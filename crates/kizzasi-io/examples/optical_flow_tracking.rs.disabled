@@ -1,0 +1,156 @@
+//! Optical Flow Tracking Example
+//!
+//! Demonstrates how to:
+//! - Load video frames
+//! - Compute optical flow between frames
+//! - Track motion
+//! - Analyze movement patterns
+
+use kizzasi_io::*;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Optical Flow Tracking Example");
+    println!("=============================\n");
+
+    // Create synthetic frames with a moving object
+    println!("Creating synthetic video frames...");
+    let width = 128;
+    let height = 128;
+
+    // Frame 1: Square at position (30, 30)
+    let mut frame1_data = vec![0u8; width * height];
+    for y in 30..50 {
+        for x in 30..50 {
+            frame1_data[y * width + x] = 255;
+        }
+    }
+
+    // Frame 2: Square moved to (35, 30) - 5 pixels to the right
+    let mut frame2_data = vec![0u8; width * height];
+    for y in 30..50 {
+        for x in 35..55 {
+            frame2_data[y * width + x] = 255;
+        }
+    }
+
+    // Frame 3: Square moved to (40, 30) - another 5 pixels to the right
+    let mut frame3_data = vec![0u8; width * height];
+    for y in 30..50 {
+        for x in 40..60 {
+            frame3_data[y * width + x] = 255;
+        }
+    }
+
+    let frame1 = VideoFrame {
+        index: 0,
+        timestamp: 0.0,
+        width,
+        height,
+        channels: 1,
+        data: frame1_data,
+    };
+
+    let frame2 = VideoFrame {
+        index: 1,
+        timestamp: 0.033,
+        width,
+        height,
+        channels: 1,
+        data: frame2_data,
+    };
+
+    let frame3 = VideoFrame {
+        index: 2,
+        timestamp: 0.066,
+        width,
+        height,
+        channels: 1,
+        data: frame3_data,
+    };
+
+    // Test all three optical flow methods
+    let methods = vec![
+        ("Dense Gradient", OpticalFlowMethod::DenseGradient),
+        ("Lucas-Kanade", OpticalFlowMethod::LucasKanade),
+        ("Block Matching", OpticalFlowMethod::BlockMatching),
+    ];
+
+    for (name, method) in methods {
+        println!("\n{} Method:", name);
+        println!("{}", "=".repeat(name.len() + 8));
+
+        let estimator = OpticalFlowEstimator::new(method).with_window_size(15);
+
+        // Compute flow from frame1 to frame2
+        println!("\nComputing flow: Frame 1 -> Frame 2");
+        let flow_1_2 = estimator.compute(&frame1, &frame2)?;
+
+        let (height, width) = flow_1_2.dimensions();
+        println!("  Flow dimensions: {}×{}", height, width);
+        println!("  Max magnitude: {:.3} pixels", flow_1_2.max_magnitude());
+        println!("  Avg magnitude: {:.3} pixels", flow_1_2.avg_magnitude());
+
+        // Sample flow at the center of the moving square
+        let center_y = 40;
+        let center_x = 42; // Center of square after movement
+        if let Some((u, v)) = flow_1_2.get_flow(center_x, center_y) {
+            println!(
+                "  Flow at square center ({}, {}): ({:.2}, {:.2})",
+                center_x, center_y, u, v
+            );
+        }
+
+        // Compute flow from frame2 to frame3
+        println!("\nComputing flow: Frame 2 -> Frame 3");
+        let flow_2_3 = estimator.compute(&frame2, &frame3)?;
+
+        println!("  Max magnitude: {:.3} pixels", flow_2_3.max_magnitude());
+        println!("  Avg magnitude: {:.3} pixels", flow_2_3.avg_magnitude());
+
+        // Analyze motion statistics
+        println!("\nMotion Statistics:");
+        let total_motion_1_2 = flow_1_2.magnitude.sum();
+        let total_motion_2_3 = flow_2_3.magnitude.sum();
+        println!("  Total motion (Frame 1->2): {:.1}", total_motion_1_2);
+        println!("  Total motion (Frame 2->3): {:.1}", total_motion_2_3);
+    }
+
+    println!("\n\nCamera Configuration Example:");
+    println!("==============================");
+
+    // Show how to configure camera input
+    let camera_config = VideoConfig::from_camera("/dev/video0")
+        .with_camera_fps(30)
+        .with_camera_format("video4linux2")
+        .with_resize(640, 480)
+        .with_pixel_format(PixelFormat::Gray);
+
+    println!("Camera configuration:");
+    println!("  FPS: {:?}", camera_config.camera_fps);
+    println!("  Format: {:?}", camera_config.camera_format);
+    println!(
+        "  Resolution: {:?}×{:?}",
+        camera_config.target_width, camera_config.target_height
+    );
+    println!("  Pixel format: {:?}", camera_config.pixel_format);
+
+    // List available cameras
+    match CameraDevice::list_devices() {
+        Ok(devices) => {
+            println!("\nAvailable camera devices:");
+            for device in devices {
+                println!("  Path: {}", device.path);
+                if let Some(name) = device.name {
+                    println!("    Name: {}", name);
+                }
+                println!("    Formats: {:?}", device.formats);
+            }
+        }
+        Err(_) => {
+            println!("\nNo camera devices found (or not running on supported platform)");
+        }
+    }
+
+    println!("\nExample completed successfully!");
+    Ok(())
+}

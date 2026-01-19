@@ -1,0 +1,77 @@
+[package]
+name = "kizzasi-inference"
+description = "Unified autoregressive inference engine for Kizzasi AGSP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["inference", "autoregressive", "sampling", "prediction", "streaming"]
+categories = ["algorithms", "asynchronous"]
+readme = "README.md"
+documentation = "https://docs.rs/kizzasi-inference"
+homepage = "https://github.com/cool-japan/kizzasi"
+
+[features]
+default = ["std"]
+std = []
+# GPU features (optional - propagate to dependencies)
+cuda = ["kizzasi-core/cuda", "kizzasi-model/cuda", "kizzasi-tokenizer/cuda"]
+metal = ["kizzasi-core/metal", "kizzasi-model/metal", "kizzasi-tokenizer/metal"]
+# Async and streaming
+async = ["dep:tokio", "dep:tokio-stream", "dep:futures", "dep:async-stream"]
+streaming = ["async"]
+msgpack = ["dep:rmp-serde"]
+mamba = []
+# Network adapters
+websocket = ["streaming", "dep:tokio-tungstenite", "dep:bytes"]
+mqtt = ["streaming", "dep:rumqttc", "dep:bytes"]
+grpc = ["streaming", "dep:tonic", "dep:prost", "dep:bytes"]
+network = ["websocket", "mqtt", "grpc"]
+
+[dependencies]
+# Internal crates
+kizzasi-core.workspace = true
+kizzasi-model.workspace = true
+kizzasi-tokenizer.workspace = true
+kizzasi-logic.workspace = true
+
+# COOLJAPAN Ecosystem
+scirs2-core.workspace = true
+
+# Core dependencies
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+half.workspace = true
+chrono.workspace = true
+
+# Serialization (optional)
+rmp-serde = { workspace = true, optional = true }
+
+# Async support (optional)
+tokio = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+
+# Network adapters (optional)
+tokio-tungstenite = { workspace = true, optional = true }
+rumqttc = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "end_to_end"
+harness = false
+
+[[bench]]
+name = "advanced_features"
+harness = false

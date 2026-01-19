@@ -1,0 +1,184 @@
+name: Code Coverage
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Generate Coverage Report
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      - name: Generate coverage (kizzasi-tokenizer)
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          cargo tarpaulin \
+            --all-features \
+            --workspace \
+            --timeout 300 \
+            --out Xml \
+            --out Html \
+            --output-dir coverage \
+            --exclude-files 'benches/*' 'examples/*' 'tests/*'
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: crates/kizzasi-tokenizer/coverage/cobertura.xml
+          flags: kizzasi-tokenizer
+          name: kizzasi-tokenizer-coverage
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload coverage report (HTML)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: crates/kizzasi-tokenizer/coverage/
+
+      - name: Coverage Summary
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          echo "## Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Extract coverage percentage from XML
+          if [ -f coverage/cobertura.xml ]; then
+            COVERAGE=$(grep -oP 'line-rate="\K[0-9.]+' coverage/cobertura.xml | head -n 1)
+            COVERAGE_PERCENT=$(echo "$COVERAGE * 100" | bc -l | xargs printf "%.2f")
+            echo "**Line Coverage:** ${COVERAGE_PERCENT}%" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  coverage-diff:
+    name: Coverage Diff
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      - name: Generate PR coverage
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          cargo tarpaulin \
+            --all-features \
+            --workspace \
+            --timeout 300 \
+            --out Xml \
+            --output-dir pr_coverage
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+          clean: false
+
+      - name: Generate base coverage
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          cargo tarpaulin \
+            --all-features \
+            --workspace \
+            --timeout 300 \
+            --out Xml \
+            --output-dir base_coverage
+
+      - name: Compare coverage
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          echo "## Coverage Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f pr_coverage/cobertura.xml ] && [ -f base_coverage/cobertura.xml ]; then
+            PR_COV=$(grep -oP 'line-rate="\K[0-9.]+' pr_coverage/cobertura.xml | head -n 1)
+            BASE_COV=$(grep -oP 'line-rate="\K[0-9.]+' base_coverage/cobertura.xml | head -n 1)
+
+            PR_PERCENT=$(echo "$PR_COV * 100" | bc -l | xargs printf "%.2f")
+            BASE_PERCENT=$(echo "$BASE_COV * 100" | bc -l | xargs printf "%.2f")
+            DIFF=$(echo "$PR_PERCENT - $BASE_PERCENT" | bc -l | xargs printf "%.2f")
+
+            echo "| Branch | Coverage |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|----------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Base   | ${BASE_PERCENT}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| PR     | ${PR_PERCENT}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Diff   | ${DIFF}% |" >> $GITHUB_STEP_SUMMARY
+
+            if (( $(echo "$DIFF < -1.0" | bc -l) )); then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ **Warning:** Coverage decreased by more than 1%" >> $GITHUB_STEP_SUMMARY
+            elif (( $(echo "$DIFF > 1.0" | bc -l) )); then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "✅ **Great!** Coverage increased by more than 1%" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+  line-coverage:
+    name: Line-by-Line Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - name: Install grcov
+        run: cargo install grcov
+
+      - name: Run tests with coverage
+        working-directory: crates/kizzasi-tokenizer
+        env:
+          RUSTFLAGS: -Cinstrument-coverage
+          LLVM_PROFILE_FILE: coverage-%p-%m.profraw
+        run: cargo test --all-features
+
+      - name: Generate coverage report
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          grcov . \
+            --binary-path ./target/debug/ \
+            -s . \
+            -t html \
+            --branch \
+            --ignore-not-existing \
+            -o ./target/coverage/
+
+      - name: Upload grcov coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: grcov-coverage
+          path: crates/kizzasi-tokenizer/target/coverage/

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8f653567b74e68328fe400bdb1e65579e5e670ed9407a9da2e87cdd735aee4c0 # shrinks to signal = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], shape=[20], strides=[1], layout=CFcf (0xf), const ndim=1, num_bins = 16
+cc d1cb34320b60fdd531d62cc19bd49d619f54104ad4b378d00938ad0d9fa16de1 # shrinks to signal = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], shape=[29], strides=[1], layout=CFcf (0xf), const ndim=1, num_coeffs = 4

@@ -1,0 +1,68 @@
+[package]
+name = "kizzasi"
+description = "Autoregressive General-Purpose Signal Predictor (AGSP) - Neuro-Symbolic Architecture for continuous signal streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["agsp", "signal-prediction", "state-space-models", "time-series", "streaming"]
+categories = ["algorithms", "science"]
+readme = "README.md"
+documentation = "https://docs.rs/kizzasi"
+homepage = "https://github.com/cool-japan/kizzasi"
+
+[features]
+default = ["std", "full"]
+std = []
+full = ["io", "logic", "mqtt", "audio", "async", "config-files", "macros"]
+# GPU features (optional - propagate to kizzasi-core)
+cuda = ["kizzasi-core/cuda"]
+metal = ["kizzasi-core/metal"]
+# Component features
+io = ["dep:kizzasi-io"]
+logic = ["dep:kizzasi-logic"]
+mqtt = ["io", "kizzasi-io/mqtt"]
+audio = ["io", "kizzasi-io/audio"]
+async = ["dep:tokio", "dep:futures", "dep:async-trait", "dep:num_cpus"]
+config-files = ["dep:toml", "dep:serde_yaml"]
+macros = ["dep:kizzasi-macros"]
+
+[dependencies]
+# Internal crates
+kizzasi-core.workspace = true
+kizzasi-logic = { workspace = true, optional = true }
+kizzasi-io = { workspace = true, optional = true }
+kizzasi-macros = { workspace = true, optional = true }
+
+# COOLJAPAN Ecosystem (following KIZZASI_POLICY.md)
+scirs2-core.workspace = true
+
+# Core dependencies
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+oxicode.workspace = true
+chrono.workspace = true
+
+# Async support (optional)
+tokio = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+num_cpus = { workspace = true, optional = true }
+
+# Configuration file support (optional)
+toml = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+criterion.workspace = true
+
+[[bench]]
+name = "predictor_benchmarks"
+harness = false

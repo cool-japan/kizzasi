@@ -1,0 +1,87 @@
+[package]
+name = "kizzasi-io"
+description = "Physical world connectors for Kizzasi - MQTT, Audio, and sensor streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["mqtt", "audio", "sensors", "streaming", "iot"]
+categories = ["hardware-support", "network-programming"]
+readme = "README.md"
+documentation = "https://docs.rs/kizzasi-io"
+homepage = "https://github.com/cool-japan/kizzasi"
+
+[features]
+default = ["std", "mqtt", "audio"]
+std = []
+# GPU features (optional - propagate to kizzasi-core)
+cuda = ["kizzasi-core/cuda"]
+metal = ["kizzasi-core/metal"]
+# IO features
+mqtt = ["dep:rumqttc"]
+audio = ["dep:cpal", "dep:hound"]
+websocket = ["dep:tokio-tungstenite"]
+serial = ["dep:tokio-serial"]
+file = ["dep:csv", "dep:hdf5", "dep:hound"]
+network = []
+osc = ["dep:rosc"]
+zeromq = ["dep:tmq"]
+ros2 = ["dep:r2r"]
+video = ["dep:ffmpeg-next"]
+simd = ["scirs2-core/simd"]
+
+[dependencies]
+# Internal crates
+kizzasi-core.workspace = true
+
+# COOLJAPAN Ecosystem (following KIZZASI_POLICY.md)
+scirs2-core.workspace = true
+scirs2-signal.workspace = true
+scirs2-fft.workspace = true
+
+# Core dependencies
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+# IO connectors (optional)
+rumqttc = { workspace = true, optional = true }
+cpal = { workspace = true, optional = true }
+rustfft.workspace = true
+
+# Network streams (optional)
+tokio-tungstenite = { workspace = true, optional = true }
+tokio-serial = { workspace = true, optional = true }
+
+# File I/O (optional)
+hound = { workspace = true, optional = true }
+csv = { workspace = true, optional = true }
+hdf5 = { workspace = true, optional = true }
+
+# Performance
+crossbeam-queue.workspace = true
+bytes.workspace = true
+
+# Protocol support (optional)
+rosc = { workspace = true, optional = true }
+tmq = { workspace = true, optional = true }
+
+# Video support (optional)
+ffmpeg-next = { workspace = true, optional = true }
+
+# Platform-specific dependencies (ROS2 not supported on macOS)
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+r2r = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "comprehensive_benchmarks"
+harness = false

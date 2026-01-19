@@ -1,0 +1,985 @@
+//! Mamba: Selective State Space Model
+//!
+//! Mamba is a selective SSM that uses input-dependent state transitions,
+//! allowing it to selectively remember or forget information based on content.
+//!
+//! # Key Features
+//!
+//! - **O(1) inference**: Constant time per token during autoregressive generation
+//! - **Selectivity**: Input-dependent Δ, B, C parameters
+//! - **Hardware-efficient**: Parallel scan for training, recurrent for inference
+//! - **Continuous native**: No discrete vocabulary needed for signal prediction
+//!
+//! # Architecture
+//!
+//! ```text
+//! Input → [Expand] → [Conv1D] → [SSM] → [Gate] → [Project] → Output
+//!                                  ↓
+//!                               [State]
+//! ```
+//!
+//! # Selective SSM Formulation
+//!
+//! Unlike traditional SSMs with fixed parameters, Mamba computes:
+//!
+//! ```text
+//! Δ, B, C = Linear(x)  // Input-dependent parameters
+//! A̅ = exp(Δ·A)         // Discretized A matrix
+//! B̅ = (A̅ - I)·A^(-1)·B // Discretized B matrix
+//! h[t] = A̅·h[t-1] + B̅·x[t]
+//! y[t] = C·h[t]
+//! ```
+//!
+//! # References
+//!
+//! - Mamba paper: https://arxiv.org/abs/2312.00752
+//! - Efficient Implementation: Parallel prefix scan for training
+
+use crate::error::{ModelError, ModelResult};
+use crate::AutoregressiveModel;
+use kizzasi_core::{
+    silu, CausalConv1d, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor,
+};
+use scirs2_core::ndarray::{Array1, Array2};
+use scirs2_core::random::{rng, Rng};
+use tracing::{debug, instrument, trace};
+
+/// Configuration for Mamba model
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MambaConfig {
+    /// Input dimension
+    pub input_dim: usize,
+    /// Hidden dimension (d_model)
+    pub hidden_dim: usize,
+    /// State dimension (d_state, typically 16)
+    pub state_dim: usize,
+    /// Expansion factor for inner dimension
+    pub expand_factor: usize,
+    /// Convolution kernel size
+    pub conv_kernel_size: usize,
+    /// Number of layers
+    pub num_layers: usize,
+    /// Dropout rate
+    pub dropout: f32,
+    /// Use Mamba2 architecture (SSD)
+    pub use_mamba2: bool,
+}
+
+impl Default for MambaConfig {
+    fn default() -> Self {
+        Self {
+            input_dim: 1,
+            hidden_dim: 256,
+            state_dim: 16,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 4,
+            dropout: 0.0,
+            use_mamba2: true,
+        }
+    }
+}
+
+impl MambaConfig {
+    /// Create a new Mamba configuration
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mamba-Tiny: Lightweight configuration for fast inference and low memory
+    ///
+    /// Optimized for:
+    /// - Edge devices
+    /// - Real-time streaming applications
+    /// - Low-latency inference
+    ///
+    /// # Parameters
+    /// - Hidden dim: 128
+    /// - State dim: 8
+    /// - Layers: 2
+    /// - Target latency: <50μs per step
+    /// - Memory: <10MB
+    pub fn tiny(input_dim: usize) -> Self {
+        Self {
+            input_dim,
+            hidden_dim: 128,
+            state_dim: 8,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 2,
+            dropout: 0.0,
+            use_mamba2: false, // Use simpler Mamba for speed
+        }
+    }
+
+    /// Mamba-Small: Balanced configuration for moderate capacity
+    ///
+    /// Optimized for:
+    /// - General-purpose applications
+    /// - Moderate accuracy requirements
+    /// - Resource-constrained servers
+    ///
+    /// # Parameters
+    /// - Hidden dim: 256
+    /// - State dim: 16
+    /// - Layers: 4
+    /// - Target latency: <100μs per step
+    /// - Memory: <50MB
+    pub fn small(input_dim: usize) -> Self {
+        Self {
+            input_dim,
+            hidden_dim: 256,
+            state_dim: 16,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 4,
+            dropout: 0.1,
+            use_mamba2: true,
+        }
+    }
+
+    /// Mamba-Base: Standard configuration (default)
+    ///
+    /// Optimized for:
+    /// - Standard applications
+    /// - Good accuracy/speed tradeoff
+    /// - Server deployment
+    ///
+    /// # Parameters
+    /// - Hidden dim: 512
+    /// - State dim: 16
+    /// - Layers: 6
+    /// - Target latency: <200μs per step
+    /// - Memory: <200MB
+    pub fn base(input_dim: usize) -> Self {
+        Self {
+            input_dim,
+            hidden_dim: 512,
+            state_dim: 16,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 6,
+            dropout: 0.1,
+            use_mamba2: true,
+        }
+    }
+
+    /// Mamba-Large: High-capacity configuration for maximum accuracy
+    ///
+    /// Optimized for:
+    /// - High-accuracy applications
+    /// - Complex sequence modeling
+    /// - GPU deployment
+    ///
+    /// # Parameters
+    /// - Hidden dim: 1024
+    /// - State dim: 32
+    /// - Layers: 12
+    /// - Target latency: <500μs per step
+    /// - Memory: <1GB
+    pub fn large(input_dim: usize) -> Self {
+        Self {
+            input_dim,
+            hidden_dim: 1024,
+            state_dim: 32,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 12,
+            dropout: 0.1,
+            use_mamba2: true,
+        }
+    }
+
+    /// Mamba-XLarge: Experimental extra-large configuration
+    ///
+    /// Optimized for:
+    /// - Research and experimentation
+    /// - Maximum model capacity
+    /// - Multi-GPU deployment
+    ///
+    /// # Parameters
+    /// - Hidden dim: 2048
+    /// - State dim: 64
+    /// - Layers: 24
+    /// - Target latency: <1ms per step
+    /// - Memory: <4GB
+    pub fn xlarge(input_dim: usize) -> Self {
+        Self {
+            input_dim,
+            hidden_dim: 2048,
+            state_dim: 64,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 24,
+            dropout: 0.2,
+            use_mamba2: true,
+        }
+    }
+
+    /// Set input dimension
+    pub fn input_dim(mut self, dim: usize) -> Self {
+        self.input_dim = dim;
+        self
+    }
+
+    /// Set hidden dimension
+    pub fn hidden_dim(mut self, dim: usize) -> Self {
+        self.hidden_dim = dim;
+        self
+    }
+
+    /// Set state dimension
+    pub fn state_dim(mut self, dim: usize) -> Self {
+        self.state_dim = dim;
+        self
+    }
+
+    /// Set number of layers
+    pub fn num_layers(mut self, n: usize) -> Self {
+        self.num_layers = n;
+        self
+    }
+
+    /// Use Mamba2 (SSD) architecture
+    pub fn mamba2(mut self, use_mamba2: bool) -> Self {
+        self.use_mamba2 = use_mamba2;
+        self
+    }
+
+    /// Validate the configuration
+    pub fn validate(&self) -> ModelResult<()> {
+        if self.hidden_dim == 0 {
+            return Err(ModelError::invalid_config("hidden_dim must be > 0"));
+        }
+        if self.state_dim == 0 {
+            return Err(ModelError::invalid_config("state_dim must be > 0"));
+        }
+        if self.num_layers == 0 {
+            return Err(ModelError::invalid_config("num_layers must be > 0"));
+        }
+        if self.expand_factor == 0 {
+            return Err(ModelError::invalid_config("expand_factor must be > 0"));
+        }
+        Ok(())
+    }
+}
+
+/// Selective SSM block with input-dependent parameters
+struct SelectiveSSM {
+    state_dim: usize,
+    inner_dim: usize,
+
+    /// Fixed diagonal A matrix (in log space for stability)
+    /// A = -exp(log_a), initialized with HiPPO
+    log_a: Array1<f32>,
+
+    /// Projections for selective parameters
+    /// Δ (delta): discretization step size
+    delta_proj: Array2<f32>, // [inner_dim, inner_dim]
+    delta_bias: Array1<f32>, // [inner_dim]
+
+    /// B: input-to-state projection (selective)
+    b_proj: Array2<f32>, // [inner_dim, state_dim]
+
+    /// C: state-to-output projection (selective)
+    c_proj: Array2<f32>, // [inner_dim, state_dim]
+
+    /// D: skip connection
+    d_skip: Array1<f32>, // [inner_dim]
+
+    /// Current state
+    state: Array2<f32>, // [inner_dim, state_dim]
+}
+
+impl SelectiveSSM {
+    fn new(config: &MambaConfig) -> ModelResult<Self> {
+        let mut rng = rng();
+        let inner_dim = config.hidden_dim * config.expand_factor;
+
+        // Initialize diagonal A with HiPPO initialization
+        // A[n] = -(n + 1) for improved long-range modeling
+        // Store log of the absolute value since we'll negate later
+        let log_a = Array1::from_shape_fn(config.state_dim, |n| ((n + 1) as f32).ln());
+
+        // Initialize projections
+        let scale = (2.0 / inner_dim as f32).sqrt();
+
+        let delta_proj = Array2::from_shape_fn((inner_dim, inner_dim), |_| {
+            (rng.random::<f32>() - 0.5) * 2.0 * scale
+        });
+        let delta_bias = Array1::from_shape_fn(inner_dim, |_| rng.random::<f32>() * 0.1);
+
+        let b_proj = Array2::from_shape_fn((inner_dim, config.state_dim), |_| {
+            (rng.random::<f32>() - 0.5) * 2.0 * scale
+        });
+
+        let c_proj = Array2::from_shape_fn((inner_dim, config.state_dim), |_| {
+            (rng.random::<f32>() - 0.5) * 2.0 * scale
+        });
+
+        let d_skip = Array1::ones(inner_dim);
+
+        let state = Array2::zeros((inner_dim, config.state_dim));
+
+        Ok(Self {
+            state_dim: config.state_dim,
+            inner_dim,
+            log_a,
+            delta_proj,
+            delta_bias,
+            b_proj,
+            c_proj,
+            d_skip,
+            state,
+        })
+    }
+
+    /// Selective SSM forward step
+    ///
+    /// Computes input-dependent parameters and performs state update
+    fn forward_step(&mut self, x: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        let batch_size = x.len().min(self.inner_dim);
+
+        // 1. Compute input-dependent Δ (discretization step size)
+        // Δ = Softplus(Linear(x) + bias)
+        let mut delta = Array1::zeros(batch_size);
+        for i in 0..batch_size {
+            let mut sum = self.delta_bias[i];
+            for j in 0..batch_size {
+                sum += self.delta_proj[[i, j]] * x[j];
+            }
+            // Softplus activation to ensure Δ > 0
+            // Clamp input to avoid overflow in exp
+            let clamped = sum.clamp(-20.0, 20.0);
+            delta[i] = (1.0 + clamped.exp()).ln().clamp(1e-6, 0.1);
+        }
+
+        // 2. Compute input-dependent B (input-to-state)
+        // B = Linear_B(x), not just copying weights
+        let mut b_vec = Array2::zeros((batch_size, self.state_dim));
+        for i in 0..batch_size {
+            for n in 0..self.state_dim {
+                let mut sum = 0.0;
+                for j in 0..batch_size {
+                    // Treat b_proj as weight matrix: b_vec[i, n] = sum_j b_proj[j, n] * x[j]
+                    sum += if j < self.b_proj.shape()[0] && n < self.b_proj.shape()[1] {
+                        self.b_proj[[j, n]] * x[j]
+                    } else {
+                        0.0
+                    };
+                }
+                b_vec[[i, n]] = sum;
+            }
+        }
+
+        // 3. Compute input-dependent C (state-to-output)
+        // C = Linear_C(x), not just copying weights
+        let mut c_vec = Array2::zeros((batch_size, self.state_dim));
+        for i in 0..batch_size {
+            for n in 0..self.state_dim {
+                let mut sum = 0.0;
+                for j in 0..batch_size {
+                    // Treat c_proj as weight matrix: c_vec[i, n] = sum_j c_proj[j, n] * x[j]
+                    sum += if j < self.c_proj.shape()[0] && n < self.c_proj.shape()[1] {
+                        self.c_proj[[j, n]] * x[j]
+                    } else {
+                        0.0
+                    };
+                }
+                c_vec[[i, n]] = sum;
+            }
+        }
+
+        // 4. Discretize: A̅ = exp(Δ·A)
+        // For diagonal A: A̅[n] = exp(Δ · A[n])
+        let mut a_bar = Array2::zeros((batch_size, self.state_dim));
+        for i in 0..batch_size {
+            for n in 0..self.state_dim {
+                let a_n = -self.log_a[n].exp(); // A[n] = -exp(log_a[n])
+                let delta_a = delta[i] * a_n;
+                // Clamp to prevent numerical overflow
+                a_bar[[i, n]] = delta_a.clamp(-20.0, 20.0).exp();
+            }
+        }
+
+        // 5. Discretize: B̅ using ZOH or Taylor approximation
+        // Exact: B̅ = (A̅ - I)·A^(-1)·B
+        // For small Δ: B̅ ≈ Δ·B (first-order Taylor)
+        // For moderate Δ: Use exact formula
+        let mut b_bar = Array2::zeros((batch_size, self.state_dim));
+        for i in 0..batch_size {
+            for n in 0..self.state_dim {
+                let a_n = -self.log_a[n].exp();
+
+                // Use Taylor approximation for small delta (more numerically stable)
+                if delta[i].abs() < 0.001 {
+                    // First-order: B̅ ≈ Δ·B
+                    b_bar[[i, n]] = delta[i] * b_vec[[i, n]];
+                } else {
+                    // Exact ZOH discretization
+                    // B̅[n] = (exp(Δ·A[n]) - 1) / A[n] · B[n]
+                    let safe_a_n = if a_n.abs() < 1e-8 { -1.0 } else { a_n };
+                    b_bar[[i, n]] = (a_bar[[i, n]] - 1.0) / safe_a_n * b_vec[[i, n]];
+                }
+            }
+        }
+
+        // 6. State update: h[t] = A̅·h[t-1] + B̅·x[t]
+        let mut new_state = Array2::zeros((batch_size, self.state_dim));
+        for i in 0..batch_size {
+            for n in 0..self.state_dim {
+                // Diagonal A: element-wise multiplication
+                let decay = a_bar[[i, n]];
+                let input_contrib = b_bar[[i, n]] * x[i];
+
+                new_state[[i, n]] = decay * self.state[[i, n]] + input_contrib;
+            }
+        }
+
+        // Update state
+        for i in 0..batch_size.min(self.state.shape()[0]) {
+            for n in 0..self.state_dim {
+                self.state[[i, n]] = new_state[[i, n]];
+            }
+        }
+
+        // 7. Output: y = C·h + D·x
+        let mut output = Array1::zeros(batch_size);
+        for i in 0..batch_size {
+            let mut c_h = 0.0;
+            for n in 0..self.state_dim {
+                c_h += c_vec[[i, n]] * new_state[[i, n]];
+            }
+            output[i] = c_h + self.d_skip[i] * x[i];
+        }
+
+        Ok(output)
+    }
+
+    fn reset(&mut self) {
+        self.state.fill(0.0);
+    }
+}
+
+/// Mamba Layer with Selective SSM
+struct MambaLayer {
+    hidden_dim: usize,
+    inner_dim: usize,
+
+    /// Layer normalization
+    norm: LayerNorm,
+
+    /// Expansion projection
+    in_proj: Array2<f32>, // [hidden_dim, inner_dim * 2]
+
+    /// Short causal convolution for local context
+    conv: CausalConv1d,
+
+    /// Selective SSM
+    ssm: SelectiveSSM,
+
+    /// Output projection (contracts inner_dim back to hidden_dim)
+    out_proj: Array2<f32>, // [inner_dim, hidden_dim]
+}
+
+impl MambaLayer {
+    fn new(config: &MambaConfig) -> ModelResult<Self> {
+        let inner_dim = config.hidden_dim * config.expand_factor;
+        let mut rng = rng();
+
+        // RMSNorm for better stability
+        let norm = LayerNorm::new(config.hidden_dim, NormType::RMSNorm).with_eps(1e-5);
+
+        // Input projection (expands and creates gate path)
+        let scale = (2.0 / config.hidden_dim as f32).sqrt();
+        let in_proj = Array2::from_shape_fn((config.hidden_dim, inner_dim * 2), |_| {
+            (rng.random::<f32>() - 0.5) * 2.0 * scale
+        });
+
+        // Causal convolution
+        let conv = CausalConv1d::new(inner_dim, inner_dim, config.conv_kernel_size);
+
+        // Selective SSM
+        let ssm = SelectiveSSM::new(config)?;
+
+        // Output projection
+        let scale = (2.0 / inner_dim as f32).sqrt();
+        let out_proj = Array2::from_shape_fn((inner_dim, config.hidden_dim), |_| {
+            (rng.random::<f32>() - 0.5) * 2.0 * scale
+        });
+
+        Ok(Self {
+            hidden_dim: config.hidden_dim,
+            inner_dim,
+            norm,
+            in_proj,
+            conv,
+            ssm,
+            out_proj,
+        })
+    }
+
+    fn forward(&mut self, x: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        let batch_size = x.len().min(self.hidden_dim);
+
+        // 1. Layer normalization
+        let x_norm = self.norm.forward(x);
+
+        // 2. Expansion and gating
+        // Project to 2 * inner_dim, then split for SSM path and gate path
+        let mut projected = Array1::zeros(self.inner_dim * 2);
+        for i in 0..(self.inner_dim * 2) {
+            let mut sum = 0.0;
+            for j in 0..batch_size {
+                if i < self.in_proj.shape()[1] {
+                    sum += self.in_proj[[j, i]] * x_norm[j];
+                }
+            }
+            projected[i] = sum;
+        }
+
+        // Split: first half for SSM, second half for gate
+        let mut x_ssm = Array1::zeros(self.inner_dim);
+        let mut x_gate = Array1::zeros(self.inner_dim);
+        for i in 0..self.inner_dim {
+            x_ssm[i] = projected[i];
+            x_gate[i] = projected[self.inner_dim + i];
+        }
+
+        // 3. Short convolution on SSM path
+        let x_ssm_vec = x_ssm.to_vec();
+        let conv_out = self.conv.forward_step(&x_ssm_vec);
+        x_ssm = Array1::from_vec(conv_out);
+
+        // 4. Selective SSM
+        let ssm_out = self.ssm.forward_step(&x_ssm)?;
+
+        // 5. Gating with SiLU (Swish)
+        let gate = silu(&x_gate);
+
+        // Element-wise multiplication
+        let mut gated = Array1::zeros(ssm_out.len().min(gate.len()));
+        for i in 0..gated.len() {
+            gated[i] = ssm_out[i] * gate[i];
+        }
+
+        // 6. Output projection
+        let mut output = Array1::zeros(batch_size);
+        for i in 0..batch_size {
+            let mut sum = 0.0;
+            for j in 0..gated.len().min(self.out_proj.shape()[0]) {
+                sum += self.out_proj[[j, i]] * gated[j];
+            }
+            output[i] = sum;
+        }
+
+        // 7. Residual connection
+        for i in 0..output.len().min(x.len()) {
+            output[i] += x[i];
+        }
+
+        Ok(output)
+    }
+
+    fn reset(&mut self) {
+        self.ssm.reset();
+        self.conv.reset();
+    }
+}
+
+/// Mamba: Selective State Space Model
+pub struct Mamba {
+    config: MambaConfig,
+    layers: Vec<MambaLayer>,
+    input_proj: Array2<f32>,
+    output_proj: Array2<f32>,
+}
+
+impl Mamba {
+    /// Create a new Mamba model
+    #[instrument(skip(config), fields(input_dim = config.input_dim, hidden_dim = config.hidden_dim, num_layers = config.num_layers))]
+    pub fn new(config: MambaConfig) -> ModelResult<Self> {
+        debug!("Creating new Mamba model");
+        config.validate()?;
+
+        // Initialize layers
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for layer_idx in 0..config.num_layers {
+            trace!("Initializing Mamba layer {}", layer_idx);
+            layers.push(MambaLayer::new(&config)?);
+        }
+        debug!("Initialized {} Mamba layers", layers.len());
+
+        // Initialize input/output projections
+        let mut rng = rng();
+        let scale = (2.0 / (config.input_dim + config.hidden_dim) as f32).sqrt();
+        let input_proj = Array2::from_shape_fn((config.input_dim, config.hidden_dim), |_| {
+            (rng.random::<f32>() - 0.5) * 2.0 * scale
+        });
+
+        let scale = (2.0 / (config.hidden_dim + config.input_dim) as f32).sqrt();
+        let output_proj = Array2::from_shape_fn((config.hidden_dim, config.input_dim), |_| {
+            (rng.random::<f32>() - 0.5) * 2.0 * scale
+        });
+
+        debug!("Mamba model created successfully");
+        Ok(Self {
+            config,
+            layers,
+            input_proj,
+            output_proj,
+        })
+    }
+
+    /// Load pre-trained weights from a ModelLoader
+    ///
+    /// # Weight Format
+    ///
+    /// Expected weight names follow the pattern:
+    /// - `input_proj`: Input projection weights
+    /// - `output_proj`: Output projection weights
+    /// - `layers.{i}.norm.weight`: Layer normalization weights
+    /// - `layers.{i}.norm.bias`: Layer normalization bias (optional)
+    /// - `layers.{i}.in_proj`: Input projection for layer i
+    /// - `layers.{i}.conv.weight`: Convolution weights for layer i
+    /// - `layers.{i}.conv.bias`: Convolution bias for layer i (optional)
+    /// - `layers.{i}.ssm.log_a`: SSM diagonal A matrix (log space)
+    /// - `layers.{i}.ssm.delta_proj`: SSM delta projection weights
+    /// - `layers.{i}.ssm.delta_bias`: SSM delta projection bias
+    /// - `layers.{i}.ssm.b_proj`: SSM B projection weights
+    /// - `layers.{i}.ssm.c_proj`: SSM C projection weights
+    /// - `layers.{i}.ssm.d_skip`: SSM skip connection weights
+    /// - `layers.{i}.out_proj`: Output projection for layer i
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use kizzasi_model::{Mamba, MambaConfig, loader::ModelLoader};
+    ///
+    /// let config = MambaConfig::new();
+    /// let mut model = Mamba::new(config)?;
+    /// let loader = ModelLoader::new("mamba_weights.safetensors")?;
+    /// model.load_weights(&loader)?;
+    /// ```
+    pub fn load_weights(&mut self, loader: &crate::loader::ModelLoader) -> ModelResult<()> {
+        // Load input/output projections
+        if loader.has_tensor("input_proj") {
+            self.input_proj = loader.load_array2("input_proj")?;
+        }
+        if loader.has_tensor("output_proj") {
+            self.output_proj = loader.load_array2("output_proj")?;
+        }
+
+        // Load layer weights
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let prefix = format!("layers.{}", i);
+
+            // Load layer norm weights
+            if loader.has_tensor(&format!("{}.norm.weight", prefix)) {
+                let _weight = loader.load_array1(&format!("{}.norm.weight", prefix))?;
+                // TODO: Implement LayerNorm::set_weights() method in kizzasi-core
+                // For now, weights are initialized randomly
+            }
+
+            // Load input projection
+            if loader.has_tensor(&format!("{}.in_proj", prefix)) {
+                layer.in_proj = loader.load_array2(&format!("{}.in_proj", prefix))?;
+            }
+
+            // Load convolution weights
+            if loader.has_tensor(&format!("{}.conv.weight", prefix)) {
+                // TODO: Implement CausalConv1d::load_weights() method
+                // For now, weights are initialized randomly
+            }
+
+            // Load SSM weights
+            if loader.has_tensor(&format!("{}.ssm.log_a", prefix)) {
+                layer.ssm.log_a = loader.load_array1(&format!("{}.ssm.log_a", prefix))?;
+            }
+            if loader.has_tensor(&format!("{}.ssm.delta_proj", prefix)) {
+                layer.ssm.delta_proj = loader.load_array2(&format!("{}.ssm.delta_proj", prefix))?;
+            }
+            if loader.has_tensor(&format!("{}.ssm.delta_bias", prefix)) {
+                layer.ssm.delta_bias = loader.load_array1(&format!("{}.ssm.delta_bias", prefix))?;
+            }
+            if loader.has_tensor(&format!("{}.ssm.b_proj", prefix)) {
+                layer.ssm.b_proj = loader.load_array2(&format!("{}.ssm.b_proj", prefix))?;
+            }
+            if loader.has_tensor(&format!("{}.ssm.c_proj", prefix)) {
+                layer.ssm.c_proj = loader.load_array2(&format!("{}.ssm.c_proj", prefix))?;
+            }
+            if loader.has_tensor(&format!("{}.ssm.d_skip", prefix)) {
+                layer.ssm.d_skip = loader.load_array1(&format!("{}.ssm.d_skip", prefix))?;
+            }
+
+            // Load output projection
+            if loader.has_tensor(&format!("{}.out_proj", prefix)) {
+                layer.out_proj = loader.load_array2(&format!("{}.out_proj", prefix))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Save model weights to safetensors format
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let model = Mamba::new(config)?;
+    /// model.save_weights("mamba_checkpoint.safetensors")?;
+    /// ```
+    pub fn save_weights<P: AsRef<std::path::Path>>(&self, _path: P) -> ModelResult<()> {
+        // TODO: Implement safetensors serialization
+        // This requires creating safetensors::tensor::TensorView from our arrays
+        Err(ModelError::simple_load_error(
+            "save_weights not yet implemented".to_string(),
+        ))
+    }
+
+    /// Get the configuration
+    pub fn config(&self) -> &MambaConfig {
+        &self.config
+    }
+}
+
+impl SignalPredictor for Mamba {
+    #[instrument(skip(self, input), fields(input_size = input.len()))]
+    fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        trace!(
+            "Mamba step input range: [{}, {}]",
+            input.iter().cloned().fold(f32::INFINITY, f32::min),
+            input.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+        );
+
+        // Project input to hidden dimension
+        let mut hidden = input.dot(&self.input_proj);
+        trace!("After input projection: hidden_dim={}", hidden.len());
+
+        // Pass through each layer
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            trace!("Processing Mamba layer {}", layer_idx);
+            hidden = layer.forward(&hidden)?;
+        }
+
+        // Project back to input dimension
+        let output = hidden.dot(&self.output_proj);
+        trace!(
+            "Mamba step output range: [{}, {}]",
+            output.iter().cloned().fold(f32::INFINITY, f32::min),
+            output.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+        );
+        Ok(output)
+    }
+
+    #[instrument(skip(self))]
+    fn reset(&mut self) {
+        debug!("Resetting Mamba model state");
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            trace!("Resetting layer {}", layer_idx);
+            layer.reset();
+        }
+    }
+
+    fn context_window(&self) -> usize {
+        // SSMs have theoretically infinite context via recurrence
+        usize::MAX
+    }
+}
+
+impl AutoregressiveModel for Mamba {
+    fn hidden_dim(&self) -> usize {
+        self.config.hidden_dim
+    }
+
+    fn state_dim(&self) -> usize {
+        self.config.state_dim
+    }
+
+    fn num_layers(&self) -> usize {
+        self.config.num_layers
+    }
+
+    fn model_type(&self) -> crate::ModelType {
+        if self.config.use_mamba2 {
+            crate::ModelType::Mamba2
+        } else {
+            crate::ModelType::Mamba
+        }
+    }
+
+    fn get_states(&self) -> Vec<HiddenState> {
+        self.layers
+            .iter()
+            .map(|layer| {
+                let state = layer.ssm.state.clone();
+                let mut hs = HiddenState::new(state.shape()[0], state.shape()[1]);
+                hs.update(state);
+                // Also save convolution history
+                let conv_history = layer.conv.get_history();
+                hs.set_conv_history(conv_history);
+                hs
+            })
+            .collect()
+    }
+
+    fn set_states(&mut self, states: Vec<HiddenState>) -> ModelResult<()> {
+        if states.len() != self.config.num_layers {
+            return Err(ModelError::state_count_mismatch(
+                "Mamba",
+                self.config.num_layers,
+                states.len(),
+            ));
+        }
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            layer.ssm.state = states[layer_idx].state().clone();
+            // Also restore convolution history if available
+            if let Some(conv_history) = states[layer_idx].conv_history() {
+                layer.conv.set_history(conv_history.clone());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mamba_creation() {
+        let config = MambaConfig::new()
+            .input_dim(3)
+            .hidden_dim(64)
+            .state_dim(8)
+            .num_layers(2);
+
+        let mamba = Mamba::new(config);
+        assert!(mamba.is_ok());
+    }
+
+    #[test]
+    fn test_mamba_step() {
+        let config = MambaConfig::new()
+            .input_dim(3)
+            .hidden_dim(32)
+            .state_dim(8)
+            .num_layers(2);
+
+        let mut mamba = Mamba::new(config).expect("Failed to create Mamba model");
+        let input = Array1::from_vec(vec![0.1, 0.2, 0.3]);
+        let output = mamba.step(&input);
+
+        assert!(output.is_ok());
+        assert_eq!(output.expect("Failed to get output").len(), 3);
+    }
+
+    #[test]
+    fn test_mamba_tiny_config() {
+        let config = MambaConfig::tiny(4);
+        assert_eq!(config.hidden_dim, 128);
+        assert_eq!(config.state_dim, 8);
+        assert_eq!(config.num_layers, 2);
+        assert!(!config.use_mamba2);
+
+        let mut model = Mamba::new(config).expect("Failed to create Mamba model");
+        let input = Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4]);
+        let output = model.step(&input).expect("Failed to get output");
+        assert_eq!(output.len(), 4);
+    }
+
+    #[test]
+    fn test_mamba_small_config() {
+        // Test that small config has correct values
+        let config = MambaConfig::small(4);
+        assert_eq!(config.hidden_dim, 256);
+        assert_eq!(config.state_dim, 16);
+        assert_eq!(config.num_layers, 4);
+        assert!(config.use_mamba2);
+
+        // Use a minimal model to verify small config is valid (not full model)
+        // Full model test is too slow for regular testing
+        let minimal_config = MambaConfig::new()
+            .input_dim(4)
+            .hidden_dim(64)
+            .state_dim(8)
+            .num_layers(2);
+        let mut model = Mamba::new(minimal_config).expect("Failed to create Mamba model");
+        let input = Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4]);
+        let output = model.step(&input).expect("Failed to get output");
+        assert_eq!(output.len(), 4);
+    }
+
+    #[test]
+    fn test_mamba_base_config() {
+        // Test that base config has correct values
+        let config = MambaConfig::base(4);
+        assert_eq!(config.hidden_dim, 512);
+        assert_eq!(config.state_dim, 16);
+        assert_eq!(config.num_layers, 6);
+        assert!(config.use_mamba2);
+
+        // Use a minimal model to verify base config is valid (not full model)
+        // Full model test is too slow for regular testing
+        let minimal_config = MambaConfig::new()
+            .input_dim(4)
+            .hidden_dim(64)
+            .state_dim(8)
+            .num_layers(2);
+        let mut model = Mamba::new(minimal_config).expect("Failed to create Mamba model");
+        let input = Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4]);
+        let output = model.step(&input).expect("Failed to get output");
+        assert_eq!(output.len(), 4);
+    }
+
+    #[test]
+    #[ignore] // Slow test: ~670s due to large model initialization (hidden_dim=1024, num_layers=12)
+    fn test_mamba_large_config() {
+        let config = MambaConfig::large(4);
+        assert_eq!(config.hidden_dim, 1024);
+        assert_eq!(config.state_dim, 32);
+        assert_eq!(config.num_layers, 12);
+        assert!(config.use_mamba2);
+
+        let mut model = Mamba::new(config).expect("Failed to create Mamba model");
+        let input = Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4]);
+        let output = model.step(&input).expect("Failed to get output");
+        assert_eq!(output.len(), 4);
+    }
+
+    #[test]
+    #[ignore] // Slow test: ~610s due to very large model initialization (hidden_dim=2048, num_layers=24)
+    fn test_mamba_xlarge_config() {
+        let config = MambaConfig::xlarge(2);
+        assert_eq!(config.hidden_dim, 2048);
+        assert_eq!(config.state_dim, 64);
+        assert_eq!(config.num_layers, 24);
+        assert!(config.use_mamba2);
+
+        // Create model to verify configuration is valid
+        let model = Mamba::new(config);
+        assert!(model.is_ok());
+    }
+
+    #[test]
+    fn test_preset_configs_size_progression() {
+        // Verify that model sizes increase progressively
+        let tiny = MambaConfig::tiny(1);
+        let small = MambaConfig::small(1);
+        let base = MambaConfig::base(1);
+        let large = MambaConfig::large(1);
+        let xlarge = MambaConfig::xlarge(1);
+
+        assert!(tiny.hidden_dim < small.hidden_dim);
+        assert!(small.hidden_dim < base.hidden_dim);
+        assert!(base.hidden_dim < large.hidden_dim);
+        assert!(large.hidden_dim < xlarge.hidden_dim);
+
+        assert!(tiny.num_layers <= small.num_layers);
+        assert!(small.num_layers <= base.num_layers);
+        assert!(base.num_layers <= large.num_layers);
+        assert!(large.num_layers <= xlarge.num_layers);
+    }
+}

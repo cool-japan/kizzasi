@@ -1,0 +1,113 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kizzasi",
+    "crates/kizzasi-core",
+    "crates/kizzasi-model",
+    "crates/kizzasi-tokenizer",
+    "crates/kizzasi-inference",
+    "crates/kizzasi-logic",
+    "crates/kizzasi-io",
+    "crates/kizzasi-macros",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cool-japan/kizzasi"
+authors = ["COOL JAPAN Team"]
+rust-version = "1.89"
+
+[workspace.dependencies]
+# Internal crates
+kizzasi = { path = "crates/kizzasi", version = "0.1.0" }
+kizzasi-core = { path = "crates/kizzasi-core", version = "0.1.0" }
+kizzasi-model = { path = "crates/kizzasi-model", version = "0.1.0" }
+kizzasi-tokenizer = { path = "crates/kizzasi-tokenizer", version = "0.1.0" }
+kizzasi-inference = { path = "crates/kizzasi-inference", version = "0.1.0" }
+kizzasi-logic = { path = "crates/kizzasi-logic", version = "0.1.0" }
+kizzasi-io = { path = "crates/kizzasi-io", version = "0.1.0" }
+kizzasi-macros = { path = "crates/kizzasi-macros", version = "0.1.0" }
+
+# ============================================
+# COOLJAPAN Ecosystem Dependencies
+# ============================================
+# Following KIZZASI_POLICY.md - use scirs2 abstractions
+scirs2-core = { version = "0.1.2", features = ["array", "random", "simd", "parallel"] }
+scirs2-linalg = { version = "0.1.2", features = ["simd", "parallel"] }
+scirs2-signal = { version = "0.1.2" }
+scirs2-fft = { version = "0.1.2" }
+scirs2-series = { version = "0.1.2" }
+tensorlogic = { version = "0.1.0-alpha.2" }
+
+# Core dependencies
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+oxicode = "0.1"
+rmp-serde = "1"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Parallelism
+rayon = "1"
+
+# ML Backend (Candle) - each crate will specify target-specific candle dependencies
+# to avoid pulling cudarc on macOS (CUDA not supported on macOS)
+safetensors = "0.5"
+half = "2"
+
+# HTTP client for HuggingFace Hub integration
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+sha2 = "0.10"
+
+# IO connectors
+rumqttc = "0.25.1"
+cpal = "0.16"
+rustfft = "6"
+tokio-tungstenite = "0.28"
+tokio-serial = "5.4"
+hound = "3.5"
+csv = "1.4"
+hdf5 = "0.8"
+crossbeam-queue = "0.3"
+bytes = "1"
+rosc = "0.11"
+tmq = "0.5"
+r2r = "0.9"
+ffmpeg-next = "8"
+tonic = "0.14"
+prost = "0.14"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Property-based testing
+proptest = "1"
+
+# Additional dependencies used by subcrates
+async-stream = "0.3"
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+num_cpus = "1.17"
+toml = "0.9"
+serde_yaml = "0.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

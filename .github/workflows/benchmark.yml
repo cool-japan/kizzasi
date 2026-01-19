@@ -1,0 +1,174 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-benchmark-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install criterion
+        run: cargo install cargo-criterion
+
+      - name: Run benchmarks (kizzasi-tokenizer)
+        working-directory: crates/kizzasi-tokenizer
+        run: cargo criterion --all-features --output-format bencher | tee benchmark_results.txt
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        with:
+          tool: 'cargo'
+          output-file-path: crates/kizzasi-tokenizer/benchmark_results.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          # Comment on commit with benchmark results
+          comment-on-alert: true
+          alert-threshold: '150%'
+          fail-on-alert: false
+          alert-comment-cc-users: '@kitasan'
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: crates/kizzasi-tokenizer/benchmark_results.txt
+
+  performance-comparison:
+    name: Performance Regression Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-perf-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run PR benchmarks
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          cargo bench --all-features --bench comprehensive_benchmarks -- --output-format bencher | tee pr_bench.txt
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+          clean: false
+
+      - name: Run base benchmarks
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          cargo bench --all-features --bench comprehensive_benchmarks -- --output-format bencher | tee base_bench.txt
+
+      - name: Install critcmp
+        run: cargo install critcmp
+
+      - name: Compare benchmarks
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          echo "## Benchmark Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          critcmp base_bench.txt pr_bench.txt >> $GITHUB_STEP_SUMMARY || true
+
+  memory-profiling:
+    name: Memory Usage Profiling
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Build tests
+        working-directory: crates/kizzasi-tokenizer
+        run: cargo test --all-features --no-run
+
+      - name: Run memory profiling
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          TEST_BIN=$(find target/debug/deps -name 'kizzasi_tokenizer-*' -type f -executable | head -n 1)
+          if [ -n "$TEST_BIN" ]; then
+            valgrind --tool=massif --massif-out-file=massif.out $TEST_BIN --test-threads=1 || true
+            ms_print massif.out > memory_profile.txt
+          fi
+
+      - name: Upload memory profile
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: memory-profile
+          path: crates/kizzasi-tokenizer/memory_profile.txt
+
+  throughput-analysis:
+    name: Throughput Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install hyperfine
+        run: |
+          wget https://github.com/sharkdp/hyperfine/releases/download/v1.18.0/hyperfine_1.18.0_amd64.deb
+          sudo dpkg -i hyperfine_1.18.0_amd64.deb
+
+      - name: Build release
+        working-directory: crates/kizzasi-tokenizer
+        run: cargo build --release --all-features
+
+      - name: Benchmark throughput
+        working-directory: crates/kizzasi-tokenizer
+        run: |
+          echo "## Throughput Analysis" > throughput.md
+          echo "" >> throughput.md
+
+          # Run benchmarks and capture output
+          cargo bench --all-features --bench comprehensive_benchmarks 2>&1 | tee -a throughput.md
+
+      - name: Upload throughput analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-analysis
+          path: crates/kizzasi-tokenizer/throughput.md

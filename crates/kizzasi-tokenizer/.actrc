@@ -1,0 +1,16 @@
+# Configuration for act (run GitHub Actions locally)
+# https://github.com/nektos/act
+
+# Use medium-sized container for better compatibility
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+-P macos-latest=ghcr.io/catthehacker/ubuntu:act-latest
+-P windows-latest=ghcr.io/catthehacker/ubuntu:act-latest
+
+# Use verbose logging
+--verbose
+
+# Reuse containers for faster runs
+--reuse
+
+# Bind workspace to container
+--bind

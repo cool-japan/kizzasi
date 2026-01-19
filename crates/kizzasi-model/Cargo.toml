@@ -1,0 +1,69 @@
+[package]
+name = "kizzasi-model"
+description = "Model architectures for Kizzasi AGSP - Mamba, RWKV, S4, Transformer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["mamba", "rwkv", "transformer", "neural-networks", "llm"]
+categories = ["algorithms", "science"]
+readme = "README.md"
+documentation = "https://docs.rs/kizzasi-model"
+homepage = "https://github.com/cool-japan/kizzasi"
+
+[features]
+default = ["std", "mamba"]
+std = []
+# GPU features (optional)
+# Note: cuda feature only works on Linux/Windows, ignored on macOS
+cuda = ["kizzasi-core/cuda"]
+metal = ["kizzasi-core/metal"]
+# Model features
+mamba = []
+rwkv = []
+s4 = []
+transformer = []
+all-models = ["mamba", "rwkv", "s4", "transformer"]
+
+[dependencies]
+# Internal crates
+kizzasi-core.workspace = true
+
+# COOLJAPAN Ecosystem
+scirs2-core.workspace = true
+scirs2-linalg.workspace = true
+
+# Core dependencies
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+rayon.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+
+safetensors.workspace = true
+half.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+# Platform-specific Candle dependencies
+# CUDA is only supported on Linux and Windows (not macOS)
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+candle-core = { version = "0.9.1", default-features = false, features = [] }
+candle-nn = { version = "0.9.1", default-features = false, features = [] }
+
+# macOS uses Metal (or CPU-only by default)
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.9.1", default-features = false, features = [] }
+candle-nn = { version = "0.9.1", default-features = false, features = [] }
+
+[[bench]]
+name = "model_bench"
+harness = false

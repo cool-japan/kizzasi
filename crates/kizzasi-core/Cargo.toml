@@ -1,0 +1,53 @@
+[package]
+name = "kizzasi-core"
+description = "Core SSM (State Space Model) engine for Kizzasi AGSP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["ssm", "state-space-models", "signal-processing", "machine-learning", "time-series"]
+categories = ["algorithms", "science"]
+readme = "README.md"
+documentation = "https://docs.rs/kizzasi-core"
+homepage = "https://github.com/cool-japan/kizzasi"
+
+[features]
+default = ["std"]
+std = []
+# GPU features (optional)
+# Note: cuda feature only works on Linux/Windows, ignored on macOS
+cuda = []
+metal = []
+# parallel feature uses scirs2-core parallel (already included in default features)
+
+[dependencies]
+# COOLJAPAN Ecosystem (following KIZZASI_POLICY.md)
+scirs2-core.workspace = true
+
+# Core dependencies
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+safetensors.workspace = true
+half.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+
+# Platform-specific Candle dependencies
+# CUDA is only supported on Linux and Windows (not macOS)
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+candle-core = { version = "0.9.1", default-features = false, features = [] }
+candle-nn = { version = "0.9.1", default-features = false, features = [] }
+
+# macOS uses Metal (or CPU-only by default)
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.9.1", default-features = false, features = [] }
+candle-nn = { version = "0.9.1", default-features = false, features = [] }
