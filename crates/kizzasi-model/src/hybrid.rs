@@ -37,7 +37,7 @@ use crate::error::{ModelError, ModelResult};
 use crate::{AutoregressiveModel, ModelType};
 use kizzasi_core::{silu, softmax, CoreResult, HiddenState, SignalPredictor};
 use scirs2_core::ndarray::{Array1, Array2};
-use scirs2_core::random::{rng, Rng};
+use scirs2_core::random::{rng, RngExt};
 use std::collections::VecDeque;
 
 #[allow(unused_imports)]

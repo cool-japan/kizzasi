@@ -400,7 +400,7 @@ impl AttentionScaleFusion {
     ///
     /// # Returns
     ///
-    /// Fused embedding [embed_dim]
+    /// Fused embedding `[embed_dim]`
     pub fn fuse(&self, scale_embeddings: &[Array1<f32>]) -> TokenizerResult<Array1<f32>> {
         if scale_embeddings.len() != self.num_scales {
             return Err(TokenizerError::InvalidConfig(format!(

@@ -44,10 +44,10 @@ criterion.workspace = true
 # Platform-specific Candle dependencies
 # CUDA is only supported on Linux and Windows (not macOS)
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-candle-core = { version = "0.9.1", default-features = false, features = [] }
-candle-nn = { version = "0.9.1", default-features = false, features = [] }
+candle-core = { version = "0.10.2", default-features = false, features = [] }
+candle-nn = { version = "0.10.2", default-features = false, features = [] }
 
 # macOS uses Metal (or CPU-only by default)
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.9.1", default-features = false, features = [] }
-candle-nn = { version = "0.9.1", default-features = false, features = [] }
+candle-core = { version = "0.10.2", default-features = false, features = [] }
+candle-nn = { version = "0.10.2", default-features = false, features = [] }

@@ -2,13 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, '0.2.0', '0.*' ]
   pull_request:
-    branches: [ master, main ]
+    branches: [ master, main, '0.2.0' ]
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Features that require external C/system libraries (ROS2, FFmpeg, HDF5)
+  # are excluded from CI. Use --all-features only on crates without C deps.
+  # kizzasi-python is excluded because it requires Python dev headers.
+  CI_EXCLUDE: "--exclude kizzasi-python"
 
 jobs:
   test:
@@ -64,21 +68,17 @@ jobs:
 
       - name: Run clippy
         if: matrix.rust == 'stable'
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --workspace $CI_EXCLUDE -- -D warnings
 
       - name: Build workspace
-        run: cargo build --workspace --all-features --verbose
-
-      - name: Run tests (kizzasi-tokenizer)
-        working-directory: crates/kizzasi-tokenizer
-        run: cargo test --all-features --verbose
+        run: cargo build --workspace $CI_EXCLUDE --verbose
 
       - name: Run tests (all crates)
-        run: cargo test --workspace --all-features --verbose
+        run: cargo test --workspace $CI_EXCLUDE --verbose
 
       - name: Build documentation
         if: matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'
-        run: cargo doc --workspace --all-features --no-deps
+        run: cargo doc --workspace $CI_EXCLUDE --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -96,7 +96,7 @@ jobs:
         run: cargo install cargo-minimal-versions
 
       - name: Check with minimal versions
-        run: cargo minimal-versions check --workspace --all-features
+        run: cargo minimal-versions check --workspace $CI_EXCLUDE
 
   miri:
     name: Miri (Undefined Behavior Detection)
@@ -115,7 +115,7 @@ jobs:
 
       - name: Run miri tests (kizzasi-tokenizer)
         working-directory: crates/kizzasi-tokenizer
-        run: cargo miri test --all-features
+        run: cargo miri test
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
 
@@ -145,4 +145,64 @@ jobs:
         run: cargo install cargo-udeps --locked
 
       - name: Check for unused dependencies
-        run: cargo +nightly udeps --workspace --all-features
+        run: cargo +nightly udeps --workspace $CI_EXCLUDE
+
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - run: cargo check --workspace --exclude kizzasi-python
+
+  proptest:
+    name: Property Tests
+    runs-on: ubuntu-latest
+    env:
+      PROPTEST_CASES: 256
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --exclude kizzasi-python -- proptest
+
+  cross-platform:
+    name: Cross-platform Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: Run tests
+        run: cargo test --workspace --exclude kizzasi-python
+        shell: bash
+
+  perf-regression:
+    name: Performance Regression Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run performance regression tests (release)
+        run: cargo test --test perf_regression -p kizzasi-model --release -- --nocapture
+        shell: bash
+
+  wasm-check:
+    name: WASM Compilation Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Check kizzasi-tokenizer for WASM (no-default-features)
+        run: cargo check --target wasm32-unknown-unknown -p kizzasi-tokenizer --no-default-features
+      - name: Check kizzasi-tokenizer for WASM (wasm feature)
+        run: cargo check --target wasm32-unknown-unknown -p kizzasi-tokenizer --no-default-features --features wasm

@@ -267,7 +267,7 @@ impl GeometricSet {
 
                 // Project onto simplex using efficient algorithm
                 let mut sorted: Vec<f32> = x.to_vec();
-                sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                sorted.sort_by(|a, b| b.total_cmp(a));
 
                 let mut theta = 0.0;
                 let mut t_sum = 0.0;

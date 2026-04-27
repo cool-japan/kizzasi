@@ -8,17 +8,17 @@
 //! - Pitch detection using cepstrum
 
 use crate::error::{IoError, IoResult};
-use rustfft::{num_complex::Complex32, FftPlanner};
+use oxifft::{Complex, Direction, Flags, Plan};
 use scirs2_core::ndarray::Array1;
 use std::f32::consts::PI;
+
+type Complex32 = Complex<f32>;
 
 /// Real cepstrum analyzer
 ///
 /// The real cepstrum is the inverse FFT of the log magnitude spectrum.
 /// Useful for pitch detection and formant analysis.
 pub struct RealCepstrum {
-    /// FFT planner
-    planner: FftPlanner<f32>,
     /// Minimum value for logarithm (prevents log(0))
     min_log: f32,
 }
@@ -26,10 +26,7 @@ pub struct RealCepstrum {
 impl RealCepstrum {
     /// Create a new real cepstrum analyzer
     pub fn new() -> Self {
-        Self {
-            planner: FftPlanner::new(),
-            min_log: 1e-10,
-        }
+        Self { min_log: 1e-10 }
     }
 
     /// Compute real cepstrum of a signal
@@ -43,10 +40,12 @@ impl RealCepstrum {
         let n = signal.len();
 
         // Forward FFT
-        let mut buffer: Vec<Complex32> = signal.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        let input: Vec<Complex32> = signal.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        let mut buffer = vec![Complex32::new(0.0, 0.0); n];
 
-        let fft = self.planner.plan_fft_forward(n);
-        fft.process(&mut buffer);
+        let fft_plan = Plan::dft_1d(n, Direction::Forward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("FFT planning failed: {}".to_string()))?;
+        fft_plan.execute(&input, &mut buffer);
 
         // Compute log magnitude
         for sample in buffer.iter_mut() {
@@ -55,11 +54,13 @@ impl RealCepstrum {
         }
 
         // Inverse FFT
-        let ifft = self.planner.plan_fft_inverse(n);
-        ifft.process(&mut buffer);
+        let ifft_plan = Plan::dft_1d(n, Direction::Backward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("IFFT planning failed: {}".to_string()))?;
+        let mut output = vec![Complex32::new(0.0, 0.0); n];
+        ifft_plan.execute(&buffer, &mut output);
 
         // Extract real part and normalize
-        let cepstrum = buffer.iter().map(|c| c.re / n as f32).collect::<Vec<_>>();
+        let cepstrum = output.iter().map(|c| c.re / n as f32).collect::<Vec<_>>();
 
         Ok(Array1::from_vec(cepstrum))
     }
@@ -143,8 +144,6 @@ impl Default for RealCepstrum {
 /// The complex cepstrum is used for homomorphic deconvolution
 /// and minimum-phase signal analysis.
 pub struct ComplexCepstrum {
-    /// FFT planner
-    planner: FftPlanner<f32>,
     /// Minimum value for logarithm
     min_log: f32,
 }
@@ -152,10 +151,7 @@ pub struct ComplexCepstrum {
 impl ComplexCepstrum {
     /// Create a new complex cepstrum analyzer
     pub fn new() -> Self {
-        Self {
-            planner: FftPlanner::new(),
-            min_log: 1e-10,
-        }
+        Self { min_log: 1e-10 }
     }
 
     /// Compute complex cepstrum using unwrapped phase
@@ -169,10 +165,12 @@ impl ComplexCepstrum {
         let n = signal.len();
 
         // Forward FFT
-        let mut buffer: Vec<Complex32> = signal.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        let input: Vec<Complex32> = signal.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        let mut buffer = vec![Complex32::new(0.0, 0.0); n];
 
-        let fft = self.planner.plan_fft_forward(n);
-        fft.process(&mut buffer);
+        let fft_plan = Plan::dft_1d(n, Direction::Forward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("FFT planning failed: {}".to_string()))?;
+        fft_plan.execute(&input, &mut buffer);
 
         // Compute log spectrum (magnitude + phase)
         let mut log_spectrum = Vec::with_capacity(n);
@@ -191,12 +189,13 @@ impl ComplexCepstrum {
         }
 
         // Inverse FFT
-        let mut buffer = log_spectrum;
-        let ifft = self.planner.plan_fft_inverse(n);
-        ifft.process(&mut buffer);
+        let ifft_plan = Plan::dft_1d(n, Direction::Backward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("IFFT planning failed: {}".to_string()))?;
+        let mut output = vec![Complex32::new(0.0, 0.0); n];
+        ifft_plan.execute(&log_spectrum, &mut output);
 
         // Extract real part
-        let cepstrum = buffer.iter().map(|c| c.re / n as f32).collect::<Vec<_>>();
+        let cepstrum = output.iter().map(|c| c.re / n as f32).collect::<Vec<_>>();
 
         Ok(Array1::from_vec(cepstrum))
     }
@@ -302,11 +301,13 @@ impl FormantTracker {
         let liftered = self.cepstrum.lifter(&cepstrum, self.lifter_coeff);
 
         // Convert back to frequency domain via FFT
-        let mut buffer: Vec<Complex32> = liftered.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        let n = liftered.len();
+        let input: Vec<Complex32> = liftered.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        let mut buffer = vec![Complex32::new(0.0, 0.0); n];
 
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(buffer.len());
-        fft.process(&mut buffer);
+        let fft_plan = Plan::dft_1d(n, Direction::Forward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("FFT planning failed: {}".to_string()))?;
+        fft_plan.execute(&input, &mut buffer);
 
         // Compute magnitude spectrum
         let n = buffer.len();
@@ -402,8 +403,6 @@ impl CepstralDistance {
 pub struct QuefrencyFilter {
     /// Cepstrum analyzer
     cepstrum: RealCepstrum,
-    /// FFT planner for reconstruction
-    planner: FftPlanner<f32>,
 }
 
 impl QuefrencyFilter {
@@ -411,7 +410,6 @@ impl QuefrencyFilter {
     pub fn new() -> Self {
         Self {
             cepstrum: RealCepstrum::new(),
-            planner: FftPlanner::new(),
         }
     }
 
@@ -457,10 +455,12 @@ impl QuefrencyFilter {
         let n = cepstrum.len();
 
         // Forward FFT of cepstrum
-        let mut buffer: Vec<Complex32> = cepstrum.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        let input: Vec<Complex32> = cepstrum.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        let mut buffer = vec![Complex32::new(0.0, 0.0); n];
 
-        let fft = self.planner.plan_fft_forward(n);
-        fft.process(&mut buffer);
+        let fft_plan = Plan::dft_1d(n, Direction::Forward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("FFT planning failed: {}".to_string()))?;
+        fft_plan.execute(&input, &mut buffer);
 
         // Exponentiate to get spectrum
         for sample in buffer.iter_mut() {
@@ -469,10 +469,12 @@ impl QuefrencyFilter {
         }
 
         // Inverse FFT to get signal
-        let ifft = self.planner.plan_fft_inverse(n);
-        ifft.process(&mut buffer);
+        let ifft_plan = Plan::dft_1d(n, Direction::Backward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("IFFT planning failed: {}".to_string()))?;
+        let mut output = vec![Complex32::new(0.0, 0.0); n];
+        ifft_plan.execute(&buffer, &mut output);
 
-        let signal = buffer.iter().map(|c| c.re / n as f32).collect::<Vec<_>>();
+        let signal = output.iter().map(|c| c.re / n as f32).collect::<Vec<_>>();
 
         Ok(Array1::from_vec(signal))
     }

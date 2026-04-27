@@ -38,7 +38,11 @@
   - [x] Lloyd-Max quantizer for Gaussian distributions
   - [x] Custom reconstruction values
 - [ ] Perceptual quantization (psychoacoustic models) (future)
-- [ ] Entropy-constrained quantization (future)
+- [x] Entropy-constrained quantization (ECQ) (completed 2026-04-18)
+  - **Goal:** `EntropyConstrainedQuantizer` in `kizzasi-tokenizer::advanced_quant` implementing Lagrangian R-D scalar quantization: minimizes `D + λ·R` where R is empirical entropy from `entropy::compute_frequencies`. Ships with `Quantizer` + `SignalTokenizer` trait impls.
+  - **Design:** Extend `crates/kizzasi-tokenizer/src/advanced_quant.rs` (~486→~750 lines). Struct fields: `bin_edges: Vec<f32>`, `reconstruction_values: Vec<f32>`, `lambda: f32`, `target_bits_per_symbol: Option<f64>`. Constructors: `new(bin_edges, recon, lambda)`, `fit_lagrangian(signal, num_levels, lambda, max_iters, tol)`. Algorithm: percentile-init → iterate (centroid update + entropy-regularized edge update: `edge[i] = 0.5·(recon[i-1]+recon[i]) + (λ/(recon[i]-recon[i-1]))·(ln p[i-1] - ln p[i])`) until convergence. Guard: min-gap floor `1e-6·(signal.max-signal.min)`. `encode_compressed` via `HuffmanEncoder`. `fit_with_target_rate` wraps with `BitrateController` λ-adjustment.
+  - **Files:** `crates/kizzasi-tokenizer/src/advanced_quant.rs` (extend); `crates/kizzasi-tokenizer/src/lib.rs` (re-export).
+  - **Tests:** fit_lagrangian convergence on 10k-sample Gaussian N(0,1) within 50 iters; R-D tradeoff bracketed (λ=0.01 vs λ=1.0); encode→decode MSE ≤ 3× uniform baseline; compressed output shorter than raw Vec<u32>; fit_with_target_rate lands in [2.2, 2.8] bpp; determinism check.
 
 ### 4. Serialization & Persistence ✅
 - [x] Save/load tokenizer weights and configurations
@@ -190,7 +194,7 @@
   - [x] advanced_features.rs - Dropout, jitter, temporal coherence, hierarchical tokenization (compiles ✓)
   - All examples tested and verified
 - [ ] Audio processing pipeline examples (future)
-- [ ] Integration examples with kizzasi-inference (future)
+- [ ] Integration examples with kizzasi-inference (future) ← re-classify as ready: kizzasi-inference crate exists and is production
 - [ ] Architecture documentation (future)
 - [ ] Performance tuning guide (future)
 
@@ -237,7 +241,7 @@
   - [x] Variable bitrate encoding (use N of M levels)
   - [x] Residual coding between levels
   - [x] Bitrate computation and control
-- [ ] Cross-modal tokenization (audio + control) (future)
+- [x] Cross-modal tokenization (audio + control) (future)
 
 ### 15. Compatibility & Interoperability ✅
 - [x] Import/export from other frameworks (PyTorch, ONNX)
@@ -955,3 +959,10 @@
   - 5 minor clippy warnings (style only)
   - Cutting-edge ML features implemented
 
+## Proposed follow-ups
+
+- **Vague items needing decomposition:** `vqvae-candle-nn-training-integration`, `perceptual-quantization-psychoacoustic`, `lazy-evaluation-pipeline`, `edge-case-coverage`, `regression-test-suite`, `cross-modal-tokenization`, `multi-speaker-tokenization` — each should become 2-3 concrete sub-items in a future planning pass.
+- **Oversized items:** `peaq-perceptual-audio-quality` (ITU-R BS.1387 scope), `rest-api-tokenization-service` (belongs in separate service binary), `adversarial-training-perceptual` (gate on candle training-loop maturity).
+- **`kizzasi-inference-integration-examples` (currently blocked):** Re-classify as `ready` — kizzasi-inference crate is production-ready; this is now a documentation/example task.
+- **Tutorial documentation for advanced features:** Split per phase (Phase 1-5) into separate tutorial tasks.
+- **API reference updates:** Run `cargo doc --no-deps` to collect missing-doc warnings; turn those into concrete `- [ ]` items.

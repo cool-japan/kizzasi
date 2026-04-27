@@ -73,7 +73,7 @@ pub enum STLFormula {
         /// Stored as dimension index and threshold for serialization
         dimension: usize,
         threshold: f32,
-        /// If true, checks x[dim] ≥ threshold, else x[dim] ≤ threshold
+        /// If true, checks `x[dim] >= threshold`, else `x[dim] <= threshold`
         greater_than: bool,
     },
 
@@ -93,29 +93,29 @@ pub enum STLFormula {
     /// Equivalent to ¬φ₁ ∨ φ₂
     Implies(Box<STLFormula>, Box<STLFormula>),
 
-    /// Eventually (Future): ◇[a,b] φ
-    /// ρ(◇[a,b] φ, t) = sup_{t' ∈ [t+a, t+b]} ρ(φ, t')
+    /// Eventually (Future): `◇[a,b] φ`
+    /// `ρ(◇[a,b] φ, t) = sup_{t' ∈ [t+a, t+b]} ρ(φ, t')`
     Eventually {
         interval: TimeInterval,
         formula: Box<STLFormula>,
     },
 
-    /// Always (Globally): □[a,b] φ
-    /// ρ(□[a,b] φ, t) = inf_{t' ∈ [t+a, t+b]} ρ(φ, t')
+    /// Always (Globally): `□[a,b] φ`
+    /// `ρ(□[a,b] φ, t) = inf_{t' ∈ [t+a, t+b]} ρ(φ, t')`
     Always {
         interval: TimeInterval,
         formula: Box<STLFormula>,
     },
 
-    /// Until: φ₁ U[a,b] φ₂
-    /// φ₁ must hold until φ₂ becomes true within [a,b]
+    /// Until: `φ₁ U[a,b] φ₂`
+    /// φ₁ must hold until φ₂ becomes true within `[a,b]`
     Until {
         interval: TimeInterval,
         lhs: Box<STLFormula>,
         rhs: Box<STLFormula>,
     },
 
-    /// Release: φ₁ R[a,b] φ₂
+    /// Release: `φ₁ R[a,b] φ₂`
     /// φ₂ must hold until φ₁ becomes true (dual of Until)
     Release {
         interval: TimeInterval,
@@ -125,7 +125,7 @@ pub enum STLFormula {
 }
 
 impl STLFormula {
-    /// Create a predicate: x[dim] ≥ threshold
+    /// Create a predicate: `x[dim] >= threshold`
     pub fn greater_eq(name: impl Into<String>, dimension: usize, threshold: f32) -> Self {
         Self::Predicate {
             name: name.into(),
@@ -135,7 +135,7 @@ impl STLFormula {
         }
     }
 
-    /// Create a predicate: x[dim] ≤ threshold
+    /// Create a predicate: `x[dim] <= threshold`
     pub fn less_eq(name: impl Into<String>, dimension: usize, threshold: f32) -> Self {
         Self::Predicate {
             name: name.into(),
@@ -294,14 +294,16 @@ impl Signal {
         if t <= self.times[0] {
             return Some(self.values[0].clone());
         }
-        if t >= *self.times.last().unwrap() {
-            return Some(self.values.last().unwrap().clone());
+        if let Some(&last_t) = self.times.last() {
+            if t >= last_t {
+                return self.values.last().cloned();
+            }
         }
 
         // Binary search for interval
         let idx = self
             .times
-            .binary_search_by(|probe| probe.partial_cmp(&t).unwrap())
+            .binary_search_by(|probe| probe.total_cmp(&t))
             .unwrap_or_else(|i| i);
 
         if idx == 0 {
@@ -323,7 +325,9 @@ impl Signal {
         if self.times.is_empty() {
             (0.0, 0.0)
         } else {
-            (self.times[0], *self.times.last().unwrap())
+            // times is non-empty (checked above), so last() is always Some
+            let last = self.times.last().copied().unwrap_or(0.0);
+            (self.times[0], last)
         }
     }
 

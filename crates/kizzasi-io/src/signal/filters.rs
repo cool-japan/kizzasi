@@ -176,7 +176,7 @@ impl IirFilter {
     /// Create a new IIR filter with given coefficients
     ///
     /// `b` are the feedforward coefficients (numerator)
-    /// `a` are the feedback coefficients (denominator), a[0] should be 1.0
+    /// `a` are the feedback coefficients (denominator), `a[0]` should be 1.0
     pub fn new(b: Vec<f32>, a: Vec<f32>) -> IoResult<Self> {
         if b.is_empty() || a.is_empty() {
             return Err(IoError::SignalError(

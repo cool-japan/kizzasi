@@ -54,7 +54,12 @@ mod hotswap;
 #[cfg(feature = "streaming")]
 pub mod streaming;
 
-#[cfg(any(feature = "websocket", feature = "mqtt", feature = "grpc"))]
+#[cfg(any(
+    feature = "websocket",
+    feature = "mqtt",
+    feature = "grpc",
+    feature = "rest"
+))]
 pub mod adapters;
 
 pub mod versioning;

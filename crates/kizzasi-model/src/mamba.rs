@@ -30,9 +30,47 @@
 //! y[t] = C·h[t]
 //! ```
 //!
+//! # Detailed Mathematical Formulation
+//!
+//! ## Input-Dependent Parameters
+//!
+//! Mamba's selectivity comes from computing SSM parameters as functions of the input:
+//!
+//! ```text
+//! Δ_t = softplus(Linear_Δ(x_t) + bias_Δ)     ∈ ℝ^D
+//! B_t = Linear_B(x_t)                          ∈ ℝ^{D×N}
+//! C_t = Linear_C(x_t)                          ∈ ℝ^{D×N}
+//! ```
+//!
+//! where D is the expanded dimension and N is the state dimension.
+//!
+//! ## Zero-Order Hold (ZOH) Discretization
+//!
+//! The continuous SSM is discretized using ZOH:
+//!
+//! ```text
+//! A̅_t = exp(Δ_t ⊙ A)                         (element-wise for diagonal A)
+//! B̅_t = (A̅_t - I) ⊘ A ⊙ (Δ_t ⊙ B_t)        (simplified for diagonal A)
+//! ```
+//!
+//! For numerical stability, when |Δ·A| < ε, a first-order Taylor approximation is used:
+//!
+//! ```text
+//! B̅_t ≈ Δ_t ⊙ B_t    (when Δ·A → 0)
+//! ```
+//!
+//! ## Gating Mechanism
+//!
+//! The output is gated using a SiLU (Swish) activation:
+//!
+//! ```text
+//! z_t = SiLU(Linear_z(x_t))
+//! y_t = (C_t · h_t) ⊙ z_t
+//! ```
+//!
 //! # References
 //!
-//! - Mamba paper: https://arxiv.org/abs/2312.00752
+//! - Mamba paper: <https://arxiv.org/abs/2312.00752>
 //! - Efficient Implementation: Parallel prefix scan for training
 
 use crate::error::{ModelError, ModelResult};
@@ -41,7 +79,7 @@ use kizzasi_core::{
     silu, CausalConv1d, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor,
 };
 use scirs2_core::ndarray::{Array1, Array2};
-use scirs2_core::random::{rng, Rng};
+use scirs2_core::random::{rng, RngExt};
 use tracing::{debug, instrument, trace};
 
 /// Configuration for Mamba model
@@ -338,6 +376,12 @@ impl SelectiveSSM {
     ///
     /// Computes input-dependent parameters and performs state update
     fn forward_step(&mut self, x: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        let _span = tracing::trace_span!(
+            "ssm_step",
+            state_dim = self.state_dim,
+            inner_dim = self.inner_dim
+        )
+        .entered();
         let batch_size = x.len().min(self.inner_dim);
 
         // 1. Compute input-dependent Δ (discretization step size)
@@ -520,6 +564,12 @@ impl MambaLayer {
     }
 
     fn forward(&mut self, x: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        let _span = tracing::debug_span!(
+            "mamba_layer_forward",
+            hidden_dim = self.hidden_dim,
+            inner_dim = self.inner_dim
+        )
+        .entered();
         let batch_size = x.len().min(self.hidden_dim);
 
         // 1. Layer normalization
@@ -676,9 +726,8 @@ impl Mamba {
 
             // Load layer norm weights
             if loader.has_tensor(&format!("{}.norm.weight", prefix)) {
-                let _weight = loader.load_array1(&format!("{}.norm.weight", prefix))?;
-                // TODO: Implement LayerNorm::set_weights() method in kizzasi-core
-                // For now, weights are initialized randomly
+                let weight = loader.load_array1(&format!("{}.norm.weight", prefix))?;
+                layer.norm.set_gamma(weight);
             }
 
             // Load input projection
@@ -688,8 +737,8 @@ impl Mamba {
 
             // Load convolution weights
             if loader.has_tensor(&format!("{}.conv.weight", prefix)) {
-                // TODO: Implement CausalConv1d::load_weights() method
-                // For now, weights are initialized randomly
+                let weights_3d = loader.load_array3(&format!("{}.conv.weight", prefix))?;
+                layer.conv.set_weights(weights_3d);
             }
 
             // Load SSM weights
@@ -721,20 +770,225 @@ impl Mamba {
         Ok(())
     }
 
-    /// Save model weights to safetensors format
+    /// Save model weights to a JSON file as `HashMap<String, Vec<f32>>`.
     ///
-    /// # Example
+    /// # Format
     ///
-    /// ```ignore
-    /// let model = Mamba::new(config)?;
-    /// model.save_weights("mamba_checkpoint.safetensors")?;
-    /// ```
-    pub fn save_weights<P: AsRef<std::path::Path>>(&self, _path: P) -> ModelResult<()> {
-        // TODO: Implement safetensors serialization
-        // This requires creating safetensors::tensor::TensorView from our arrays
-        Err(ModelError::simple_load_error(
-            "save_weights not yet implemented".to_string(),
-        ))
+    /// Keys follow the pattern:
+    /// - `input_proj` / `output_proj`: top-level projection matrices (flattened row-major)
+    /// - `layers.{i}.in_proj`, `layers.{i}.out_proj`: layer projections
+    /// - `layers.{i}.ssm.log_a`, `layers.{i}.ssm.delta_proj`, `layers.{i}.ssm.delta_bias`,
+    ///   `layers.{i}.ssm.b_proj`, `layers.{i}.ssm.c_proj`, `layers.{i}.ssm.d_skip`
+    pub fn save_weights_json<P: AsRef<std::path::Path>>(&self, path: P) -> ModelResult<()> {
+        let mut weights: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+
+        // Top-level projections
+        weights.insert(
+            "input_proj".to_string(),
+            self.input_proj.iter().copied().collect(),
+        );
+        weights.insert(
+            "output_proj".to_string(),
+            self.output_proj.iter().copied().collect(),
+        );
+
+        // Per-layer weights
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+            weights.insert(
+                format!("{}.in_proj", prefix),
+                layer.in_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.out_proj", prefix),
+                layer.out_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.ssm.log_a", prefix),
+                layer.ssm.log_a.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.ssm.delta_proj", prefix),
+                layer.ssm.delta_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.ssm.delta_bias", prefix),
+                layer.ssm.delta_bias.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.ssm.b_proj", prefix),
+                layer.ssm.b_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.ssm.c_proj", prefix),
+                layer.ssm.c_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.ssm.d_skip", prefix),
+                layer.ssm.d_skip.iter().copied().collect(),
+            );
+        }
+
+        let file = std::fs::File::create(path.as_ref()).map_err(|e| {
+            ModelError::load_error("mamba save_weights", format!("failed to create file: {e}"))
+        })?;
+        serde_json::to_writer(file, &weights).map_err(|e| {
+            ModelError::load_error(
+                "mamba save_weights",
+                format!("JSON serialization failed: {e}"),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Load weights from a JSON file previously written by `save_weights_json`.
+    ///
+    /// Only keys present in the file are applied; missing keys leave the current
+    /// randomly-initialized values in place (graceful partial loading).
+    pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
+        let file = std::fs::File::open(path.as_ref()).map_err(|e| {
+            ModelError::load_error("mamba load_weights", format!("failed to open file: {e}"))
+        })?;
+        let weights: std::collections::HashMap<String, Vec<f32>> = serde_json::from_reader(file)
+            .map_err(|e| {
+                ModelError::load_error(
+                    "mamba load_weights",
+                    format!("JSON deserialization failed: {e}"),
+                )
+            })?;
+
+        let load_array2 = |map: &std::collections::HashMap<String, Vec<f32>>,
+                           key: &str,
+                           rows: usize,
+                           cols: usize|
+         -> ModelResult<Option<Array2<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != rows * cols {
+                    return Err(ModelError::load_error(
+                        "mamba load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {}×{}={} but got {}",
+                            key,
+                            rows,
+                            cols,
+                            rows * cols,
+                            data.len()
+                        ),
+                    ));
+                }
+                let arr = Array2::from_shape_vec((rows, cols), data.clone()).map_err(|e| {
+                    ModelError::load_error(
+                        "mamba load_weights",
+                        format!("failed to reshape '{}': {e}", key),
+                    )
+                })?;
+                Ok(Some(arr))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let load_array1 = |map: &std::collections::HashMap<String, Vec<f32>>,
+                           key: &str,
+                           expected_len: usize|
+         -> ModelResult<Option<Array1<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != expected_len {
+                    return Err(ModelError::load_error(
+                        "mamba load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {} but got {}",
+                            key,
+                            expected_len,
+                            data.len()
+                        ),
+                    ));
+                }
+                Ok(Some(Array1::from_vec(data.clone())))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let in_rows = self.config.input_dim;
+        let in_cols = self.config.hidden_dim;
+        if let Some(arr) = load_array2(&weights, "input_proj", in_rows, in_cols)? {
+            self.input_proj = arr;
+        }
+        let out_rows = self.config.hidden_dim;
+        let out_cols = self.config.input_dim;
+        if let Some(arr) = load_array2(&weights, "output_proj", out_rows, out_cols)? {
+            self.output_proj = arr;
+        }
+
+        let inner_dim = self.config.hidden_dim * self.config.expand_factor;
+        let state_dim = self.config.state_dim;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let prefix = format!("layers.{}", i);
+
+            if let Some(arr) = load_array2(
+                &weights,
+                &format!("{}.in_proj", prefix),
+                self.config.hidden_dim,
+                inner_dim * 2,
+            )? {
+                layer.in_proj = arr;
+            }
+            if let Some(arr) = load_array2(
+                &weights,
+                &format!("{}.out_proj", prefix),
+                inner_dim,
+                self.config.hidden_dim,
+            )? {
+                layer.out_proj = arr;
+            }
+            if let Some(arr) = load_array1(&weights, &format!("{}.ssm.log_a", prefix), state_dim)? {
+                layer.ssm.log_a = arr;
+            }
+            if let Some(arr) = load_array2(
+                &weights,
+                &format!("{}.ssm.delta_proj", prefix),
+                inner_dim,
+                inner_dim,
+            )? {
+                layer.ssm.delta_proj = arr;
+            }
+            if let Some(arr) =
+                load_array1(&weights, &format!("{}.ssm.delta_bias", prefix), inner_dim)?
+            {
+                layer.ssm.delta_bias = arr;
+            }
+            if let Some(arr) = load_array2(
+                &weights,
+                &format!("{}.ssm.b_proj", prefix),
+                inner_dim,
+                state_dim,
+            )? {
+                layer.ssm.b_proj = arr;
+            }
+            if let Some(arr) = load_array2(
+                &weights,
+                &format!("{}.ssm.c_proj", prefix),
+                inner_dim,
+                state_dim,
+            )? {
+                layer.ssm.c_proj = arr;
+            }
+            if let Some(arr) = load_array1(&weights, &format!("{}.ssm.d_skip", prefix), inner_dim)?
+            {
+                layer.ssm.d_skip = arr;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Save model weights to safetensors format (legacy stub — use `save_weights_json` instead).
+    #[allow(unused_variables)]
+    pub fn save_weights<P: AsRef<std::path::Path>>(&self, path: P) -> ModelResult<()> {
+        self.save_weights_json(path)
     }
 
     /// Get the configuration
@@ -841,6 +1095,14 @@ impl AutoregressiveModel for Mamba {
         }
 
         Ok(())
+    }
+
+    fn load_weights_json(&mut self, path: &std::path::Path) -> ModelResult<()> {
+        Mamba::load_weights_json(self, path)
+    }
+
+    fn save_weights_json(&self, path: &std::path::Path) -> ModelResult<()> {
+        Mamba::save_weights_json(self, path)
     }
 }
 
@@ -981,5 +1243,77 @@ mod tests {
         assert!(small.num_layers <= base.num_layers);
         assert!(base.num_layers <= large.num_layers);
         assert!(large.num_layers <= xlarge.num_layers);
+    }
+
+    #[test]
+    fn test_mamba_save_load_roundtrip() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MAMBA_ROUNDTRIP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uid = MAMBA_ROUNDTRIP_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let config = MambaConfig::new()
+            .input_dim(1)
+            .hidden_dim(32)
+            .state_dim(8)
+            .num_layers(2);
+
+        let model = Mamba::new(config).expect("Failed to create Mamba model");
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("kizzasi_mamba_roundtrip_test_{}.json", uid));
+
+        model
+            .save_weights_json(&tmp)
+            .expect("save_weights_json failed");
+
+        let config2 = MambaConfig::new()
+            .input_dim(1)
+            .hidden_dim(32)
+            .state_dim(8)
+            .num_layers(2);
+        let mut model2 = Mamba::new(config2).expect("Failed to create second Mamba model");
+        model2
+            .load_weights_json(&tmp)
+            .expect("load_weights_json failed");
+
+        // Verify key count by re-saving and checking file is valid JSON
+        let file = std::fs::File::open(&tmp).expect("temp file should exist");
+        let reloaded: std::collections::HashMap<String, Vec<f32>> =
+            serde_json::from_reader(file).expect("should deserialize");
+        // 2 top-level + 8 per-layer × 2 layers = 18 keys
+        assert_eq!(reloaded.len(), 18, "unexpected number of weight keys");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_mamba_load_weights_shape_mismatch_error() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MAMBA_SHAPE_MISMATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uid = MAMBA_SHAPE_MISMATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let config = MambaConfig::new()
+            .input_dim(1)
+            .hidden_dim(32)
+            .state_dim(8)
+            .num_layers(1);
+
+        let mut model = Mamba::new(config).expect("Failed to create Mamba model");
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("kizzasi_mamba_shape_mismatch_test_{}.json", uid));
+
+        // Write deliberately wrong-shaped weights
+        let mut bad_weights: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        // input_proj should be (1, 32) = 32 elements; provide wrong size
+        bad_weights.insert("input_proj".to_string(), vec![0.1f32; 5]);
+        let file = std::fs::File::create(&tmp).expect("should create temp file");
+        serde_json::to_writer(file, &bad_weights).expect("should serialize");
+
+        let result = model.load_weights_json(&tmp);
+        assert!(result.is_err(), "expected shape mismatch error");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

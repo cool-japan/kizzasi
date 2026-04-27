@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo bench
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use kizzasi_core::SignalPredictor;
 use kizzasi_model::{
     mamba::{Mamba, MambaConfig},
@@ -12,6 +12,7 @@ use kizzasi_model::{
     transformer::{Transformer, TransformerConfig},
 };
 use scirs2_core::ndarray::Array1;
+use std::hint::black_box;
 
 fn create_test_signal(length: usize) -> Vec<f32> {
     (0..length).map(|t| (t as f32 * 0.1).sin()).collect()

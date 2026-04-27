@@ -7,9 +7,10 @@
 //! - Guardrail validation
 //! - Advanced constraints (chance, robust, CVaR)
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kizzasi_logic::*;
 use scirs2_core::ndarray::Array1;
+use std::hint::black_box;
 
 // ============================================
 // Basic Constraint Operations

@@ -8,8 +8,9 @@
 //! - SIMD and GPU acceleration
 //! - Memory and throughput analysis
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kizzasi_tokenizer::*;
+use std::hint::black_box;
 
 // ============================================================================
 // Advanced Quantization Benchmarks

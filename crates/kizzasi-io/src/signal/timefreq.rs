@@ -9,17 +9,17 @@
 
 use crate::error::{IoError, IoResult};
 use crate::signal::spectral::WindowType;
-use rustfft::{num_complex::Complex32, FftPlanner};
+use oxifft::{Complex, Direction, Flags, Plan};
 use scirs2_core::ndarray::Array1;
 use std::f32::consts::PI;
+
+type Complex32 = Complex<f32>;
 
 /// Gabor transform analyzer
 ///
 /// The Gabor transform provides optimal joint time-frequency resolution
 /// using Gaussian windows.
 pub struct GaborTransform {
-    /// FFT planner
-    planner: FftPlanner<f32>,
     /// Sample rate
     sample_rate: f32,
 }
@@ -27,10 +27,7 @@ pub struct GaborTransform {
 impl GaborTransform {
     /// Create a new Gabor transform analyzer
     pub fn new(sample_rate: f32) -> Self {
-        Self {
-            planner: FftPlanner::new(),
-            sample_rate,
-        }
+        Self { sample_rate }
     }
 
     /// Compute Gabor transform
@@ -63,21 +60,23 @@ impl GaborTransform {
         let window = Self::gaussian_window(window_size, sigma);
 
         let mut spectrogram = Vec::with_capacity(num_frames * num_bins);
-        let fft = self.planner.plan_fft_forward(window_size);
+        let fft_plan = Plan::dft_1d(window_size, Direction::Forward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("FFT planning failed: {}".to_string()))?;
 
         for frame_idx in 0..num_frames {
             let start = frame_idx * hop_size;
             let end = (start + window_size).min(signal.len());
 
             // Windowed frame
-            let mut buffer: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); window_size];
-            for (i, buf_val) in buffer.iter_mut().enumerate().take(end - start) {
+            let mut input: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); window_size];
+            for (i, inp_val) in input.iter_mut().enumerate().take(end - start) {
                 let sig_val = signal[start + i];
-                *buf_val = Complex32::new(sig_val * window[i], 0.0);
+                *inp_val = Complex32::new(sig_val * window[i], 0.0);
             }
 
             // FFT
-            fft.process(&mut buffer);
+            let mut buffer = vec![Complex32::new(0.0, 0.0); window_size];
+            fft_plan.execute(&input, &mut buffer);
 
             // Store magnitude and phase
             spectrogram.extend_from_slice(&buffer[..num_bins]);
@@ -110,7 +109,8 @@ impl GaborTransform {
         let mut signal = vec![0.0; signal_len];
         let mut normalization = vec![0.0; signal_len];
 
-        let ifft = self.planner.plan_fft_inverse(result.window_size);
+        let ifft_plan = Plan::dft_1d(result.window_size, Direction::Backward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("IFFT planning failed: {}".to_string()))?;
 
         // Regenerate window
         let window = Self::gaussian_window(result.window_size, result.window_size as f32 / 8.0);
@@ -119,22 +119,23 @@ impl GaborTransform {
             let start = frame_idx * result.hop_size;
 
             // Get frame spectrum
-            let mut buffer: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); result.window_size];
+            let mut input: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); result.window_size];
             let frame_start = frame_idx * result.num_bins;
             for (i, coeff) in result.coefficients[frame_start..frame_start + result.num_bins]
                 .iter()
                 .enumerate()
             {
-                buffer[i] = *coeff;
+                input[i] = *coeff;
             }
 
             // Mirror for real signal
             for i in 1..result.num_bins - 1 {
-                buffer[result.window_size - i] = buffer[i].conj();
+                input[result.window_size - i] = input[i].conj();
             }
 
             // IFFT
-            ifft.process(&mut buffer);
+            let mut buffer = vec![Complex32::new(0.0, 0.0); result.window_size];
+            ifft_plan.execute(&input, &mut buffer);
 
             // Overlap-add with windowing
             for (i, &buf_val) in buffer.iter().enumerate().take(result.window_size) {
@@ -194,8 +195,6 @@ impl GaborResult {
 ///
 /// Provides frequency-dependent time-frequency resolution
 pub struct STransform {
-    /// FFT planner
-    planner: FftPlanner<f32>,
     /// Sample rate
     sample_rate: f32,
 }
@@ -203,10 +202,7 @@ pub struct STransform {
 impl STransform {
     /// Create a new S-transform analyzer
     pub fn new(sample_rate: f32) -> Self {
-        Self {
-            planner: FftPlanner::new(),
-            sample_rate,
-        }
+        Self { sample_rate }
     }
 
     /// Compute S-transform
@@ -218,20 +214,25 @@ impl STransform {
         let n = signal.len();
 
         // Forward FFT of signal
-        let mut signal_fft: Vec<Complex32> =
-            signal.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        let signal_input: Vec<Complex32> = signal.iter().map(|&x| Complex32::new(x, 0.0)).collect();
+        let mut signal_fft = vec![Complex32::new(0.0, 0.0); n];
 
-        let fft = self.planner.plan_fft_forward(n);
-        fft.process(&mut signal_fft);
+        let fft_plan = Plan::dft_1d(n, Direction::Forward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("FFT planning failed: {}".to_string()))?;
+        fft_plan.execute(&signal_input, &mut signal_fft);
 
         let mut result = Vec::with_capacity(n * n);
-        let ifft = self.planner.plan_fft_inverse(n);
+        let ifft_plan = Plan::dft_1d(n, Direction::Backward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("IFFT planning failed: {}".to_string()))?;
 
         // For each frequency
         for f_idx in 0..n {
             if f_idx == 0 {
                 // DC component
-                let avg = signal_fft.iter().sum::<Complex32>() / n as f32;
+                let sum = signal_fft
+                    .iter()
+                    .fold(Complex32::new(0.0, 0.0), |acc, &x| acc + x);
+                let avg = sum / n as f32;
                 for _ in 0..n {
                     result.push(avg);
                 }
@@ -257,9 +258,10 @@ impl STransform {
             }
 
             // IFFT
-            ifft.process(&mut windowed_fft);
+            let mut output = vec![Complex32::new(0.0, 0.0); n];
+            ifft_plan.execute(&windowed_fft, &mut output);
 
-            for &val in &windowed_fft {
+            for &val in &output {
                 result.push(val);
             }
         }
@@ -305,8 +307,6 @@ impl STransformResult {
 /// Provides high resolution time-frequency representation but suffers
 /// from cross-term interference for multi-component signals.
 pub struct WignerVille {
-    /// FFT planner
-    planner: FftPlanner<f32>,
     /// Sample rate
     sample_rate: f32,
 }
@@ -314,10 +314,7 @@ pub struct WignerVille {
 impl WignerVille {
     /// Create a new Wigner-Ville distribution analyzer
     pub fn new(sample_rate: f32) -> Self {
-        Self {
-            planner: FftPlanner::new(),
-            sample_rate,
-        }
+        Self { sample_rate }
     }
 
     /// Compute Wigner-Ville distribution
@@ -329,14 +326,15 @@ impl WignerVille {
         let n_freq = n; // Number of frequency points
 
         let mut result = Vec::with_capacity(n * n_freq);
-        let fft = self.planner.plan_fft_forward(n_freq);
+        let fft_plan = Plan::dft_1d(n_freq, Direction::Forward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("FFT planning failed: {}".to_string()))?;
 
         // Compute for each time point
         for t in 0..n {
-            let mut buffer = vec![Complex32::new(0.0, 0.0); n_freq];
+            let mut input = vec![Complex32::new(0.0, 0.0); n_freq];
 
             // Compute instantaneous autocorrelation
-            for (tau_idx, buf_val) in buffer.iter_mut().enumerate() {
+            for (tau_idx, inp_val) in input.iter_mut().enumerate() {
                 let tau = if tau_idx > n_freq / 2 {
                     tau_idx as i32 - n_freq as i32
                 } else {
@@ -348,12 +346,13 @@ impl WignerVille {
 
                 if t_plus < n && t_minus < n {
                     let val = signal[t_plus] * signal[t_minus];
-                    *buf_val = Complex32::new(val, 0.0);
+                    *inp_val = Complex32::new(val, 0.0);
                 }
             }
 
             // FFT to get frequency content
-            fft.process(&mut buffer);
+            let mut buffer = vec![Complex32::new(0.0, 0.0); n_freq];
+            fft_plan.execute(&input, &mut buffer);
 
             for &val in &buffer {
                 result.push(val.re);
@@ -467,8 +466,6 @@ impl ChoiWilliams {
 /// Improves time-frequency resolution by reassigning energy
 /// to more accurate time-frequency locations.
 pub struct ReassignedSpectrogram {
-    /// FFT planner
-    planner: FftPlanner<f32>,
     /// Sample rate
     sample_rate: f32,
 }
@@ -476,10 +473,7 @@ pub struct ReassignedSpectrogram {
 impl ReassignedSpectrogram {
     /// Create a new reassigned spectrogram analyzer
     pub fn new(sample_rate: f32) -> Self {
-        Self {
-            planner: FftPlanner::new(),
-            sample_rate,
-        }
+        Self { sample_rate }
     }
 
     /// Compute reassigned spectrogram
@@ -508,25 +502,28 @@ impl ReassignedSpectrogram {
             .collect();
 
         let mut reassigned_spec = vec![0.0; num_frames * num_bins];
-        let fft = self.planner.plan_fft_forward(window_size);
+        let fft_plan = Plan::dft_1d(window_size, Direction::Forward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("FFT planning failed: {}".to_string()))?;
 
         for frame_idx in 0..num_frames {
             let start = frame_idx * hop_size;
             let end = (start + window_size).min(signal.len());
 
             // Standard STFT
-            let mut buffer: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); window_size];
-            let mut time_weighted_buffer: Vec<Complex32> =
+            let mut input: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); window_size];
+            let mut time_weighted_input: Vec<Complex32> =
                 vec![Complex32::new(0.0, 0.0); window_size];
 
             for i in 0..(end - start) {
                 let sig_val = signal[start + i];
-                buffer[i] = Complex32::new(sig_val * window[i], 0.0);
-                time_weighted_buffer[i] = Complex32::new(sig_val * time_weighted_window[i], 0.0);
+                input[i] = Complex32::new(sig_val * window[i], 0.0);
+                time_weighted_input[i] = Complex32::new(sig_val * time_weighted_window[i], 0.0);
             }
 
-            fft.process(&mut buffer);
-            fft.process(&mut time_weighted_buffer);
+            let mut buffer = vec![Complex32::new(0.0, 0.0); window_size];
+            let mut time_weighted_buffer = vec![Complex32::new(0.0, 0.0); window_size];
+            fft_plan.execute(&input, &mut buffer);
+            fft_plan.execute(&time_weighted_input, &mut time_weighted_buffer);
 
             // Compute reassignment (simplified)
             let frame_start = frame_idx * num_bins;

@@ -30,13 +30,13 @@
 //! # References
 //!
 //! - H3 paper: "Hungry Hungry Hippos: Towards Language Modeling with State Space Models"
-//! - https://arxiv.org/abs/2212.14052
+//! - <https://arxiv.org/abs/2212.14052>
 
 use crate::error::{ModelError, ModelResult};
 use crate::{AutoregressiveModel, ModelType};
 use kizzasi_core::{silu, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor};
 use scirs2_core::ndarray::{Array1, Array2};
-use scirs2_core::random::{rng, Rng};
+use scirs2_core::random::{rng, RngExt};
 use std::collections::VecDeque;
 
 #[allow(unused_imports)]

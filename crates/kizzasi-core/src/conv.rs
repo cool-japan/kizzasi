@@ -83,7 +83,7 @@ impl CausalConv1d {
 
     /// Forward pass for a single time step (streaming/causal)
     ///
-    /// Takes input of shape [in_channels] and returns output of shape [out_channels]
+    /// Takes input of shape `[in_channels]` and returns output of shape `[out_channels]`
     pub fn forward_step(&mut self, input: &[f32]) -> Vec<f32> {
         assert_eq!(input.len(), self.in_channels);
 

@@ -27,7 +27,8 @@ mamba = []
 # Network adapters
 websocket = ["streaming", "dep:tokio-tungstenite", "dep:bytes"]
 mqtt = ["streaming", "dep:rumqttc", "dep:bytes"]
-grpc = ["streaming", "dep:tonic", "dep:prost", "dep:bytes"]
+grpc = ["streaming", "dep:tonic", "dep:prost", "dep:bytes", "dep:http", "dep:http-body", "dep:tower-service"]
+rest = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio"]
 network = ["websocket", "mqtt", "grpc"]
 
 [dependencies]
@@ -63,6 +64,12 @@ rumqttc = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+tower-service = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true

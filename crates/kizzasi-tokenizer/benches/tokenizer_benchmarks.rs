@@ -1,5 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kizzasi_tokenizer::*;
+use std::hint::black_box;
 
 fn continuous_tokenizer_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("continuous_tokenizer");

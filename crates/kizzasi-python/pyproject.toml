@@ -1,0 +1,91 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "kizzasi"
+version = "0.2.0"
+description = "Autoregressive General-Purpose Signal Predictor (AGSP) — Python bindings for Kizzasi"
+authors = [
+    {name = "COOLJAPAN OU (Team Kitasan)", email = "contact@cooljapan.tech"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+]
+keywords = [
+    "signal-processing",
+    "state-space-models",
+    "mamba",
+    "rwkv",
+    "machine-learning",
+    "time-series",
+    "real-time",
+]
+dependencies = [
+    "numpy>=1.24.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/cool-japan/kizzasi"
+Repository = "https://github.com/cool-japan/kizzasi"
+Documentation = "https://pypi.org/project/kizzasi/"
+"Bug Tracker" = "https://github.com/cool-japan/kizzasi/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "numpy>=1.24.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+]
+viz = [
+    "matplotlib>=3.7.0",
+]
+
+[tool.maturin]
+# Feature flags for the extension module
+features = ["pyo3/extension-module"]
+# Python source directory
+python-source = "python"
+# PyO3 binding mode
+binding = "pyo3"
+# ABI3 stable ABI for Python 3.10+
+abi3 = true
+abi3-py310 = true
+# Module name (matches #[pymodule] fn name)
+module-name = "kizzasi._kizzasi"
+# Manifest path relative to this directory
+manifest-path = "Cargo.toml"
+# Files to include in the sdist
+include = ["LICENSE*", "README.md", "python/kizzasi/*.pyi", "python/kizzasi/py.typed"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

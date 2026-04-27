@@ -146,7 +146,7 @@ impl ZeroCopyBuffer {
         samples
     }
 
-    /// Convert to Array1<f32>
+    /// Convert to `Array1<f32>`
     pub fn to_array(&self) -> Array1<f32> {
         Array1::from_vec(self.to_f32_samples())
     }

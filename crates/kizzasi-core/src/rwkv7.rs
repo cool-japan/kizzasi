@@ -20,7 +20,7 @@
 //! ## References
 //!
 //! - RWKV-7 paper: "RWKV: Reinventing RNNs for the Transformer Era"
-//! - https://github.com/BlinkDL/RWKV-LM
+//! - <https://github.com/BlinkDL/RWKV-LM>
 
 use crate::{CoreError, CoreResult};
 use scirs2_core::ndarray::{Array1, Array2};

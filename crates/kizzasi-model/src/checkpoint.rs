@@ -25,6 +25,7 @@
 //! ```
 
 use crate::error::{ModelError, ModelResult};
+use scirs2_core::ndarray::Array1;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -203,6 +204,133 @@ impl CheckpointManager {
                 tracing::info!("New best checkpoint with val_loss: {}", val_loss);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Weight serialization
+    // -----------------------------------------------------------------------
+
+    /// Serialise `weights` and `bias` as JSON and write to
+    /// `<checkpoint_dir>/weights_step_<step>.json`.
+    ///
+    /// Returns the path of the written file.
+    ///
+    /// # Format
+    ///
+    /// ```json
+    /// { "step": 100, "bias": 0.42, "weights": [1.0, 2.0, 3.0] }
+    /// ```
+    pub fn save_weights(
+        &self,
+        weights: &Array1<f32>,
+        bias: f32,
+        step: usize,
+    ) -> ModelResult<PathBuf> {
+        std::fs::create_dir_all(&self.checkpoint_dir).map_err(|e| {
+            ModelError::load_error(
+                "weight save",
+                format!("failed to create checkpoint directory: {e}"),
+            )
+        })?;
+
+        let path = self
+            .checkpoint_dir
+            .join(format!("weights_step_{step}.json"));
+
+        let weights_vec: Vec<f32> = weights.iter().copied().collect();
+
+        let payload = serde_json::json!({
+            "step": step,
+            "bias": bias,
+            "weights": weights_vec,
+        });
+
+        let json = serde_json::to_string_pretty(&payload).map_err(|e| {
+            ModelError::load_error("weight save", format!("serialisation failed: {e}"))
+        })?;
+
+        std::fs::write(&path, json)
+            .map_err(|e| ModelError::load_error("weight save", format!("write failed: {e}")))?;
+
+        tracing::info!("Saved weights checkpoint to {:?}", path);
+        Ok(path)
+    }
+
+    /// Load weights and bias from the JSON file at `path`.
+    ///
+    /// Returns `(weights, bias)`.
+    pub fn load_weights(path: &Path) -> ModelResult<(Array1<f32>, f32)> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| ModelError::load_error("weight load", format!("read failed: {e}")))?;
+
+        let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
+            ModelError::load_error("weight load", format!("JSON parse failed: {e}"))
+        })?;
+
+        let bias = value.get("bias").and_then(|v| v.as_f64()).ok_or_else(|| {
+            ModelError::load_error("weight load", "missing or invalid 'bias' field")
+        })? as f32;
+
+        let weights_arr = value
+            .get("weights")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                ModelError::load_error("weight load", "missing or invalid 'weights' field")
+            })?;
+
+        let weights: Vec<f32> = weights_arr
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.as_f64()
+                    .ok_or_else(|| {
+                        ModelError::load_error(
+                            "weight load",
+                            format!("weights[{i}] is not a number"),
+                        )
+                    })
+                    .map(|x| x as f32)
+            })
+            .collect::<ModelResult<Vec<f32>>>()?;
+
+        Ok((Array1::from_vec(weights), bias))
+    }
+
+    /// Return all weight checkpoint paths in the checkpoint directory, sorted
+    /// by ascending step number.
+    ///
+    /// Only files matching the pattern `weights_step_<N>.json` are included.
+    pub fn list_weight_checkpoints(&self) -> ModelResult<Vec<(usize, PathBuf)>> {
+        if !self.checkpoint_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let read_dir = std::fs::read_dir(&self.checkpoint_dir).map_err(|e| {
+            ModelError::load_error("weight list", format!("failed to read checkpoint dir: {e}"))
+        })?;
+
+        let mut results: Vec<(usize, PathBuf)> = Vec::new();
+
+        for entry in read_dir {
+            let entry = entry.map_err(|e| {
+                ModelError::load_error("weight list", format!("directory entry error: {e}"))
+            })?;
+
+            let path = entry.path();
+
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(rest) = name.strip_prefix("weights_step_") {
+                    if let Some(step_str) = rest.strip_suffix(".json") {
+                        if let Ok(step) = step_str.parse::<usize>() {
+                            results.push((step, path));
+                        }
+                    }
+                }
+            }
+        }
+
+        results.sort_by_key(|(step, _)| *step);
+        Ok(results)
     }
 
     /// Cleanup old checkpoints

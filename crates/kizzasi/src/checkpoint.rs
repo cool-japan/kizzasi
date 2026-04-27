@@ -880,9 +880,10 @@ mod tests {
         let predictor = Kizzasi::new(config).unwrap();
 
         let temp_dir = std::env::temp_dir();
-        let config_path = temp_dir.join("test_config_checkpoint.json");
-        let full_json_path = temp_dir.join("test_full_checkpoint.json");
-        let full_bin_path = temp_dir.join("test_full_checkpoint.bin");
+        let pid = std::process::id();
+        let config_path = temp_dir.join(format!("test_config_checkpoint_{}.json", pid));
+        let full_json_path = temp_dir.join(format!("test_full_checkpoint_{}.json", pid));
+        let full_bin_path = temp_dir.join(format!("test_full_checkpoint_{}.bin", pid));
 
         // Save all formats
         predictor.save_checkpoint(&config_path).unwrap();

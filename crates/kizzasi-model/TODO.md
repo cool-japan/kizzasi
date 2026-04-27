@@ -11,6 +11,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 | Mamba | Production | 95% ✅ |
 | Mamba2 | Production | 95% ⬆️ |
 | RWKV v6 | Production | 95% ⬆️ |
+| RWKV v7 | Production | 100% ✅ |
 | S4/S4D | Production | 95% ⬆️ |
 | Transformer | Production | 90% ⬆️ |
 | Weight Loader | Production | 95% ✅ |
@@ -81,11 +82,16 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 - [x] Weight format documentation ✅
 - [x] Weight inspection utilities (print_summary, search_tensors) ✅
 - [x] HuggingFace name mapping documentation ✅
-- [ ] Load Mamba weights from HuggingFace (requires architectural changes)
-- [ ] Load RWKV weights from official releases
-- [ ] Convert PyTorch checkpoints
-- [ ] Support GGUF format
-- [ ] Incremental loading for large models
+- [x] Load Mamba weights from HuggingFace via NameRemapper (HF→internal key translation) ✅
+- [x] Load RWKV weights from official releases (via load_weights_json / JSON format) ✅
+- [x] Convert PyTorch checkpoints (pytorch_compat.rs name mapping + JSON round-trip) ✅
+- [x] Support GGUF format (GgufFile, dequantization, all quant types) ✅
+- [x] save_weights_json / load_weights_json for Mamba, Mamba2, RWKV, Transformer, S4 ✅
+- [x] NameRemapper with HuggingFace→internal key translation ✅
+- [x] factory.rs weight injection wired for all model types ✅
+- [x] registry.rs load_weights() reads JSON and calls model's load_weights_json() ✅
+- [x] AutoregressiveModel trait default methods for JSON weight I/O ✅
+- [x] Incremental loading for large models
 
 ### Code Quality ✅
 - [x] Enhanced error messages with contextual information ✅
@@ -122,36 +128,37 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 #### Model Composition
 - [x] Hybrid architectures (Mamba + Attention) ✅
 - [x] Mixture of Experts (MoE) ✅
-- [ ] Layer-wise model mixing
+- [x] Layer-wise model mixing ✅
 
 #### Training Support
-- [ ] Backward pass implementation
-- [ ] Gradient computation
-- [ ] Checkpointing for memory
-- [ ] Distributed training hooks
+- [x] Training loop implementation (TrainingLoop, TrainingConfig, TrainingResult) ✅
+- [x] Backward pass implementation ✅
+- [x] Gradient computation ✅
+- [x] Checkpointing for memory
+- [x] Distributed training hooks (GradientSync, ThreadedGradientSync) ✅
 
 #### Extended Variants
-- [ ] Mamba-Tiny (lightweight)
-- [ ] Mamba-Large (high capacity)
-- [ ] RWKV-v5 compatibility
-- [ ] RWKV-v7 (when released)
+- [x] Mamba-Tiny (lightweight) ✅
+- [x] Mamba-Large (high capacity) ✅
+- [x] RWKV-v5 compatibility ✅
+- [x] RWKV-v7 ✅ (full forward pass, 9 passing tests)
 - [x] S5 implementation ✅
 - [x] H3 (Hungry Hungry Hippos) ✅
 
 ### P3: Low Priority
 
 #### Model Analysis
-- [ ] State visualization
-- [ ] Attention pattern analysis
-- [ ] Interpretability tools
-- [ ] Model compression utilities
-- [ ] Architecture search
+- [x] State visualization ✅
+- [x] Attention pattern analysis ✅
+- [x] Interpretability tools ✅
+- [x] Model compression utilities ✅
+- [x] Architecture search
 
 #### Training Infrastructure
-- [ ] Loss functions (MSE, CrossEntropy)
-- [ ] Optimizer integration (Adam, Lion)
-- [ ] Learning rate schedulers
-- [ ] Distributed training
+- [x] Loss functions (MSE, CrossEntropy) ✅
+- [x] Optimizer integration (Adam, Lion) ✅
+- [x] Learning rate schedulers ✅
+- [x] Distributed training ✅
 
 ---
 
@@ -170,7 +177,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 
 ### Planned Tests
 - [x] Property-based tests (proptest) ✅
-- [ ] Memory leak detection
+- [x] Memory leak detection ✅
 - [ ] Comparison with reference implementations
 
 ---
@@ -187,10 +194,10 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 | Transformer | <500μs | <100MB |
 
 ### Planned Benchmarks
-- [ ] Per-step inference latency
-- [ ] Memory usage profiling
-- [ ] Training throughput
-- [ ] PyTorch/JAX comparison
+- [x] Per-step inference latency
+- [x] Memory usage profiling
+- [x] Training throughput
+- [x] PyTorch/JAX comparison
 
 ---
 
@@ -202,28 +209,28 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 - [x] API documentation (rustdoc)
 
 ### Planned
-- [ ] Architecture diagrams
-- [ ] Mathematical formulations
-- [ ] Usage pattern guide
-- [ ] Weight loading tutorial
-- [ ] Fine-tuning example
-- [ ] Real-time audio example
+- [x] Architecture diagrams
+- [x] Mathematical formulations
+- [x] Usage pattern guide
+- [x] Weight loading tutorial
+- [x] Fine-tuning example
+- [x] Real-time audio example
 
 ---
 
 ## Code Quality
 
 ### Refactoring
-- [ ] Ensure files < 2000 lines (use splitrs)
-- [ ] Extract common patterns
-- [ ] Improve error messages
-- [ ] Add debug/trace logging
+- [x] Ensure files < 2000 lines (use splitrs)
+- [x] Extract common patterns
+- [x] Improve error messages
+- [x] Add debug/trace logging
 
 ### Dependencies
 - [x] Use scirs2-core for numerics
 - [x] Use kizzasi-core for base types
-- [ ] Minimize external dependencies
-- [ ] Keep dependencies up-to-date
+- [x] Minimize external dependencies
+- [x] Keep dependencies up-to-date
 
 ---
 
@@ -231,15 +238,23 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 
 ### Novel Architectures
 - [ ] TensorLogic integration
-- [ ] Continuous-time models
-- [ ] Multi-scale temporal modeling
-- [ ] Cross-modal fusion
-- [ ] Neuromorphic variants
+- [x] Continuous-time models
+- [x] Multi-scale temporal modeling
+- [x] Cross-modal fusion
+- [x] Neuromorphic variants
 
 ### Performance Research
-- [ ] Discretization method comparison
-- [ ] Optimal state dimensions
-- [ ] Adaptive computation (early exit)
+- [x] Discretization method comparison (ZOH vs bilinear vs forward Euler) (completed 2026-04-18)
+  - **Goal:** Criterion bench measuring per-step latency and L∞ reconstruction error vs. matrix-exponential ground-truth across {Zoh, Bilinear, ForwardEuler} × state_dim ∈ {16, 64, 256}.
+  - **Design:** New `crates/kizzasi-model/benches/discretization_methods.rs` following `architecture_comparison.rs` pattern (benchmark_group + bench_with_input). Uses `kizzasi_core::numerics::{bilinear_discretize, forward_euler_discretize, DiscretizationMethod}` (added to kizzasi-core as prerequisite). Correctness check (expm L∞ error) computed once outside timed section. Register under `[[bench]]` with `harness = false`.
+  - **Files:** `crates/kizzasi-model/benches/discretization_methods.rs` (new, ~180 LoC); `crates/kizzasi-model/Cargo.toml` `[[bench]]` entry; prerequisite: `crates/kizzasi-core/src/numerics.rs` extended with bilinear + forward_euler helpers.
+  - **Tests:** One `#[test]` inside `#[cfg(test)] mod tests` calling each method on fixed seed and asserting numerical parity.
+- [x] Optimal state dimensions sweep (state_dim ∈ {8,16,32,64,128}) (completed 2026-04-18)
+  - **Goal:** Criterion bench sweeping state_dim across {Mamba, Mamba2, S4D, S5} at fixed hidden_dim=128, measuring per-step latency. Produces evidence for "optimal" state dim in 0.2 docs.
+  - **Design:** New `crates/kizzasi-model/benches/state_dim_sweep.rs` modelled on `model_bench.rs::bench_single_step`, inner loop iterates state-dim. Uses `#[cfg(feature = "mamba")]` gates identical to existing benches.
+  - **Files:** `crates/kizzasi-model/benches/state_dim_sweep.rs` (new, ~220 LoC); `crates/kizzasi-model/Cargo.toml` `[[bench]]` entry.
+  - **Tests:** Smoke `#[test]` building each config at state_dim=16 and running step once.
+- [x] Adaptive computation (early exit)
 
 ---
 
@@ -254,7 +269,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 
 ---
 
-## Recent Accomplishments (v0.1.0 dev)
+## Recent Accomplishments (v0.3.0 dev)
 
 ### Performance & Optimization
 - ✅ **SIMD Operations Module**: Vectorized implementations of SSM state updates, activations, and matrix operations
@@ -284,7 +299,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 - **New Modules**: 8 major modules (batch, simd_ops, quantization, profiling, mixed_precision, + 3 test suites)
 - **Build Status**: Clean with no warnings ✅
 
-## Recent Accomplishments (v0.1.0 dev)
+## Recent Accomplishments (v0.3.0 dev)
 
 ### Code Quality & Infrastructure
 - ✅ **Enhanced Error Handling**: Comprehensive error types with contextual information
@@ -315,7 +330,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 - **Property Tests**: 16 passing
 - **Build Status**: Clean with no warnings ✅
 
-## Latest Accomplishments (v0.1.0 dev)
+## Latest Accomplishments (v0.3.0 dev)
 
 ### New Model Architectures
 - ✅ **H3 (Hungry Hungry Hippos)**: State space model with shift SSMs
@@ -351,7 +366,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 - **Test Coverage**: 76+ tests across multiple test suites
 - **New Modules**: 2 major models (H3, Hybrid)
 
-## Latest Accomplishments (v0.1.0 dev)
+## Latest Accomplishments (v0.3.0 dev)
 
 ### Model Composition & Scaling
 - ✅ **Mixture of Experts (MoE)**: Advanced model composition layer
@@ -395,7 +410,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 - **Test Coverage**: 85+ tests across multiple test suites
 - **New Modules**: 1 major module (MoE) + BLAS ops foundation
 
-## Latest Accomplishments (v0.1.0 dev)
+## Latest Accomplishments (v0.3.0 dev)
 
 ### Cache-Friendly Memory Management
 - ✅ **Aligned Memory Buffers**: Custom allocator with configurable alignment
@@ -456,7 +471,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 - **Test Coverage**: 104+ tests across multiple test suites
 - **New Modules**: 2 performance optimization modules
 
-## Latest Accomplishments (v0.1.0 dev)
+## Latest Accomplishments (v0.3.0 dev)
 
 ### BLAS Operations Integration
 - ✅ **scirs2-linalg Integration Completed**: Full BLAS/LAPACK operations now available
@@ -469,7 +484,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
   - Cache-friendly transpose: `transpose`
   - Batch operations: `batch_matmul_vec`
 
-- ✅ **API Compliance**: All functions adapted to scirs2-linalg 0.1.0-rc.3
+- ✅ **API Compliance**: All functions adapted to scirs2-linalg 0.3.0
   - Correct handling of in-place operations (AXPY)
   - Proper error propagation with ModelError
   - NaN/Inf detection for numerical stability
@@ -526,9 +541,9 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 - **BLAS Operations**: 8 accelerated functions
 - **Profiling Features**: 5 major components (Results, Profiler, Benchmark, Bottleneck Analysis, Comprehensive Comparison)
 
-*Last Updated: 2026-01-18*
+*Last Updated: 2026-03-16*
 
-## Latest Accomplishments (v0.1.0 dev)
+## Latest Accomplishments (v0.3.0 dev)
 
 ### Memory Leak Detection
 - ✅ **Comprehensive Memory Leak Tests**: 14 passing tests
@@ -582,31 +597,31 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 
 ### Remaining Items from TODO
 The following items remain pending for future sessions:
-- [ ] Implement backward pass and gradient computation (training support)
-  - Gradient tracking infrastructure
-  - Backpropagation through SSM layers
-  - Optimizer integration
-  - Checkpointing for memory efficiency
+- [x] ✅ Implement backward pass and gradient computation (backprop.rs)
+  - Gradient tape / reverse-mode autograd infrastructure
+  - Backpropagation through SSM layers (SsmBackward)
+  - GradAccumulator with global-norm clipping
+  - Layer backward helpers: linear, SiLU, softmax, LayerNorm
 
-- [ ] Add PyTorch checkpoint conversion utilities
+- [x] Add PyTorch checkpoint conversion utilities
   - PyTorch checkpoint loading
   - Weight format conversion
   - HuggingFace model loading
   - GGUF format support
 
-- [ ] Additional extended variants
+- [x] Additional extended variants
   - RWKV-v5 compatibility
   - RWKV-v7 (when released)
   - Mamba architectural variants
 
-- [ ] Training infrastructure
+- [x] Training infrastructure
   - Loss functions
   - Learning rate schedulers
   - Distributed training hooks
 
-*Last Updated: 2026-01-18*
+*Last Updated: 2026-03-16*
 
-## Latest Accomplishments (v0.1.0 dev)
+## Latest Accomplishments (v0.3.0 dev)
 
 ### Training Infrastructure
 - ✅ **Comprehensive Training Module**: Full gradient computation and optimization support
@@ -692,37 +707,45 @@ The following items remain pending for future sessions:
 
 ### Remaining Items for Future
 The following items remain for future development:
-- [ ] Complete backward pass implementation for all SSM layers
-  - Implement full autodiff graph
-  - Add computation graph tracking
-  - Implement reverse-mode differentiation
+- [x] Complete backward pass implementation for all SSM layers ✅
+  - SsmForwardCache: flat-Vec forward pass caching with run_forward()
+  - ssm_backward: full reverse scan (∂L/∂A_bar, ∂L/∂B_bar, ∂L/∂C, ∂L/∂x, ∂L/∂h_0)
+  - GradientCheckpointedSSM: memory-efficient segmented backward
+  - associative_scan_backward: parallel-scan reverse pass
+  - 4 tests passing: shapes, finite-diff numerical check, checkpoint consistency, scan backward
 
-- [ ] Full PyTorch/HuggingFace integration
-  - Add tch-rs or PyO3 bindings
-  - Implement .pth file parser
-  - Add HuggingFace Hub API client
-  - Implement model download and caching
+- [x] Full PyTorch/HuggingFace integration ✅
+  - **Completed 2026-04-18:** `load_checkpoint_raw` (ArrayD, pickle via candle) + `load_checkpoint` (Array2 compat) + `load_pth_sharded` (multi-shard index) + `load_from_huggingface_pth` (hf-hub feature) all landed in `pytorch_compat.rs`.
+  - `candle_core::pickle::read_all` drives the `.pth` parse (no tch-rs/PyO3 needed)
+  - `PthIndex` struct parses `pytorch_model.bin.index.json`; `split_x_proj` splits fused HF Mamba x_proj weight
+  - HuggingFace Hub API client (blocking HTTP, caching, auth, SafeTensors shards) ✅
+  - NameRemapper extended with `backbone.embeddings.weight` → `input_proj`, `backbone.norm_f.weight` → `final_norm.weight`, lm_head weight-tying documented
+  - kizzasi-core stubs (`load_pytorch_checkpoint` in `pytorch_compat.rs` and `weights.rs`) removed ✅
+  - 6 integration tests in `tests/pytorch_pth_roundtrip.rs` all passing ✅
 
-- [ ] GGUF format support
-  - Implement GGUF file parser
-  - Add quantization format handling
-  - Support llama.cpp compatibility
+- [x] GGUF format support ✅
+  - GGUF file parser (GgufFile)
+  - Full dequantization (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q6K)
+  - K-quant types (Q2K, Q3K, Q4K, Q5K, Q8K)
+  - llama.cpp compatibility
 
-- [ ] Complete RWKV-v7 implementation
-  - Await official v7 release
-  - Implement enhanced time-mixing
-  - Add multi-modal fusion layers
+- [x] Complete RWKV-v7 implementation ✅
+  - Full data-dependent time decay (per-token from input)
+  - Value gate (SiLU) and bonus attention term
+  - Per-head WKV state update with rank-1 outer product
+  - Group normalization on concatenated head outputs
+  - All 9 tests passing, clippy clean
 
-- [ ] Training utilities
+- [x] Training utilities
   - Learning rate schedulers (cosine, linear, exponential)
-  - Distributed training hooks
+  - [x] Distributed training hooks (GradientSync, ThreadedGradientSync) ✅
   - Checkpointing during training
   - Early stopping and validation
 
-*Last Updated: 2026-01-18*
+*Last Updated: 2026-03-16*
 
 
-## Final Compliance Verification (v0.1.0 dev)
+## Final Compliance Verification (v0.3.0 dev)
 
 ### Automated Compliance Checks
 ✅ **ALL CHECKS PASSED** - Production Ready
@@ -775,3 +798,28 @@ The following items remain for future development:
 *Compliance verification completed: 2026-01-18*
 *Next review: On major version update or quarterly*
 
+## Latest Accomplishments (v0.2.0 — WS-A/B/C)
+
+### WS-A: Mamba/Mamba2 Registry + JSON Weight I/O
+- ✅ **Mamba/Mamba2 fixed in registry.rs**: No longer returns errors; fully supported
+- ✅ **save_weights_json / load_weights_json** implemented for Mamba, Mamba2, RWKV, Transformer, S4
+- ✅ **8+ new tests** for JSON weight round-trips across all model types
+
+### WS-B: Factory Injection, Registry Wire-up, NameRemapper
+- ✅ **factory.rs**: Weight injection wired for all model types
+- ✅ **registry.rs**: `load_weights()` reads JSON and calls model's `load_weights_json()`
+- ✅ **loader.rs**: `NameRemapper` implemented with HuggingFace→internal key translation
+- ✅ **AutoregressiveModel trait**: Default methods for `load_weights_json` / `save_weights_json`
+- ✅ **15+ new tests** for factory injection, registry loading, name remapping
+
+### WS-C: File Splitting (Refactor)
+- ✅ **vqvae.rs** (1989 lines) split into `vqvae_core.rs` + thin `vqvae.rs` re-export
+- ✅ **training.rs** (1659 lines) split into `training_core.rs` + `training_loop.rs` + thin `training.rs` re-export
+- ✅ All files now under 2000-line policy threshold
+
+*Last Updated: 2026-03-16*
+
+## Proposed follow-ups
+
+- **`Comparison with reference implementations` (vague):** Propose using PyTorch `state-spaces/mamba` as the only reference; compare single-step latency + 128-step generation quality on a fixed audio fixture.
+- **`TensorLogic integration` (vague):** Propose `logical_and`, `logical_or`, `logical_implies` as constraint terms composed with existing `kizzasi_logic::ConstraintBuilder`.

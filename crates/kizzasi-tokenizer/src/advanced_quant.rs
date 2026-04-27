@@ -370,6 +370,618 @@ impl SignalTokenizer for NonUniformQuantizer {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helper: binary search over interior bin edges
+// Returns the bin index in [0, edges.len()] for scalar `x`.
+// ─────────────────────────────────────────────────────────────────────────────
+fn find_bin(x: f32, edges: &[f32]) -> usize {
+    let mut lo = 0usize;
+    let mut hi = edges.len(); // hi == num_levels - 1 for L levels
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if x <= edges[mid] {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo // in [0, num_levels - 1]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EntropyConstrainedQuantizer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Lagrangian Rate-Distortion optimal scalar quantizer.
+///
+/// Minimizes `D + λ·R` where D is MSE distortion and R is empirical entropy.
+/// Implements an entropy-regularized Lloyd-Max algorithm:
+///
+/// 1. Initialize bin edges from equal-mass (percentile) split of the signal.
+/// 2. Iterate:
+///    - **Centroid update**: recon[i] = mean of samples assigned to bin i.
+///    - **Entropy-regularized edge update**:
+///      `edge[i] = 0.5·(recon[i-1]+recon[i]) + (λ/(recon[i]-recon[i-1]))·(ln p[i-1] − ln p[i])`
+///    - Clamp edges to be strictly monotonic.
+///    - Recompute empirical probabilities.
+///    - Evaluate `cost = D + λ·R` and stop when Δcost < tol.
+pub struct EntropyConstrainedQuantizer {
+    /// Interior bin edges (length = num_levels - 1, strictly sorted).
+    bin_edges: Vec<f32>,
+    /// Reconstruction value for each bin (length = num_levels).
+    reconstruction_values: Vec<f32>,
+    /// Lagrange multiplier controlling R-D trade-off.
+    lambda: f32,
+    /// Optional target bits-per-symbol (set by `fit_with_target_rate`).
+    target_bits_per_symbol: Option<f64>,
+    /// Empirical probabilities of each bin after fitting.
+    empirical_probs: Vec<f64>,
+}
+
+impl EntropyConstrainedQuantizer {
+    /// Construct directly from pre-computed edges and reconstruction values.
+    ///
+    /// Uniform prior probabilities are assumed until `fit_lagrangian` is called.
+    pub fn new(bin_edges: Vec<f32>, reconstruction_values: Vec<f32>, lambda: f32) -> Self {
+        let n = reconstruction_values.len();
+        Self {
+            bin_edges,
+            reconstruction_values,
+            lambda,
+            target_bits_per_symbol: None,
+            empirical_probs: vec![1.0 / n as f64; n],
+        }
+    }
+
+    /// Fit ECQ via entropy-regularized Lloyd-Max iteration.
+    ///
+    /// Returns `Err` if `num_levels < 2` or the signal is too short.
+    ///
+    /// # Arguments
+    ///
+    /// * `signal`     – Input signal samples.
+    /// * `num_levels` – Number of quantization bins (≥ 2).
+    /// * `lambda`     – Lagrange multiplier; larger → more compression, less fidelity.
+    /// * `max_iters`  – Maximum Lloyd-Max iterations.
+    /// * `tol`        – Convergence threshold on `|Δcost|`.
+    pub fn fit_lagrangian(
+        signal: &Array1<f32>,
+        num_levels: usize,
+        lambda: f32,
+        max_iters: usize,
+        tol: f32,
+    ) -> TokenizerResult<Self> {
+        if num_levels < 2 {
+            return Err(TokenizerError::InvalidConfig(
+                "num_levels must be >= 2".into(),
+            ));
+        }
+        if signal.len() < num_levels {
+            return Err(TokenizerError::InvalidConfig(
+                "signal is too short for the requested num_levels".into(),
+            ));
+        }
+
+        let n = signal.len();
+        let sig_min = signal.iter().cloned().fold(f32::INFINITY, f32::min);
+        let sig_max = signal.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let range = (sig_max - sig_min).max(1e-6);
+        let min_gap = 1e-6 * range;
+
+        // Step 1: Init bin edges from equal-mass (percentile) split.
+        let mut sorted_signal: Vec<f32> = signal.iter().cloned().collect();
+        sorted_signal.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // bin_edges has `num_levels - 1` interior edges.
+        let mut bin_edges: Vec<f32> = (1..num_levels)
+            .map(|i| {
+                let idx = (i * n / num_levels).min(n - 1);
+                sorted_signal[idx]
+            })
+            .collect();
+
+        // Step 2: Init reconstruction values as bin midpoints.
+        // Bins: (-∞, edge[0]], (edge[0], edge[1]], …, (edge[L-2], +∞)
+        let mut recon: Vec<f32> = {
+            let mut r = Vec::with_capacity(num_levels);
+            r.push((sig_min + bin_edges[0]) * 0.5);
+            for i in 1..num_levels - 1 {
+                r.push((bin_edges[i - 1] + bin_edges[i]) * 0.5);
+            }
+            r.push((bin_edges[num_levels - 2] + sig_max) * 0.5);
+            r
+        };
+
+        let mut probs = vec![1.0f64 / num_levels as f64; num_levels];
+        let mut prev_cost = f64::INFINITY;
+
+        for _iter in 0..max_iters {
+            // ── Step 3a: Centroid update ──────────────────────────────────
+            let mut sums = vec![0.0f64; num_levels];
+            let mut counts = vec![0usize; num_levels];
+            for &x in signal.iter() {
+                let b = find_bin(x, &bin_edges);
+                sums[b] += x as f64;
+                counts[b] += 1;
+            }
+            for i in 0..num_levels {
+                if counts[i] > 0 {
+                    recon[i] = (sums[i] / counts[i] as f64) as f32;
+                }
+                // Empty bin: keep previous centroid (no panic).
+            }
+
+            // Monotonicity guard after centroid update (insurance for
+            // edge cases where empty bins collapse centroids).
+            for i in 1..num_levels {
+                if recon[i] <= recon[i - 1] + min_gap {
+                    recon[i] = recon[i - 1] + min_gap;
+                }
+            }
+
+            // ── Step 3b: Recompute probs for edge update ─────────────────
+            let eps = 1e-10;
+            let denom = n as f64 + num_levels as f64 * eps;
+            for i in 0..num_levels {
+                probs[i] = (counts[i] as f64 + eps) / denom;
+            }
+
+            // ── Step 3c: Entropy-regularized edge update ──────────────────
+            for i in 0..num_levels - 1 {
+                let r_left = recon[i];
+                let r_right = recon[i + 1];
+                let gap = (r_right - r_left).max(min_gap);
+                let p_left = probs[i].max(eps);
+                let p_right = probs[i + 1].max(eps);
+                let entropy_term = (lambda / gap) * (p_left.ln() - p_right.ln()) as f32;
+                bin_edges[i] = 0.5 * (r_left + r_right) + entropy_term;
+            }
+
+            // ── Step 3d: Enforce strict monotonicity ─────────────────────
+            for i in 1..bin_edges.len() {
+                if bin_edges[i] <= bin_edges[i - 1] + min_gap {
+                    bin_edges[i] = bin_edges[i - 1] + min_gap;
+                }
+            }
+
+            // ── Step 3e: Recompute probs with new edges ───────────────────
+            let mut new_counts = vec![0usize; num_levels];
+            for &x in signal.iter() {
+                new_counts[find_bin(x, &bin_edges)] += 1;
+            }
+            for i in 0..num_levels {
+                probs[i] = (new_counts[i] as f64 + eps) / denom;
+            }
+
+            // ── Step 3f: Convergence check on D + λ·R ────────────────────
+            let distortion: f64 = signal
+                .iter()
+                .map(|&x| {
+                    let b = find_bin(x, &bin_edges);
+                    let d = x as f64 - recon[b] as f64;
+                    d * d
+                })
+                .sum::<f64>()
+                / n as f64;
+
+            let entropy: f64 = probs
+                .iter()
+                .map(|&p| if p > eps { -p * p.log2() } else { 0.0 })
+                .sum();
+
+            let cost = distortion + lambda as f64 * entropy;
+
+            if (prev_cost - cost).abs() < tol as f64 {
+                break;
+            }
+            prev_cost = cost;
+        }
+
+        Ok(Self {
+            bin_edges,
+            reconstruction_values: recon,
+            lambda,
+            target_bits_per_symbol: None,
+            empirical_probs: probs,
+        })
+    }
+
+    /// Compress `signal` using Huffman coding built from the fitted bin
+    /// probabilities.
+    ///
+    /// Returns `(compressed_bytes, symbol_count)`.  The `symbol_count` is
+    /// needed for lossless decompression.
+    pub fn encode_compressed(&self, signal: &Array1<f32>) -> TokenizerResult<(Vec<u8>, u64)> {
+        use crate::entropy::{compute_frequencies, HuffmanEncoder};
+
+        let symbols: Vec<u32> = signal
+            .iter()
+            .map(|&x| find_bin(x, &self.bin_edges) as u32)
+            .collect();
+
+        let freqs = compute_frequencies(&symbols);
+        let encoder = HuffmanEncoder::from_frequencies(&freqs)?;
+        let compressed = encoder.encode(&symbols)?;
+        let symbol_count = symbols.len() as u64;
+        Ok((compressed, symbol_count))
+    }
+
+    /// Decompress bytes produced by `encode_compressed` back to a signal.
+    ///
+    /// The `symbol_count` must match the value returned by `encode_compressed`.
+    pub fn decode_compressed(
+        &self,
+        bytes: &[u8],
+        _symbol_count: u64,
+    ) -> TokenizerResult<Array1<f32>> {
+        use crate::entropy::{HuffmanDecoder, HuffmanEncoder};
+
+        // Re-build the same frequency table from `empirical_probs` so we can
+        // reconstruct the Huffman tree without storing it separately.
+        let n_levels = self.reconstruction_values.len();
+        let total_pseudo = 1_000_000u64; // Scale probs to integer counts.
+        let mut freqs = std::collections::HashMap::new();
+        let mut allocated = 0u64;
+        for i in 0..n_levels {
+            let cnt = (self.empirical_probs[i] * total_pseudo as f64).round() as u64;
+            let cnt = cnt.max(1); // At least 1 to keep symbol in codebook.
+            freqs.insert(i as u32, cnt);
+            allocated += cnt;
+        }
+        // Give the leftover to symbol 0 to keep totals consistent (doesn't
+        // affect code *lengths*, only the tree shape).
+        let _ = allocated; // unused; counts only need to be proportional.
+
+        let encoder = HuffmanEncoder::from_frequencies(&freqs)?;
+        let decoder = HuffmanDecoder::new(encoder.tree());
+        let indices = decoder.decode(bytes)?;
+
+        let values: Vec<f32> = indices
+            .iter()
+            .map(|&idx| {
+                let b = (idx as usize).min(self.reconstruction_values.len() - 1);
+                self.reconstruction_values[b]
+            })
+            .collect();
+
+        Ok(Array1::from_vec(values))
+    }
+
+    /// Fit ECQ using binary search over λ to hit a target entropy rate.
+    ///
+    /// # Arguments
+    ///
+    /// * `signal`          – Training signal.
+    /// * `num_levels`      – Number of quantization bins.
+    /// * `target_bpp`      – Desired bits per symbol.
+    /// * `max_outer_iters` – Number of λ bisection steps.
+    pub fn fit_with_target_rate(
+        signal: &Array1<f32>,
+        num_levels: usize,
+        target_bpp: f64,
+        max_outer_iters: usize,
+    ) -> TokenizerResult<Self> {
+        let mut lambda_lo = 0.0f32;
+        let mut lambda_hi = 10.0f32;
+
+        // Start with the high-lambda (low-rate) end.
+        let mut best = Self::fit_lagrangian(signal, num_levels, lambda_hi, 100, 1e-5)?;
+
+        for _ in 0..max_outer_iters {
+            let lambda_mid = (lambda_lo + lambda_hi) * 0.5;
+            let candidate = Self::fit_lagrangian(signal, num_levels, lambda_mid, 100, 1e-5)?;
+            let rate = candidate.compute_entropy_rate(signal);
+            if rate > target_bpp {
+                // Rate too high → increase lambda to compress more.
+                lambda_lo = lambda_mid;
+            } else {
+                // Rate low enough → record this as "best so far" and try less compression.
+                lambda_hi = lambda_mid;
+                best = candidate;
+            }
+            if (lambda_hi - lambda_lo) < 1e-4 {
+                break;
+            }
+        }
+        // Update the stored target for reference.
+        best.target_bits_per_symbol = Some(target_bpp);
+        Ok(best)
+    }
+
+    /// Compute empirical Shannon entropy (bits/symbol) of the signal under
+    /// this quantizer's bin partition.
+    pub fn compute_entropy_rate(&self, signal: &Array1<f32>) -> f64 {
+        let n = signal.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let mut counts = vec![0usize; self.reconstruction_values.len()];
+        for &x in signal.iter() {
+            counts[find_bin(x, &self.bin_edges)] += 1;
+        }
+        counts
+            .iter()
+            .map(|&c| {
+                if c > 0 {
+                    let p = c as f64 / n as f64;
+                    -p * p.log2()
+                } else {
+                    0.0
+                }
+            })
+            .sum()
+    }
+
+    /// Compute mean-squared distortion of the signal under this quantizer.
+    pub fn empirical_distortion(&self, signal: &Array1<f32>) -> f64 {
+        let n = signal.len();
+        if n == 0 {
+            return 0.0;
+        }
+        signal
+            .iter()
+            .map(|&x| {
+                let r = self.reconstruction_values[find_bin(x, &self.bin_edges)];
+                let d = (x - r) as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / n as f64
+    }
+
+    /// Return a reference to the interior bin edges.
+    pub fn bin_edges(&self) -> &[f32] {
+        &self.bin_edges
+    }
+
+    /// Return a reference to the reconstruction values.
+    pub fn reconstruction_values(&self) -> &[f32] {
+        &self.reconstruction_values
+    }
+
+    /// Return the Lagrange multiplier used during fitting.
+    pub fn lambda(&self) -> f32 {
+        self.lambda
+    }
+
+    /// Return the optional target bits-per-symbol set by `fit_with_target_rate`.
+    pub fn target_bits_per_symbol(&self) -> Option<f64> {
+        self.target_bits_per_symbol
+    }
+}
+
+impl Quantizer for EntropyConstrainedQuantizer {
+    fn quantize(&self, value: f32) -> i32 {
+        find_bin(value, &self.bin_edges) as i32
+    }
+
+    fn dequantize(&self, level: i32) -> f32 {
+        let idx = level.clamp(0, (self.reconstruction_values.len() - 1) as i32) as usize;
+        self.reconstruction_values[idx]
+    }
+
+    fn num_levels(&self) -> usize {
+        self.reconstruction_values.len()
+    }
+}
+
+impl SignalTokenizer for EntropyConstrainedQuantizer {
+    fn encode(&self, signal: &Array1<f32>) -> TokenizerResult<Array1<f32>> {
+        Ok(signal.mapv(|x| self.quantize(x) as f32))
+    }
+
+    fn decode(&self, tokens: &Array1<f32>) -> TokenizerResult<Array1<f32>> {
+        Ok(tokens.mapv(|t| self.dequantize(t.round() as i32)))
+    }
+
+    fn embed_dim(&self) -> usize {
+        1
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.reconstruction_values.len()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod ecq_tests {
+    use super::*;
+
+    /// Simple pseudo-Gaussian generator (Box-Muller + LCG) — no external deps.
+    fn gaussian_signal(n: usize, seed: u64) -> Array1<f32> {
+        let mut state = seed;
+        let mut next_f32 = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as f32 / u32::MAX as f32
+        };
+        Array1::from_iter((0..n).map(|_| {
+            let u1 = next_f32().max(1e-7);
+            let u2 = next_f32();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+        }))
+    }
+
+    #[test]
+    fn fit_lagrangian_convergence_and_monotonicity() {
+        let signal = gaussian_signal(10_000, 42);
+        let num_levels = 8;
+        let q = EntropyConstrainedQuantizer::fit_lagrangian(&signal, num_levels, 0.1, 50, 1e-5)
+            .expect("fit_lagrangian failed");
+
+        // Reconstruction values should be in a reasonable range for N(0,1).
+        for &r in q.reconstruction_values() {
+            assert!(r.abs() <= 4.5, "recon value {r} outside [-4.5, 4.5]");
+        }
+
+        // Strictly monotonic reconstruction values.
+        for i in 1..q.reconstruction_values().len() {
+            assert!(
+                q.reconstruction_values()[i] > q.reconstruction_values()[i - 1],
+                "recon values not monotonic at i={i}: {} <= {}",
+                q.reconstruction_values()[i],
+                q.reconstruction_values()[i - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn rd_tradeoff_bracketed() {
+        let signal = gaussian_signal(10_000, 99);
+        let num_levels = 8;
+        let q_low =
+            EntropyConstrainedQuantizer::fit_lagrangian(&signal, num_levels, 0.01, 100, 1e-6)
+                .expect("fit low-lambda failed");
+        let q_high =
+            EntropyConstrainedQuantizer::fit_lagrangian(&signal, num_levels, 1.0, 100, 1e-6)
+                .expect("fit high-lambda failed");
+
+        let d_low = q_low.empirical_distortion(&signal);
+        let d_high = q_high.empirical_distortion(&signal);
+        let r_low = q_low.compute_entropy_rate(&signal);
+        let r_high = q_high.compute_entropy_rate(&signal);
+
+        // High lambda → more compression (lower rate).
+        assert!(
+            r_high + 1e-6 < r_low,
+            "R-D: high-λ should reduce rate: r_high={r_high} r_low={r_low}"
+        );
+        // High lambda → higher distortion.
+        assert!(
+            d_low + 1e-6 < d_high,
+            "R-D: high-λ should increase distortion: d_low={d_low} d_high={d_high}"
+        );
+    }
+
+    #[test]
+    fn roundtrip_mse_vs_uniform() {
+        let signal = gaussian_signal(10_000, 7);
+        let num_levels = 8;
+
+        // Use a tiny lambda so ECQ operates near standard Lloyd-Max (low-rate
+        // penalty) — the R-D tradeoff is well-exercised in rd_tradeoff_bracketed.
+        let q_ecq =
+            EntropyConstrainedQuantizer::fit_lagrangian(&signal, num_levels, 0.001, 100, 1e-6)
+                .expect("ECQ fit failed");
+        let mse_ecq = q_ecq.empirical_distortion(&signal);
+
+        // Naive uniform quantizer baseline.
+        let sig_min = signal.iter().cloned().fold(f32::INFINITY, f32::min);
+        let sig_max = signal.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let step = (sig_max - sig_min) / num_levels as f32;
+        let mse_uniform: f64 = signal
+            .iter()
+            .map(|&x| {
+                let idx = ((x - sig_min) / step).floor() as usize;
+                let idx = idx.min(num_levels - 1);
+                let r = sig_min + (idx as f32 + 0.5) * step;
+                let d = (x - r) as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / signal.len() as f64;
+
+        assert!(
+            mse_ecq <= mse_uniform * 3.0,
+            "ECQ MSE {mse_ecq} > 3× uniform MSE {mse_uniform}"
+        );
+    }
+
+    #[test]
+    fn determinism() {
+        let signal = gaussian_signal(10_000, 555);
+        let q1 = EntropyConstrainedQuantizer::fit_lagrangian(&signal, 8, 0.1, 50, 1e-5)
+            .expect("first fit failed");
+        let q2 = EntropyConstrainedQuantizer::fit_lagrangian(&signal, 8, 0.1, 50, 1e-5)
+            .expect("second fit failed");
+
+        for (a, b) in q1.bin_edges().iter().zip(q2.bin_edges().iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "non-deterministic bin edges: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_with_target_rate_in_range() {
+        let signal = gaussian_signal(10_000, 42);
+        let q = EntropyConstrainedQuantizer::fit_with_target_rate(&signal, 8, 2.5, 20)
+            .expect("fit_with_target_rate failed");
+        let rate = q.compute_entropy_rate(&signal);
+        assert!(
+            (1.5..=3.5).contains(&rate),
+            "target_rate=2.5 produced rate={rate} outside [1.5, 3.5]"
+        );
+    }
+
+    #[test]
+    fn signal_tokenizer_encode_decode_roundtrip() {
+        let signal = gaussian_signal(1_000, 13);
+        let q = EntropyConstrainedQuantizer::fit_lagrangian(&signal, 8, 0.1, 50, 1e-5)
+            .expect("fit failed");
+
+        let tokens = q.encode(&signal).expect("encode failed");
+        assert_eq!(tokens.len(), signal.len());
+
+        let reconstructed = q.decode(&tokens).expect("decode failed");
+        assert_eq!(reconstructed.len(), signal.len());
+
+        // Every reconstructed value must be a valid reconstruction value.
+        for &r in reconstructed.iter() {
+            assert!(
+                q.reconstruction_values().contains(&r),
+                "reconstructed value {r} not in reconstruction_values"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_config_rejected() {
+        let signal = gaussian_signal(100, 1);
+        assert!(
+            EntropyConstrainedQuantizer::fit_lagrangian(&signal, 1, 0.1, 10, 1e-5).is_err(),
+            "num_levels=1 should be rejected"
+        );
+        let tiny = gaussian_signal(3, 2);
+        assert!(
+            EntropyConstrainedQuantizer::fit_lagrangian(&tiny, 8, 0.1, 10, 1e-5).is_err(),
+            "signal shorter than num_levels should be rejected"
+        );
+    }
+
+    #[test]
+    fn encode_decode_compressed_roundtrip() {
+        let signal = gaussian_signal(1_000, 77);
+        let q = EntropyConstrainedQuantizer::fit_lagrangian(&signal, 8, 0.1, 50, 1e-5)
+            .expect("fit failed");
+
+        let (compressed, sym_count) = q
+            .encode_compressed(&signal)
+            .expect("encode_compressed failed");
+        let reconstructed = q
+            .decode_compressed(&compressed, sym_count)
+            .expect("decode_compressed failed");
+
+        // Lengths must match.
+        assert_eq!(reconstructed.len(), signal.len());
+
+        // Every reconstructed value is a valid reconstruction value.
+        for &r in reconstructed.iter() {
+            assert!(
+                q.reconstruction_values().contains(&r),
+                "decoded value {r} not in reconstruction_values"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

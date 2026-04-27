@@ -170,12 +170,24 @@ impl MemoryStats {
         let elem_count: usize = tensor.dims().iter().product();
         let dtype_size = match tensor.dtype() {
             candle_core::DType::U8 => 1,
+            candle_core::DType::I16 => 2,
             candle_core::DType::U32 => 4,
+            candle_core::DType::I32 => 4,
             candle_core::DType::I64 => 8,
-            candle_core::DType::F16 => 2,
             candle_core::DType::BF16 => 2,
+            candle_core::DType::F16 => 2,
             candle_core::DType::F32 => 4,
             candle_core::DType::F64 => 8,
+            // 8-bit float formats: 1 byte per element
+            candle_core::DType::F8E4M3 => 1,
+            candle_core::DType::F8E8M0 => 1,
+            // Sub-byte formats: round up to 1 byte per element for memory tracking purposes
+            // (actual storage is packed, but we conservatively over-count here)
+            candle_core::DType::F6E2M3 => 1,
+            candle_core::DType::F6E3M2 => 1,
+            candle_core::DType::F4 => 1,
+            // Unknown future variants from #[non_exhaustive] DType; not tracked
+            _ => 0,
         };
         elem_count * dtype_size
     }

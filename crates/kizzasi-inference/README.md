@@ -47,7 +47,7 @@ while let Some(prediction) = stream.next().await {
 
 - Single-step latency: <100μs (Mamba2)
 - Throughput: 320K predictions/sec (16 workers)
-- 177 comprehensive tests, all passing
+- 202 comprehensive tests, all passing
 
 ## Documentation
 
@@ -56,4 +56,4 @@ while let Some(prediction) = stream.next().await {
 
 ## License
 
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+Licensed under the Apache License, Version 2.0.

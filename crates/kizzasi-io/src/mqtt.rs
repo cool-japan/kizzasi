@@ -11,7 +11,7 @@
 use crate::error::{IoError, IoResult};
 use crate::stream::{SignalStream, StreamConfig};
 use rumqttc::{
-    AsyncClient, Event, EventLoop, Incoming, MqttOptions, QoS, TlsConfiguration, Transport,
+    AsyncClient, Broker, Event, EventLoop, Incoming, MqttOptions, QoS, TlsConfiguration, Transport,
 };
 use scirs2_core::ndarray::Array1;
 use serde::{Deserialize, Serialize};
@@ -262,15 +262,15 @@ impl MqttClient {
 
     /// Connect to the MQTT broker and start receiving messages
     pub async fn connect(&mut self) -> IoResult<()> {
-        let mut options =
-            MqttOptions::new(&self.config.client_id, &self.config.host, self.config.port);
+        let broker = Broker::tcp(self.config.host.as_str(), self.config.port);
+        let mut options = MqttOptions::new(&self.config.client_id, broker);
 
-        options.set_keep_alive(Duration::from_secs(self.config.keep_alive_secs));
+        options.set_keep_alive(self.config.keep_alive_secs.try_into().unwrap_or(u16::MAX));
         options.set_clean_session(self.config.clean_session);
 
         // Set credentials if provided
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
-            options.set_credentials(username, password);
+            options.set_credentials(username.clone(), password.clone());
         }
 
         // Configure TLS if enabled
@@ -367,7 +367,12 @@ impl MqttClient {
 
             match eventloop.poll().await {
                 Ok(Event::Incoming(Incoming::Publish(p))) => {
-                    debug!("MQTT received on '{}': {} bytes", p.topic, p.payload.len());
+                    let topic_str = String::from_utf8_lossy(&p.topic).into_owned();
+                    debug!(
+                        "MQTT received on '{}': {} bytes",
+                        topic_str,
+                        p.payload.len()
+                    );
 
                     // Handle retained messages
                     if p.retain && !config.handle_retained {
@@ -377,7 +382,7 @@ impl MqttClient {
 
                     // Store raw message
                     let msg = MqttMessage {
-                        topic: p.topic.clone(),
+                        topic: topic_str.clone(),
                         payload: p.payload.to_vec(),
                         qos: match p.qos {
                             QoS::AtMostOnce => QosLevel::AtMostOnce,

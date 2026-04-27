@@ -29,7 +29,7 @@ use scirs2_core::ndarray::{Array1, Array2, Zip};
 ///
 /// # Returns
 ///
-/// Result array with out[i] = a[i] * b[i] + c[i]
+/// Result array with `out[i] = a[i] * b[i] + c[i]`
 #[inline]
 pub fn fused_mul_add(a: &Array1<f32>, b: &Array1<f32>, c: &Array1<f32>) -> Array1<f32> {
     debug_assert_eq!(a.len(), b.len());
@@ -71,7 +71,7 @@ pub fn fused_mul_scalar_add(a: &Array1<f32>, scalar: f32, b: &Array1<f32>) -> Ar
     result
 }
 
-/// Element-wise exponential: out[i] = exp(a[i])
+/// Element-wise exponential: `out[i] = exp(a[i])`
 ///
 /// Optimized implementation using vectorized exp when available
 #[inline]
@@ -79,13 +79,13 @@ pub fn exp_array(a: &Array1<f32>) -> Array1<f32> {
     a.mapv(f32::exp)
 }
 
-/// Element-wise natural logarithm: out[i] = ln(a[i])
+/// Element-wise natural logarithm: `out[i] = ln(a[i])`
 #[inline]
 pub fn ln_array(a: &Array1<f32>) -> Array1<f32> {
     a.mapv(f32::ln)
 }
 
-/// SiLU activation: out[i] = x[i] * sigmoid(x[i])
+/// SiLU activation: `out[i] = x[i] * sigmoid(x[i])`
 ///
 /// Also known as Swish activation. Uses optimized sigmoid approximation.
 #[inline]
@@ -132,7 +132,7 @@ pub fn gelu(x: &Array1<f32>) -> Array1<f32> {
 
 /// Optimized SSM state update kernel
 ///
-/// Performs the recurrent state update: h[t] = a * h[t-1] + b * x[t]
+/// Performs the recurrent state update: `h[t] = a * h[t-1] + b * x[t]`
 ///
 /// # Arguments
 ///
@@ -176,9 +176,9 @@ pub fn ssm_state_update(
 ///
 /// # Arguments
 ///
-/// * `state` - Previous state [state_dim]
-/// * `a_diag` - Diagonal A matrix elements [state_dim]
-/// * `b` - B vector [state_dim]
+/// * `state` - Previous state `[state_dim]`
+/// * `a_diag` - Diagonal A matrix elements `[state_dim]`
+/// * `b` - B vector `[state_dim]`
 /// * `x_scalar` - Scalar input value
 ///
 /// # Returns
@@ -213,12 +213,12 @@ pub fn diagonal_ssm_update(
 ///
 /// # Arguments
 ///
-/// * `matrix` - Matrix [m, n]
-/// * `vector` - Vector [n]
+/// * `matrix` - Matrix `[m, n]`
+/// * `vector` - Vector `[n]`
 ///
 /// # Returns
 ///
-/// Result vector [m]
+/// Result vector `[m]`
 #[inline]
 pub fn matvec(matrix: &Array2<f32>, vector: &Array1<f32>) -> Array1<f32> {
     let (m, n) = matrix.dim();

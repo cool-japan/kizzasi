@@ -28,14 +28,14 @@
 //!
 //! # References
 //!
-//! - S5 paper: https://arxiv.org/abs/2208.04933
+//! - S5 paper: <https://arxiv.org/abs/2208.04933>
 //! - Efficiently Modeling Long Sequences with Structured State Spaces
 
 use crate::error::{ModelError, ModelResult};
 use crate::{AutoregressiveModel, ModelType};
 use kizzasi_core::{gelu, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor};
 use scirs2_core::ndarray::{Array1, Array2};
-use scirs2_core::random::{rng, Rng};
+use scirs2_core::random::{rng, RngExt};
 
 #[allow(unused_imports)]
 use tracing::{debug, instrument, trace};

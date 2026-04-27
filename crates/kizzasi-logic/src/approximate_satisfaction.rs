@@ -58,7 +58,8 @@ impl<C: ViolationComputable + Clone> HierarchicalRelaxation<C> {
         self.constraints
             .push(HierarchicalConstraint::new(constraint, priority, weight));
         // Sort by priority (descending)
-        self.constraints.sort_by(|a, b| b.priority.cmp(&a.priority));
+        self.constraints
+            .sort_by_key(|c| std::cmp::Reverse(c.priority));
     }
 
     /// Solve with hierarchical relaxation

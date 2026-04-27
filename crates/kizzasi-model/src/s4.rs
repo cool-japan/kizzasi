@@ -34,10 +34,43 @@
 //! For S4D, A is diagonal: A = diag(-exp(α₁), -exp(α₂), ..., -exp(αₙ))
 //! This makes discretization and computation much simpler.
 //!
+//! # Discretization Methods Comparison
+//!
+//! S4/S4D supports multiple discretization methods:
+//!
+//! ## Zero-Order Hold (ZOH) — Default
+//! ```text
+//! A̅ = exp(Δ · A)
+//! B̅ = A⁻¹(A̅ - I) · B = (exp(Δ·A) - I) · A⁻¹ · B
+//! ```
+//! Best for: piecewise-constant inputs (sampled signals)
+//!
+//! ## Bilinear (Tustin's method)
+//! ```text
+//! A̅ = (I + Δ/2 · A)(I - Δ/2 · A)⁻¹
+//! B̅ = Δ · (I - Δ/2 · A)⁻¹ · B
+//! ```
+//! Best for: frequency-domain preservation, stability guarantees
+//!
+//! ## Forward Euler
+//! ```text
+//! A̅ = I + Δ · A
+//! B̅ = Δ · B
+//! ```
+//! Simplest but may be unstable for large Δ·A
+//!
+//! ## HiPPO Initialization
+//!
+//! S4D uses HiPPO-LegS initialization for the diagonal A matrix:
+//! ```text
+//! A_n = -(n + 1/2)    for n = 0, 1, ..., N-1
+//! ```
+//! This captures a compressed history of the input via Legendre polynomial projections.
+//!
 //! # References
 //!
-//! - S4 paper: https://arxiv.org/abs/2111.00396
-//! - S4D paper: https://arxiv.org/abs/2206.11893
+//! - S4 paper: <https://arxiv.org/abs/2111.00396>
+//! - S4D paper: <https://arxiv.org/abs/2206.11893>
 
 use crate::error::{ModelError, ModelResult};
 use crate::{AutoregressiveModel, ModelType};
@@ -45,7 +78,7 @@ use kizzasi_core::{
     gelu, CausalConv1d, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor,
 };
 use scirs2_core::ndarray::{Array1, Array2};
-use scirs2_core::random::{rng, Rng};
+use scirs2_core::random::{rng, RngExt};
 #[allow(unused_imports)]
 use tracing::{debug, instrument, trace};
 
@@ -502,13 +535,176 @@ impl S4D {
         Ok(())
     }
 
-    /// Save weights to a SafeTensors model file (stub for future implementation)
+    /// Save model weights to a JSON file as `HashMap<String, Vec<f32>>`.
+    ///
+    /// Keys:
+    /// - `input_proj` / `output_proj`: top-level projections
+    /// - `layers.{i}.output_proj`
+    /// - `layers.{i}.s4_kernel.log_a`, `.b_matrix`, `.c_matrix`, `.d_skip`, `.log_dt`
+    pub fn save_weights_json<P: AsRef<std::path::Path>>(&self, path: P) -> ModelResult<()> {
+        let mut weights: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+
+        weights.insert(
+            "input_proj".to_string(),
+            self.input_proj.iter().copied().collect(),
+        );
+        weights.insert(
+            "output_proj".to_string(),
+            self.output_proj.iter().copied().collect(),
+        );
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+            let kp = format!("{}.s4_kernel", prefix);
+
+            weights.insert(
+                format!("{}.output_proj", prefix),
+                layer.output_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.log_a", kp),
+                layer.s4_kernel.log_a.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.b_matrix", kp),
+                layer.s4_kernel.b_matrix.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.c_matrix", kp),
+                layer.s4_kernel.c_matrix.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.d_skip", kp),
+                layer.s4_kernel.d_skip.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.log_dt", kp),
+                layer.s4_kernel.log_dt.iter().copied().collect(),
+            );
+        }
+
+        let file = std::fs::File::create(path.as_ref()).map_err(|e| {
+            ModelError::load_error("s4d save_weights", format!("failed to create file: {e}"))
+        })?;
+        serde_json::to_writer(file, &weights).map_err(|e| {
+            ModelError::load_error(
+                "s4d save_weights",
+                format!("JSON serialization failed: {e}"),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Load weights from a JSON file previously written by `save_weights_json`.
+    pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
+        let file = std::fs::File::open(path.as_ref()).map_err(|e| {
+            ModelError::load_error("s4d load_weights", format!("failed to open file: {e}"))
+        })?;
+        let weights: std::collections::HashMap<String, Vec<f32>> = serde_json::from_reader(file)
+            .map_err(|e| {
+                ModelError::load_error(
+                    "s4d load_weights",
+                    format!("JSON deserialization failed: {e}"),
+                )
+            })?;
+
+        let load_array2 = |map: &std::collections::HashMap<String, Vec<f32>>,
+                           key: &str,
+                           rows: usize,
+                           cols: usize|
+         -> ModelResult<Option<Array2<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != rows * cols {
+                    return Err(ModelError::load_error(
+                        "s4d load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {}×{}={} but got {}",
+                            key,
+                            rows,
+                            cols,
+                            rows * cols,
+                            data.len()
+                        ),
+                    ));
+                }
+                let arr = Array2::from_shape_vec((rows, cols), data.clone()).map_err(|e| {
+                    ModelError::load_error(
+                        "s4d load_weights",
+                        format!("failed to reshape '{}': {e}", key),
+                    )
+                })?;
+                Ok(Some(arr))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let load_array1 = |map: &std::collections::HashMap<String, Vec<f32>>,
+                           key: &str,
+                           expected_len: usize|
+         -> ModelResult<Option<Array1<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != expected_len {
+                    return Err(ModelError::load_error(
+                        "s4d load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {} but got {}",
+                            key,
+                            expected_len,
+                            data.len()
+                        ),
+                    ));
+                }
+                Ok(Some(Array1::from_vec(data.clone())))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let hidden = self.config.hidden_dim;
+        let state = self.config.state_dim;
+
+        if let Some(arr) = load_array2(&weights, "input_proj", self.config.input_dim, hidden)? {
+            self.input_proj = arr;
+        }
+        if let Some(arr) = load_array2(&weights, "output_proj", hidden, self.config.input_dim)? {
+            self.output_proj = arr;
+        }
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let prefix = format!("layers.{}", i);
+            let kp = format!("{}.s4_kernel", prefix);
+
+            if let Some(arr) =
+                load_array2(&weights, &format!("{}.output_proj", prefix), hidden, hidden)?
+            {
+                layer.output_proj = arr;
+            }
+            if let Some(arr) = load_array1(&weights, &format!("{}.log_a", kp), state)? {
+                layer.s4_kernel.log_a = arr;
+            }
+            if let Some(arr) = load_array2(&weights, &format!("{}.b_matrix", kp), state, hidden)? {
+                layer.s4_kernel.b_matrix = arr;
+            }
+            if let Some(arr) = load_array2(&weights, &format!("{}.c_matrix", kp), hidden, state)? {
+                layer.s4_kernel.c_matrix = arr;
+            }
+            if let Some(arr) = load_array1(&weights, &format!("{}.d_skip", kp), hidden)? {
+                layer.s4_kernel.d_skip = arr;
+            }
+            if let Some(arr) = load_array1(&weights, &format!("{}.log_dt", kp), hidden)? {
+                layer.s4_kernel.log_dt = arr;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Save weights to a SafeTensors model file (legacy stub — use `save_weights_json` instead).
     #[allow(unused_variables)]
     pub fn save_weights(&self, path: &str) -> ModelResult<()> {
-        // TODO: Implement SafeTensors saving
-        Err(ModelError::simple_load_error(
-            "S4D save_weights not yet implemented".to_string(),
-        ))
+        self.save_weights_json(path)
     }
 }
 
@@ -587,6 +783,14 @@ impl AutoregressiveModel for S4D {
 
         Ok(())
     }
+
+    fn load_weights_json(&mut self, path: &std::path::Path) -> ModelResult<()> {
+        S4D::load_weights_json(self, path)
+    }
+
+    fn save_weights_json(&self, path: &std::path::Path) -> ModelResult<()> {
+        S4D::save_weights_json(self, path)
+    }
 }
 
 #[cfg(test)]
@@ -627,5 +831,36 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_s4_save_load_roundtrip() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static S4_ROUNDTRIP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uid = S4_ROUNDTRIP_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let config = S4Config::new().hidden_dim(32).state_dim(8).num_layers(2);
+        let model = S4D::new(config).expect("Failed to create S4D model");
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("kizzasi_s4_roundtrip_test_{}.json", uid));
+
+        model
+            .save_weights_json(&tmp)
+            .expect("save_weights_json failed");
+
+        let config2 = S4Config::new().hidden_dim(32).state_dim(8).num_layers(2);
+        let mut model2 = S4D::new(config2).expect("Failed to create second S4D model");
+        model2
+            .load_weights_json(&tmp)
+            .expect("load_weights_json failed");
+
+        // Verify key count: 2 top-level + 6 per-layer × 2 layers = 14 keys
+        let file = std::fs::File::open(&tmp).expect("temp file should exist");
+        let reloaded: std::collections::HashMap<String, Vec<f32>> =
+            serde_json::from_reader(file).expect("should deserialize");
+        assert_eq!(reloaded.len(), 14, "unexpected number of weight keys");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

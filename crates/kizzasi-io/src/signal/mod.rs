@@ -20,6 +20,7 @@ pub mod cepstral;
 pub mod filters;
 pub mod functions;
 pub mod hht;
+pub mod ml;
 pub mod processor;
 pub mod quality;
 pub mod resamplers;
@@ -39,6 +40,8 @@ pub use filters::{Filter, FirFilter, IirFilter};
 pub use hht::{
     EmdConfig, EmdResult, EmpiricalModeDecomposition, EnsembleEmd, IntrinsicModeFunction,
 };
+#[allow(unused_imports)]
+pub use ml::{AnomalyDetector, AnomalyMethod, FeatureExtractor, MiniAutoencoder, SignalDenoiser};
 pub use processor::SignalProcessor;
 pub use quality::{
     MosPredictor, PesqCalculator, PolqaCalculator, QualityMetrics, SnrCalculator, StoiCalculator,

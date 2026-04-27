@@ -502,7 +502,7 @@ impl WaveletAnalyzer {
         }
 
         let mut abs_data: Vec<f32> = data.iter().map(|&x| x.abs()).collect();
-        abs_data.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        abs_data.sort_by(|a, b| a.total_cmp(b));
 
         let median = if abs_data.len().is_multiple_of(2) {
             (abs_data[abs_data.len() / 2 - 1] + abs_data[abs_data.len() / 2]) / 2.0

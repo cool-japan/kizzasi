@@ -41,7 +41,6 @@ scirs2-core.workspace = true
 
 # Core dependencies
 thiserror.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -59,6 +58,8 @@ toml = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 
 [dev-dependencies]
+kizzasi-model.workspace = true
+kizzasi-tokenizer.workspace = true
 proptest.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 criterion.workspace = true

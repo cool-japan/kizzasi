@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  kizzasi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: kizzasi:latest
+    container_name: kizzasi-inference
+    ports:
+      - "8080:8080"   # REST API
+      - "50051:50051" # gRPC
+    environment:
+      - RUST_LOG=info
+      - KIZZASI_ADDR=0.0.0.0:8080
+    volumes:
+      - ./models:/app/models:ro  # Mount pre-trained model weights (read-only)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      - mqtt-broker
+
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: kizzasi-mqtt
+    ports:
+      - "1883:1883"  # MQTT
+      - "9001:9001"  # MQTT over WebSockets
+    volumes:
+      - ./docker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
+networks:
+  default:
+    name: kizzasi-network

@@ -40,7 +40,7 @@ let output = ssm.step(&input)?;
 
 - Single step (d=256): ~80μs
 - Batch processing (B=32, d=256): ~1.5ms
-- 388 comprehensive tests with 100% pass rate
+- 422 comprehensive tests with 100% pass rate
 - Zero-copy operations where possible
 
 ## Documentation
@@ -50,4 +50,4 @@ let output = ssm.step(&input)?;
 
 ## License
 
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+Licensed under the Apache License, Version 2.0.

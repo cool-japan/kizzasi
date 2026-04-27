@@ -60,7 +60,8 @@ pub enum TokenizerError {
         context: String,
     },
 
-    /// Error from kizzasi-core crate
+    /// Error from kizzasi-core crate (not available on wasm32)
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("Core error: {0}")]
     CoreError(#[from] kizzasi_core::CoreError),
 

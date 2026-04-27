@@ -126,9 +126,29 @@ impl ModelRegistry {
     ) -> InferenceResult<Box<dyn AutoregressiveModel>> {
         match config.model_type {
             ModelType::Mamba2 => {
-                // TODO: Fix Mamba2 model exports in kizzasi-model
+                #[cfg(feature = "mamba")]
+                {
+                    use kizzasi_model::mamba2::{Mamba2, Mamba2Config};
+                    let num_heads = (config.hidden_dim / 64).max(1);
+                    let model_config = Mamba2Config {
+                        input_dim: config.input_dim,
+                        hidden_dim: config.hidden_dim,
+                        state_dim: config.state_dim,
+                        num_heads,
+                        head_dim: config.hidden_dim / num_heads,
+                        expand_factor: 2,
+                        conv_kernel_size: 4,
+                        num_layers: config.num_layers,
+                        dropout: 0.0,
+                        use_rms_norm: true,
+                        chunk_size: 256,
+                    };
+                    let model = Mamba2::new(model_config).map_err(InferenceError::ModelError)?;
+                    Ok(Box::new(model))
+                }
+                #[cfg(not(feature = "mamba"))]
                 Err(InferenceError::PipelineConfig(
-                    "Mamba2 not yet supported - models not exported".into(),
+                    "Mamba2 requires the 'mamba' feature to be enabled".into(),
                 ))
             }
             ModelType::Rwkv => {
@@ -183,24 +203,123 @@ impl ModelRegistry {
                 Ok(Box::new(model))
             }
             ModelType::Mamba => {
-                // TODO: Fix Mamba model exports in kizzasi-model
+                #[cfg(feature = "mamba")]
+                {
+                    use kizzasi_model::mamba::{Mamba, MambaConfig};
+                    let model_config = MambaConfig {
+                        input_dim: config.input_dim,
+                        hidden_dim: config.hidden_dim,
+                        state_dim: config.state_dim,
+                        expand_factor: 2,
+                        conv_kernel_size: 4,
+                        num_layers: config.num_layers,
+                        dropout: 0.0,
+                        use_mamba2: false,
+                    };
+                    let model = Mamba::new(model_config).map_err(InferenceError::ModelError)?;
+                    Ok(Box::new(model))
+                }
+                #[cfg(not(feature = "mamba"))]
                 Err(InferenceError::PipelineConfig(
-                    "Mamba not yet supported - models not exported".into(),
+                    "Mamba requires the 'mamba' feature to be enabled".into(),
                 ))
+            }
+            ModelType::Rwkv5 => {
+                use kizzasi_model::rwkv5::{Rwkv5Config, Rwkv5Model};
+                let num_heads = (config.hidden_dim / 64).max(1);
+                let model_config = Rwkv5Config {
+                    input_dim: config.input_dim,
+                    hidden_dim: config.hidden_dim,
+                    num_layers: config.num_layers,
+                    num_heads,
+                    head_dim: config.hidden_dim / num_heads,
+                    intermediate_dim: config.hidden_dim * 4,
+                    context_length: 8192,
+                    use_rms_norm: true,
+                };
+                let model = Rwkv5Model::new(model_config).map_err(InferenceError::ModelError)?;
+                Ok(Box::new(model))
+            }
+            ModelType::NeuralOde => Err(InferenceError::PipelineConfig(
+                "NeuralOde not yet supported in registry - use NeuralOdeModel directly".into(),
+            )),
+            ModelType::MultiModal => Err(InferenceError::PipelineConfig(
+                "MultiModal not yet supported in registry - use MultiModalModel directly".into(),
+            )),
+            ModelType::Snn => {
+                use kizzasi_model::spiking::{SpikingConfig, SpikingNeuralNetwork};
+                let model_config = SpikingConfig::new(
+                    config.input_dim,
+                    config.hidden_dim,
+                    config.output_dim,
+                    config.num_layers,
+                );
+                let model =
+                    SpikingNeuralNetwork::new(model_config).map_err(InferenceError::ModelError)?;
+                Ok(Box::new(model))
+            }
+            ModelType::MultiScale => {
+                use kizzasi_model::temporal_multiscale::{
+                    MultiScaleConfig, MultiScaleModel, ScaleFusion,
+                };
+                // Build default scale factors: [1, 2, 4, ...] up to num_layers
+                let scale_factors: Vec<usize> =
+                    (0..config.num_layers).map(|i| 1_usize << i).collect();
+                let model_config = MultiScaleConfig {
+                    input_dim: config.input_dim,
+                    hidden_dim: config.hidden_dim,
+                    output_dim: config.output_dim,
+                    num_scales: config.num_layers,
+                    scale_factors,
+                    fusion: ScaleFusion::Weighted,
+                    context_length: 2048,
+                };
+                let model =
+                    MultiScaleModel::new(model_config).map_err(InferenceError::ModelError)?;
+                Ok(Box::new(model))
             }
         }
     }
 
-    /// Load weights from a file
+    /// Load weights from a JSON file into a model.
+    ///
+    /// The file must contain a JSON object of the form `{ "key": [f32, ...], ... }`,
+    /// which is the format produced by each model's `save_weights_json` method.
+    ///
+    /// This delegates to the model's `AutoregressiveModel::load_weights_json` override.
+    /// Models that do not implement the override will return an appropriate error.
     pub fn load_weights(
         &self,
-        _model: &mut dyn AutoregressiveModel,
+        model: &mut dyn AutoregressiveModel,
         path: impl AsRef<Path>,
     ) -> InferenceResult<()> {
-        // Placeholder for weight loading
-        // Will integrate with kizzasi_model::loader once implemented
-        let _path = path.as_ref();
-        tracing::info!("Weight loading not yet implemented");
+        let path = path.as_ref();
+
+        // Validate the file exists and is readable before passing to model.
+        let file = std::fs::File::open(path).map_err(InferenceError::IoError)?;
+
+        // Deserialise to verify the JSON is well-formed; the model method
+        // will re-read and apply the data.
+        let _weights_check: std::collections::HashMap<String, Vec<f32>> =
+            serde_json::from_reader(file).map_err(|e| {
+                InferenceError::SerializationError(format!(
+                    "Failed to parse weight file '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+
+        // Delegate actual loading to the model.
+        model
+            .load_weights_json(path)
+            .map_err(InferenceError::ModelError)?;
+
+        tracing::info!(
+            "Weights loaded from '{}' into {} model",
+            path.display(),
+            model.model_type()
+        );
+
         Ok(())
     }
 }
@@ -217,6 +336,13 @@ pub struct ModelBuilder {
 }
 
 impl ModelBuilder {
+    /// Start building a Mamba model
+    pub fn mamba() -> Self {
+        Self {
+            config: ModelConfig::new(ModelType::Mamba),
+        }
+    }
+
     /// Start building a Mamba2 model
     pub fn mamba2() -> Self {
         Self {
@@ -364,5 +490,130 @@ mod tests {
 
         let model = result.unwrap();
         assert_eq!(model.model_type(), ModelType::Transformer);
+    }
+
+    #[cfg(feature = "mamba")]
+    #[test]
+    fn test_mamba_registry_create() {
+        let mut registry = ModelRegistry::new();
+        // Use hidden_dim=64 (divisible by 1 or 2 heads, small for speed)
+        let config = ModelBuilder::mamba()
+            .dims(1, 64, 1)
+            .layers(2)
+            .state_dim(8)
+            .build();
+
+        registry.register("mamba_test", config);
+
+        let result = registry.create_model("mamba_test");
+        assert!(
+            result.is_ok(),
+            "Mamba registry creation failed: {:?}",
+            result.err()
+        );
+
+        let model = result.expect("model should be created");
+        assert_eq!(model.model_type(), ModelType::Mamba);
+        assert_eq!(model.hidden_dim(), 64);
+    }
+
+    #[cfg(feature = "mamba")]
+    #[test]
+    fn test_mamba2_registry_create() {
+        let mut registry = ModelRegistry::new();
+        // hidden_dim=64 with num_heads = (64/64).max(1) = 1
+        let config = ModelBuilder::mamba2()
+            .dims(1, 64, 1)
+            .layers(2)
+            .state_dim(8)
+            .build();
+
+        registry.register("mamba2_test", config);
+
+        let result = registry.create_model("mamba2_test");
+        assert!(
+            result.is_ok(),
+            "Mamba2 registry creation failed: {:?}",
+            result.err()
+        );
+
+        let model = result.expect("model should be created");
+        assert_eq!(model.model_type(), ModelType::Mamba2);
+        assert_eq!(model.hidden_dim(), 64);
+    }
+
+    // -----------------------------------------------------------------
+    // WS-B: InferenceRegistry::load_weights tests
+    // -----------------------------------------------------------------
+
+    /// Test that load_weights correctly reads a JSON weight file and calls the
+    /// model's load_weights_json method.
+    #[test]
+    fn test_registry_load_weights_from_file() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static REGISTRY_LOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uid = REGISTRY_LOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let registry = ModelRegistry::new();
+
+        // Build a small Transformer (always available, no feature gate needed)
+        let config = ModelBuilder::transformer().dims(1, 64, 1).layers(2).build();
+
+        let mut model = registry.create_from_config(&config).expect("create model");
+
+        // First save model weights to a temp file, then call load_weights.
+        let mut save_path = std::env::temp_dir();
+        save_path.push(format!("kizzasi_registry_load_weights_test_{}.json", uid));
+
+        model
+            .save_weights_json(&save_path)
+            .expect("save_weights_json via trait");
+
+        let result = registry.load_weights(model.as_mut(), &save_path);
+        let _ = std::fs::remove_file(&save_path);
+
+        assert!(
+            result.is_ok(),
+            "load_weights should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Test that load_weights returns an error for a non-existent file.
+    #[test]
+    fn test_registry_load_weights_missing_file() {
+        let registry = ModelRegistry::new();
+
+        let config = ModelBuilder::transformer().dims(1, 64, 1).layers(1).build();
+
+        let mut model = registry.create_from_config(&config).expect("create model");
+
+        let missing = std::path::Path::new("/tmp/__kizzasi_nonexistent_weight_file__.json");
+        let result = registry.load_weights(model.as_mut(), missing);
+        assert!(result.is_err(), "missing file should produce error");
+    }
+
+    /// Test that load_weights returns an error for malformed JSON.
+    #[test]
+    fn test_registry_load_weights_bad_json() {
+        let registry = ModelRegistry::new();
+
+        let config = ModelBuilder::transformer().dims(1, 64, 1).layers(1).build();
+
+        let mut model = registry.create_from_config(&config).expect("create model");
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static REGISTRY_BAD_JSON_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let bad_uid = REGISTRY_BAD_JSON_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let mut bad_path = std::env::temp_dir();
+        bad_path.push(format!("kizzasi_registry_bad_json_test_{}.json", bad_uid));
+
+        // Write invalid JSON
+        std::fs::write(&bad_path, b"not valid json").expect("write bad json");
+        let result = registry.load_weights(model.as_mut(), &bad_path);
+        let _ = std::fs::remove_file(&bad_path);
+
+        assert!(result.is_err(), "bad JSON should produce error");
     }
 }

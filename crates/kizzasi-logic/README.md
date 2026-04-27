@@ -39,6 +39,7 @@ let safe_prediction = guardrails.project(&prediction)?; // Projects to [10.0, 3.
 - Projection algorithms: <10μs for simple constraints
 - Batch processing: 1M constraint checks/sec
 - GPU acceleration: 10x speedup for large batches
+- 293 comprehensive tests, all passing
 
 ## Documentation
 
@@ -47,4 +48,4 @@ let safe_prediction = guardrails.project(&prediction)?; // Projects to [10.0, 3.
 
 ## License
 
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+Licensed under the Apache License, Version 2.0.

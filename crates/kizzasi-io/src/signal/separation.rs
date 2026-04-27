@@ -128,7 +128,7 @@ impl FastICA {
                 let (g_wx, gp_wx) = self.apply_nonlinearity(&wx);
 
                 let eg = whitened.t().dot(&g_wx) / whitened.nrows() as f32;
-                let egp = gp_wx.mean().unwrap();
+                let egp = gp_wx.mean().unwrap_or(0.0);
 
                 // Newton update: w = E{x g(w^T x)} - E{g'(w^T x)} w
                 w_i = eg - &w_i * egp;

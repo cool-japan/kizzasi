@@ -1,0 +1,30 @@
+[package]
+name = "kizzasi-python"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for Kizzasi AGSP via PyO3"
+keywords = ["signal-processing", "machine-learning", "python", "bindings", "ssm"]
+categories = ["science", "api-bindings"]
+# Published via maturin/PyPI, not cargo publish
+publish = false
+
+[lib]
+name = "kizzasi"
+crate-type = ["cdylib", "rlib"]
+doc = false
+
+[dependencies]
+kizzasi = { path = "../kizzasi", default-features = false, features = ["std", "logic"] }
+kizzasi-core = { path = "../kizzasi-core" }
+kizzasi-logic = { path = "../kizzasi-logic" }
+pyo3 = { version = "0.28", features = ["abi3-py310"] }
+scirs2-numpy = "0.4.2"
+scirs2-core.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]

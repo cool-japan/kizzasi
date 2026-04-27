@@ -7,7 +7,7 @@
 use super::{InferenceMessage, InferenceResponse, NetworkAdapter};
 use crate::error::{InferenceError, InferenceResult};
 use crate::streaming::StreamingEngine;
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Broker, Event, EventLoop, MqttOptions, Packet, QoS};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -67,8 +67,9 @@ impl MqttAdapter {
             (url.to_string(), 1883)
         };
 
-        let mut mqttoptions = MqttOptions::new(client_id, host, port);
-        mqttoptions.set_keep_alive(Duration::from_secs(30));
+        let broker = Broker::tcp(host, port);
+        let mut mqttoptions = MqttOptions::new(client_id, broker);
+        mqttoptions.set_keep_alive(30u16);
 
         let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
 
@@ -104,7 +105,7 @@ impl MqttAdapter {
                 Ok(Event::Incoming(Packet::Publish(publish))) => {
                     debug!(
                         "Received message on topic: {} ({} bytes)",
-                        publish.topic,
+                        String::from_utf8_lossy(&publish.topic),
                         publish.payload.len()
                     );
 

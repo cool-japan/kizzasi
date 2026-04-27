@@ -4,8 +4,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/kizzasi.svg)](https://crates.io/crates/kizzasi)
 [![Documentation](https://docs.rs/kizzasi/badge.svg)](https://docs.rs/kizzasi)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
 
 *"Predicting the flux of the world with the precision of logic."*
 
@@ -56,19 +56,103 @@ Kizzasi combines the **learning capability** of State Space Models (Mamba/RWKV/S
 └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### System Overview
+
+```mermaid
+graph TB
+    subgraph Input["Signal Input Layer"]
+        IO[kizzasi-io<br/>WebSocket/MQTT/Audio/Serial]
+    end
+    subgraph Token["Tokenization Layer"]
+        TOK[kizzasi-tokenizer<br/>VQ-VAE / μ-law / Linear]
+    end
+    subgraph Core["Core SSM Engine"]
+        CORE[kizzasi-core<br/>SIMD / Parallel Scan / GPU]
+    end
+    subgraph Models["Model Layer"]
+        MB[Mamba]
+        MB2[Mamba2]
+        RW[RWKV v6/v7]
+        S4[S4D]
+        TR[Transformer]
+    end
+    subgraph Infer["Inference Layer"]
+        INF[kizzasi-inference<br/>gRPC / REST / WebSocket]
+    end
+    subgraph Logic["Constraint Layer"]
+        LOG[kizzasi-logic<br/>LTL / STL / MPC]
+    end
+    IO --> TOK --> CORE --> Models --> INF
+    LOG --> INF
+```
+
+### Mamba SSM Forward Pass
+
+```mermaid
+flowchart LR
+    X["x_t (input)"] --> PROJ["Linear Projection"]
+    PROJ --> DELTA["Δ (timescale)"]
+    PROJ --> B["B (input gate)"]
+    PROJ --> C["C (output gate)"]
+    DELTA --> DISC["ZOH Discretization\nA_bar, B_bar"]
+    H_PREV["h_{t-1} (state)"] --> SSM
+    DISC --> SSM["SSM Recurrence\nh_t = A_bar·h + B_bar·x"]
+    B --> SSM
+    SSM --> H_NEXT["h_t (new state)"]
+    C --> OUT["Output\ny_t = C·h_t"]
+    SSM --> OUT
+```
+
+### Inference Pipeline
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant REST/gRPC
+    participant InferenceEngine
+    participant Model
+    participant Constraints
+
+    Client->>REST/gRPC: POST /infer {signal: [...]}
+    REST/gRPC->>InferenceEngine: infer(request)
+    InferenceEngine->>Model: step(token)
+    Model-->>InferenceEngine: prediction
+    InferenceEngine->>Constraints: check(prediction)
+    Constraints-->>InferenceEngine: projection(prediction)
+    InferenceEngine-->>REST/gRPC: response
+    REST/gRPC-->>Client: {prediction: [...]}
+```
+
+### Training Data Flow
+
+```mermaid
+flowchart TD
+    DATA["Training Data<br/>(time series)"] --> TOK["Tokenizer"]
+    TOK --> BATCH["DataLoader<br/>(batched sequences)"]
+    BATCH --> FWD["Forward Pass<br/>(SSM model)"]
+    FWD --> LOSS["Loss Computation<br/>(prediction + constraint)"]
+    LOSS --> BWD["Backward Pass<br/>(SSM gradients)"]
+    BWD --> OPT["Optimizer<br/>(AdamW / SGD)"]
+    OPT --> CKPT["Checkpoint<br/>(JSON / SafeTensors)"]
+    OPT --> FWD
+```
+
 ### Crate Structure
 
 | Crate | Description | SLoC |
 |-------|-------------|------|
-| [`kizzasi`](crates/kizzasi) | Unified facade with prelude and ergonomic API | ~500 |
-| [`kizzasi-core`](crates/kizzasi-core) | SSM engine, embeddings, SIMD optimizations, parallel scan | ~4,500 |
-| [`kizzasi-model`](crates/kizzasi-model) | Mamba/Mamba2, RWKV, S4/S4D, Transformer architectures | ~4,000 |
-| [`kizzasi-tokenizer`](crates/kizzasi-tokenizer) | VQ-VAE, μ-law, quantizers, multi-scale tokenization | ~3,000 |
-| [`kizzasi-inference`](crates/kizzasi-inference) | Pipeline orchestration, sampling, batching, streaming | ~4,500 |
-| [`kizzasi-logic`](crates/kizzasi-logic) | Constraints, guardrails, projections, training losses | ~5,000 |
-| [`kizzasi-io`](crates/kizzasi-io) | MQTT, Audio, WebSocket, Serial, File, DSP | ~4,500 |
+| [`kizzasi`](crates/kizzasi) | Unified facade with prelude and ergonomic API | ~7,400 |
+| [`kizzasi-core`](crates/kizzasi-core) | SSM engine, embeddings, SIMD optimizations, parallel scan | ~18,500 |
+| [`kizzasi-model`](crates/kizzasi-model) | Mamba/Mamba2, RWKV v5/v6/v7, S4/S4D, Transformer + training | ~39,200 |
+| [`kizzasi-tokenizer`](crates/kizzasi-tokenizer) | VQ-VAE, μ-law, quantizers, multi-scale tokenization | ~15,900 |
+| [`kizzasi-inference`](crates/kizzasi-inference) | Pipeline orchestration, sampling, batching, gRPC/REST | ~11,000 |
+| [`kizzasi-logic`](crates/kizzasi-logic) | Constraints, guardrails, projections, LTL/STL | ~20,400 |
+| [`kizzasi-io`](crates/kizzasi-io) | MQTT, Audio, WebSocket, Serial, File, DSP, Beamforming | ~18,500 |
+| [`kizzasi-embedded`](crates/kizzasi-embedded) | no_std SSM inference for edge devices | ~800 |
+| [`kizzasi-python`](crates/kizzasi-python) | Python bindings via PyO3/maturin | ~700 |
+| [`kizzasi-macros`](crates/kizzasi-macros) | Procedural macros for compile-time config | ~100 |
 
-**Total: ~25,000 lines of Rust code**
+**Total: ~123,000+ lines of Rust code across 355 source files**
 
 ---
 
@@ -78,7 +162,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kizzasi = "0.1"
+kizzasi = "0.2"
 ```
 
 ### Feature Flags
@@ -96,7 +180,7 @@ kizzasi = "0.1"
 
 Minimal installation:
 ```toml
-kizzasi = { version = "0.1", default-features = false, features = ["std"] }
+kizzasi = { version = "0.2", default-features = false, features = ["std"] }
 ```
 
 ---
@@ -129,6 +213,8 @@ fn main() -> KizzasiResult<()> {
     Ok(())
 }
 ```
+
+See [`crates/kizzasi/examples/getting_started.rs`](crates/kizzasi/examples/getting_started.rs) for a step-by-step tutorial covering tokenization, inference, and constraint enforcement.
 
 ### With Safety Constraints
 
@@ -424,11 +510,14 @@ See [KIZZASI_POLICY.md](KIZZASI_POLICY.md) for dependency guidelines.
 ```
 Language            Files        Lines         Code     Comments       Blanks
 ───────────────────────────────────────────────────────────────────────────────
-Rust                   89       31,735       25,009        1,457        5,269
-TOML                    8          370          268           47           55
-Markdown               18        2,449            0        1,872          577
+Rust                  355      157,188      123,191        8,836       24,839
+TOML                   13          816          617           94          105
+Markdown               34        9,002            0        7,090        1,912
+Shell                   3          313          232           37           44
 ───────────────────────────────────────────────────────────────────────────────
-Total                 115       34,554       25,277        3,376        5,901
+Total                 410      166,123      123,033       16,117       26,973
+
+Tests: 2,277 passing | Clippy: 0 warnings | Rustdoc: 0 warnings (strict)
 ```
 
 ---
@@ -464,14 +553,24 @@ cargo doc --all-features --no-deps
 
 ---
 
+## Sponsorship
+
+Kizzasi is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+
+If you find Kizzasi useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-red?logo=github)](https://github.com/sponsors/cool-japan)
+
+**[https://github.com/sponsors/cool-japan](https://github.com/sponsors/cool-japan)**
+
+Your sponsorship helps us:
+- Maintain and improve the COOLJAPAN ecosystem
+- Keep the entire ecosystem (OxiBLAS, OxiFFT, SciRS2, etc.) 100% Pure Rust
+- Provide long-term support and security updates
+
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or http://www.apache.org/licenses/LICENSE-2.0).
 
 ---
 

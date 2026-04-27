@@ -7,7 +7,7 @@ use super::filters::Filter;
 use super::functions::bessel_i0;
 use super::spectral::{Spectrogram, WindowType};
 use crate::error::{IoError, IoResult};
-use rustfft::{num_complex::Complex, FftPlanner};
+use oxifft::{Complex, Direction, Flags, Plan};
 use scirs2_core::ndarray::Array1;
 use std::f32::consts::PI;
 
@@ -15,7 +15,6 @@ use std::f32::consts::PI;
 pub struct SignalProcessor {
     pub(super) buffer_size: usize,
     pub(super) sample_rate: f32,
-    pub(super) fft_planner: FftPlanner<f32>,
 }
 
 impl SignalProcessor {
@@ -24,7 +23,6 @@ impl SignalProcessor {
         Self {
             buffer_size,
             sample_rate: 44100.0,
-            fft_planner: FftPlanner::new(),
         }
     }
 
@@ -47,19 +45,23 @@ impl SignalProcessor {
     /// Apply FFT to signal
     pub fn fft(&mut self, signal: &Array1<f32>) -> IoResult<Vec<Complex<f32>>> {
         let n = signal.len();
-        let fft = self.fft_planner.plan_fft_forward(n);
-        let mut buffer: Vec<Complex<f32>> = signal.iter().map(|&x| Complex::new(x, 0.0)).collect();
-        fft.process(&mut buffer);
-        Ok(buffer)
+        let plan = Plan::dft_1d(n, Direction::Forward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("FFT planning failed: {}".to_string()))?;
+        let input: Vec<Complex<f32>> = signal.iter().map(|&x| Complex::new(x, 0.0)).collect();
+        let mut output = vec![Complex::new(0.0, 0.0); n];
+        plan.execute(&input, &mut output);
+        Ok(output)
     }
 
     /// Apply inverse FFT
     pub fn ifft(&mut self, spectrum: &mut [Complex<f32>]) -> IoResult<Array1<f32>> {
         let n = spectrum.len();
-        let ifft = self.fft_planner.plan_fft_inverse(n);
-        ifft.process(spectrum);
+        let plan = Plan::dft_1d(n, Direction::Backward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("IFFT planning failed: {}".to_string()))?;
+        let mut output = vec![Complex::new(0.0, 0.0); n];
+        plan.execute(spectrum, &mut output);
         let scale = 1.0 / n as f32;
-        let result: Vec<f32> = spectrum.iter().map(|c| c.re * scale).collect();
+        let result: Vec<f32> = output.iter().map(|c| c.re * scale).collect();
         Ok(Array1::from_vec(result))
     }
 
@@ -73,30 +75,14 @@ impl SignalProcessor {
     /// Uses specialized FFT planning for power-of-2 sizes which can be more efficient.
     /// Falls back to standard FFT for non-power-of-2 sizes.
     pub fn fft_pow2(&mut self, signal: &Array1<f32>) -> IoResult<Vec<Complex<f32>>> {
-        let n = signal.len();
-        if Self::is_power_of_2(n) {
-            let fft = self.fft_planner.plan_fft_forward(n);
-            let mut buffer = Vec::with_capacity(n);
-            buffer.extend(signal.iter().map(|&x| Complex::new(x, 0.0)));
-            fft.process(&mut buffer);
-            Ok(buffer)
-        } else {
-            self.fft(signal)
-        }
+        // OxiFFT automatically optimizes for power-of-2 sizes
+        self.fft(signal)
     }
 
     /// Optimized inverse FFT for power-of-2 sizes
     pub fn ifft_pow2(&mut self, spectrum: &mut [Complex<f32>]) -> IoResult<Array1<f32>> {
-        let n = spectrum.len();
-        if Self::is_power_of_2(n) {
-            let ifft = self.fft_planner.plan_fft_inverse(n);
-            ifft.process(spectrum);
-            let scale = 1.0 / n as f32;
-            let result: Vec<f32> = spectrum.iter().map(|c| c.re * scale).collect();
-            Ok(Array1::from_vec(result))
-        } else {
-            self.ifft(spectrum)
-        }
+        // OxiFFT automatically optimizes for power-of-2 sizes
+        self.ifft(spectrum)
     }
 
     /// Compute power spectrum efficiently for power-of-2 sizes
@@ -115,7 +101,8 @@ impl SignalProcessor {
         }
         let next_pow2 = n.next_power_of_two();
         let mut padded = vec![0.0f32; next_pow2];
-        padded[..n].copy_from_slice(signal.as_slice().unwrap());
+        let signal_vec: Vec<f32> = signal.iter().copied().collect();
+        padded[..n].copy_from_slice(&signal_vec);
         Array1::from_vec(padded)
     }
 
@@ -185,10 +172,12 @@ impl SignalProcessor {
         for item in spectrum.iter_mut().skip(n / 2 + 1) {
             *item = Complex::new(0.0, 0.0);
         }
-        let ifft = self.fft_planner.plan_fft_inverse(n);
-        ifft.process(&mut spectrum);
+        let plan = Plan::dft_1d(n, Direction::Backward, Flags::MEASURE)
+            .ok_or_else(|| IoError::SignalError("IFFT planning failed: {}".to_string()))?;
+        let mut output = vec![Complex::new(0.0, 0.0); n];
+        plan.execute(&spectrum, &mut output);
         let scale = 1.0 / n as f32;
-        let envelope: Vec<f32> = spectrum.iter().map(|c| c.norm() * scale).collect();
+        let envelope: Vec<f32> = output.iter().map(|c| c.norm() * scale).collect();
         Ok(Array1::from_vec(envelope))
     }
 
@@ -270,7 +259,8 @@ impl SignalProcessor {
     /// Uses chunked processing for better cache locality and potential SIMD vectorization.
     #[cfg(feature = "simd")]
     pub fn rms_simd(signal: &Array1<f32>) -> f32 {
-        Self::rms_simd_impl(signal.as_slice().unwrap())
+        let owned: Vec<f32> = signal.iter().copied().collect();
+        Self::rms_simd_impl(&owned)
     }
 
     /// SIMD-optimized RMS implementation for slices
@@ -292,7 +282,8 @@ impl SignalProcessor {
     /// Normalizes signal to [-1, 1] range using chunked processing.
     #[cfg(feature = "simd")]
     pub fn normalize_simd(signal: &Array1<f32>) -> Array1<f32> {
-        let max_abs = Self::max_abs_simd(signal.as_slice().unwrap());
+        let owned: Vec<f32> = signal.iter().copied().collect();
+        let max_abs = Self::max_abs_simd(&owned);
         if max_abs > 0.0 {
             signal.mapv(|x| x / max_abs)
         } else {
@@ -326,8 +317,10 @@ impl SignalProcessor {
         if a.len() != b.len() {
             return Err(IoError::SignalError("Signals must have same length".into()));
         }
-        let a_slice = a.as_slice().unwrap();
-        let b_slice = b.as_slice().unwrap();
+        let a_owned: Vec<f32> = a.iter().copied().collect();
+        let b_owned: Vec<f32> = b.iter().copied().collect();
+        let a_slice = a_owned.as_slice();
+        let b_slice = b_owned.as_slice();
         let mut result = vec![0.0f32; a.len()];
         const CHUNK_SIZE: usize = 8;
         let chunks_a = a_slice.chunks_exact(CHUNK_SIZE);
@@ -353,8 +346,10 @@ impl SignalProcessor {
         if a.len() != b.len() {
             return Err(IoError::SignalError("Signals must have same length".into()));
         }
-        let a_slice = a.as_slice().unwrap();
-        let b_slice = b.as_slice().unwrap();
+        let a_owned: Vec<f32> = a.iter().copied().collect();
+        let b_owned: Vec<f32> = b.iter().copied().collect();
+        let a_slice = a_owned.as_slice();
+        let b_slice = b_owned.as_slice();
         let mut result = vec![0.0f32; a.len()];
         const CHUNK_SIZE: usize = 8;
         let chunks_a = a_slice.chunks_exact(CHUNK_SIZE);

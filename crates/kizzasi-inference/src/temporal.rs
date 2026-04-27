@@ -164,19 +164,19 @@ pub enum STLFormula {
     /// Disjunction: φ₁ ∨ φ₂ (max robustness)
     Or(Box<STLFormula>, Box<STLFormula>),
 
-    /// Always: □[a,b] φ
+    /// Always: `□[a,b] φ`
     Always {
         formula: Box<STLFormula>,
         bound: TemporalBound,
     },
 
-    /// Eventually: ◇[a,b] φ
+    /// Eventually: `◇[a,b] φ`
     Eventually {
         formula: Box<STLFormula>,
         bound: TemporalBound,
     },
 
-    /// Until: φ₁ U[a,b] φ₂
+    /// Until: `φ₁ U[a,b] φ₂`
     Until {
         phi1: Box<STLFormula>,
         phi2: Box<STLFormula>,

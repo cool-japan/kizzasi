@@ -9,43 +9,46 @@ members = [
     "crates/kizzasi-logic",
     "crates/kizzasi-io",
     "crates/kizzasi-macros",
+    "crates/kizzasi-python",
+    "crates/kizzasi-embedded",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/cool-japan/kizzasi"
 authors = ["COOL JAPAN Team"]
 rust-version = "1.89"
 
 [workspace.dependencies]
 # Internal crates
-kizzasi = { path = "crates/kizzasi", version = "0.1.0" }
-kizzasi-core = { path = "crates/kizzasi-core", version = "0.1.0" }
-kizzasi-model = { path = "crates/kizzasi-model", version = "0.1.0" }
-kizzasi-tokenizer = { path = "crates/kizzasi-tokenizer", version = "0.1.0" }
-kizzasi-inference = { path = "crates/kizzasi-inference", version = "0.1.0" }
-kizzasi-logic = { path = "crates/kizzasi-logic", version = "0.1.0" }
-kizzasi-io = { path = "crates/kizzasi-io", version = "0.1.0" }
-kizzasi-macros = { path = "crates/kizzasi-macros", version = "0.1.0" }
+kizzasi = { path = "crates/kizzasi", version = "0.2.1" }
+kizzasi-core = { path = "crates/kizzasi-core", version = "0.2.1" }
+kizzasi-model = { path = "crates/kizzasi-model", version = "0.2.1" }
+kizzasi-tokenizer = { path = "crates/kizzasi-tokenizer", version = "0.2.1" }
+kizzasi-inference = { path = "crates/kizzasi-inference", version = "0.2.1" }
+kizzasi-logic = { path = "crates/kizzasi-logic", version = "0.2.1" }
+kizzasi-io = { path = "crates/kizzasi-io", version = "0.2.1" }
+kizzasi-macros = { path = "crates/kizzasi-macros", version = "0.2.1" }
 
 # ============================================
 # COOLJAPAN Ecosystem Dependencies
 # ============================================
 # Following KIZZASI_POLICY.md - use scirs2 abstractions
-scirs2-core = { version = "0.1.2", features = ["array", "random", "simd", "parallel"] }
-scirs2-linalg = { version = "0.1.2", features = ["simd", "parallel"] }
-scirs2-signal = { version = "0.1.2" }
-scirs2-fft = { version = "0.1.2" }
-scirs2-series = { version = "0.1.2" }
-tensorlogic = { version = "0.1.0-alpha.2" }
+scirs2-core = { version = "0.4.2", features = ["array", "random", "simd", "parallel"] }
+scirs2-linalg = { version = "0.4.2", features = ["simd", "parallel"] }
+scirs2-signal = { version = "0.4.2" }
+scirs2-fft = { version = "0.4.2" }
+scirs2-series = { version = "0.4.2" }
+# tensorlogic-ir = { version = "0.1.0" } # for future usage
 
 # Core dependencies
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+num-complex = "0.4"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -56,7 +59,7 @@ async-trait = "0.1"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-oxicode = "0.1"
+oxicode = { version = "0.2", features = ["serde"] }
 rmp-serde = "1"
 
 # Time handling
@@ -67,18 +70,18 @@ rayon = "1"
 
 # ML Backend (Candle) - each crate will specify target-specific candle dependencies
 # to avoid pulling cudarc on macOS (CUDA not supported on macOS)
-safetensors = "0.5"
+safetensors = "0.7"
 half = "2"
 
 # HTTP client for HuggingFace Hub integration
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-sha2 = "0.10"
+reqwest = { version = "0.13", features = ["json", "rustls", "blocking"], default-features = false }
+sha2 = "0.11"
 
 # IO connectors
-rumqttc = "0.25.1"
-cpal = "0.16"
-rustfft = "6"
-tokio-tungstenite = "0.28"
+rumqttc = { package = "rumqttc-v4-next", version = "0.30" }
+cpal = "0.17"
+oxifft = "0.3"
+tokio-tungstenite = "0.29"
 tokio-serial = "5.4"
 hound = "3.5"
 csv = "1.4"
@@ -91,12 +94,21 @@ r2r = "0.9"
 ffmpeg-next = "8"
 tonic = "0.14"
 prost = "0.14"
+http = "1"
+http-body = "1"
+tower-service = "0.3"
+axum = { version = "0.8", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
 
 # Benchmarking
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 # Property-based testing
 proptest = "1"
+
+# Python bindings
+pyo3 = { version = "0.28", features = ["abi3-py310"] }
 
 # Additional dependencies used by subcrates
 async-stream = "0.3"
@@ -104,8 +116,12 @@ syn = { version = "2.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"
 num_cpus = "1.17"
-toml = "0.9"
+toml = "1.1"
 serde_yaml = "0.9"
+
+# OxiRS dependencies (from crates.io)
+oxirs-core = "0.2.4"
+oxirs-gql = "0.2.4"
 
 [profile.release]
 lto = true

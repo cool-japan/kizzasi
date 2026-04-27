@@ -13,8 +13,8 @@
 //!
 //! # References
 //!
-//! - Orca paper: https://www.usenix.org/system/files/osdi22-yu.pdf
-//! - vLLM: https://arxiv.org/abs/2309.06180
+//! - Orca paper: <https://www.usenix.org/system/files/osdi22-yu.pdf>
+//! - vLLM: <https://arxiv.org/abs/2309.06180>
 
 use crate::engine::{EngineConfig, InferenceEngine};
 use crate::error::InferenceResult;

@@ -20,7 +20,7 @@
 //!
 //! - "Flash-Attention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (Dao et al., 2022)
 //! - "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (Dao, 2023)
-//! - https://github.com/Dao-AILab/flash-attention
+//! - <https://github.com/Dao-AILab/flash-attention>
 
 use crate::{CoreError, CoreResult};
 use scirs2_core::ndarray::{s, Array2, Array3};

@@ -23,7 +23,7 @@
 //! Retention = (Q K^T ⊙ D) V
 //! ```
 //!
-//! Where D is a causal decay matrix: D[i,j] = γ^(i-j) for i >= j
+//! Where D is a causal decay matrix: `D[i,j] = γ^(i-j)` for i >= j
 //! γ is the decay factor (different per head for multi-scale)
 //!
 //! # Recurrent Form (O(1) inference)

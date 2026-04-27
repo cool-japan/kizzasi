@@ -5,13 +5,14 @@
 //! - Temporal logic constraint evaluation
 //! - Streaming engine async performance
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kizzasi_inference::{
     streaming::{StreamConfig, StreamingEngine},
     temporal::{LTLFormula, STLFormula, TemporalBound, TemporalConstraintEnforcer},
     PrecisionConfig, PrecisionConverter,
 };
 use scirs2_core::ndarray::{Array1, Array2};
+use std::hint::black_box;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 

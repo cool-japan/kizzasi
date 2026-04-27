@@ -6,6 +6,7 @@
 use kizzasi_inference::{Sampler, SamplingConfig, SamplingStrategy};
 use proptest::prelude::*;
 use scirs2_core::ndarray::Array1;
+use scirs2_core::RngExt;
 
 // ============================================================================
 // Properties for Greedy Sampling

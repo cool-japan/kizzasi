@@ -1,6 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kizzasi_core::*;
 use scirs2_core::ndarray::{Array1, Array2};
+use std::hint::black_box;
 
 /// Benchmark SSM forward pass at different dimensions
 fn bench_ssm_forward(c: &mut Criterion) {

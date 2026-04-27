@@ -31,7 +31,7 @@ use crate::error::{ModelError, ModelResult};
 use crate::{AutoregressiveModel, ModelType};
 use kizzasi_core::{gelu, softmax, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor};
 use scirs2_core::ndarray::{Array1, Array2};
-use scirs2_core::random::{rng, Rng};
+use scirs2_core::random::{rng, RngExt};
 use std::collections::VecDeque;
 #[allow(unused_imports)]
 use tracing::{debug, instrument, trace};
@@ -548,13 +548,172 @@ impl Transformer {
         Ok(())
     }
 
-    /// Save weights to a SafeTensors model file (stub for future implementation)
+    /// Save model weights to a JSON file as `HashMap<String, Vec<f32>>`.
+    ///
+    /// Keys:
+    /// - `input_proj` / `output_proj`: top-level projections
+    /// - `layers.{i}.attention.q_proj`, `k_proj`, `v_proj`, `o_proj`
+    /// - `layers.{i}.feed_forward.fc1`, `fc2`
+    pub fn save_weights_json<P: AsRef<std::path::Path>>(&self, path: P) -> ModelResult<()> {
+        let mut weights: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+
+        weights.insert(
+            "input_proj".to_string(),
+            self.input_proj.iter().copied().collect(),
+        );
+        weights.insert(
+            "output_proj".to_string(),
+            self.output_proj.iter().copied().collect(),
+        );
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+            let attn = format!("{}.attention", prefix);
+            let ff = format!("{}.feed_forward", prefix);
+
+            weights.insert(
+                format!("{}.q_proj", attn),
+                layer.attention.q_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.k_proj", attn),
+                layer.attention.k_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.v_proj", attn),
+                layer.attention.v_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.o_proj", attn),
+                layer.attention.o_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.fc1", ff),
+                layer.feed_forward.fc1.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.fc2", ff),
+                layer.feed_forward.fc2.iter().copied().collect(),
+            );
+        }
+
+        let file = std::fs::File::create(path.as_ref()).map_err(|e| {
+            ModelError::load_error(
+                "transformer save_weights",
+                format!("failed to create file: {e}"),
+            )
+        })?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &weights).map_err(|e| {
+            ModelError::load_error(
+                "transformer save_weights",
+                format!("JSON serialization failed: {e}"),
+            )
+        })?;
+        // Explicitly flush the BufWriter so all buffered data reaches the OS before the
+        // file handle is closed. Without this, data still in the BufWriter's internal
+        // buffer would be silently discarded if the drop-flush encountered an error,
+        // resulting in a truncated file and an EOF error on the subsequent read.
+        use std::io::Write as _;
+        writer.flush().map_err(|e| {
+            ModelError::load_error(
+                "transformer save_weights",
+                format!("failed to flush JSON to file: {e}"),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Load weights from a JSON file previously written by `save_weights_json`.
+    pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
+        let file = std::fs::File::open(path.as_ref()).map_err(|e| {
+            ModelError::load_error(
+                "transformer load_weights",
+                format!("failed to open file: {e}"),
+            )
+        })?;
+        let weights: std::collections::HashMap<String, Vec<f32>> = serde_json::from_reader(file)
+            .map_err(|e| {
+                ModelError::load_error(
+                    "transformer load_weights",
+                    format!("JSON deserialization failed: {e}"),
+                )
+            })?;
+
+        let load_array2 = |map: &std::collections::HashMap<String, Vec<f32>>,
+                           key: &str,
+                           rows: usize,
+                           cols: usize|
+         -> ModelResult<Option<Array2<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != rows * cols {
+                    return Err(ModelError::load_error(
+                        "transformer load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {}×{}={} but got {}",
+                            key,
+                            rows,
+                            cols,
+                            rows * cols,
+                            data.len()
+                        ),
+                    ));
+                }
+                let arr = Array2::from_shape_vec((rows, cols), data.clone()).map_err(|e| {
+                    ModelError::load_error(
+                        "transformer load_weights",
+                        format!("failed to reshape '{}': {e}", key),
+                    )
+                })?;
+                Ok(Some(arr))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let hidden = self.config.hidden_dim;
+        let ff_dim = self.config.ff_dim;
+
+        if let Some(arr) = load_array2(&weights, "input_proj", self.config.input_dim, hidden)? {
+            self.input_proj = arr;
+        }
+        if let Some(arr) = load_array2(&weights, "output_proj", hidden, self.config.input_dim)? {
+            self.output_proj = arr;
+        }
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let prefix = format!("layers.{}", i);
+            let attn = format!("{}.attention", prefix);
+            let ff = format!("{}.feed_forward", prefix);
+
+            if let Some(arr) = load_array2(&weights, &format!("{}.q_proj", attn), hidden, hidden)? {
+                layer.attention.q_proj = arr;
+            }
+            if let Some(arr) = load_array2(&weights, &format!("{}.k_proj", attn), hidden, hidden)? {
+                layer.attention.k_proj = arr;
+            }
+            if let Some(arr) = load_array2(&weights, &format!("{}.v_proj", attn), hidden, hidden)? {
+                layer.attention.v_proj = arr;
+            }
+            if let Some(arr) = load_array2(&weights, &format!("{}.o_proj", attn), hidden, hidden)? {
+                layer.attention.o_proj = arr;
+            }
+            if let Some(arr) = load_array2(&weights, &format!("{}.fc1", ff), hidden, ff_dim)? {
+                layer.feed_forward.fc1 = arr;
+            }
+            if let Some(arr) = load_array2(&weights, &format!("{}.fc2", ff), ff_dim, hidden)? {
+                layer.feed_forward.fc2 = arr;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Save weights to a SafeTensors model file (legacy stub — use `save_weights_json` instead).
     #[allow(unused_variables)]
     pub fn save_weights(&self, path: &str) -> ModelResult<()> {
-        // TODO: Implement SafeTensors saving
-        Err(ModelError::simple_load_error(
-            "Transformer save_weights not yet implemented".to_string(),
-        ))
+        self.save_weights_json(path)
     }
 }
 
@@ -653,6 +812,14 @@ impl AutoregressiveModel for Transformer {
 
         Ok(())
     }
+
+    fn load_weights_json(&mut self, path: &std::path::Path) -> ModelResult<()> {
+        Transformer::load_weights_json(self, path)
+    }
+
+    fn save_weights_json(&self, path: &std::path::Path) -> ModelResult<()> {
+        Transformer::save_weights_json(self, path)
+    }
 }
 
 #[cfg(test)]
@@ -710,5 +877,45 @@ mod tests {
             .max_seq_len(512);
         let model = Transformer::new(config).expect("Failed to create Transformer");
         assert_eq!(model.context_window(), 512);
+    }
+
+    #[test]
+    fn test_transformer_save_load_roundtrip() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TRANSFORMER_ROUNDTRIP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uid = TRANSFORMER_ROUNDTRIP_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let config = TransformerConfig::new()
+            .hidden_dim(64)
+            .num_heads(4)
+            .num_layers(2)
+            .max_seq_len(128);
+
+        let model = Transformer::new(config).expect("Failed to create Transformer");
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("kizzasi_transformer_roundtrip_test_{}.json", uid));
+
+        model
+            .save_weights_json(&tmp)
+            .expect("save_weights_json failed");
+
+        let config2 = TransformerConfig::new()
+            .hidden_dim(64)
+            .num_heads(4)
+            .num_layers(2)
+            .max_seq_len(128);
+        let mut model2 = Transformer::new(config2).expect("Failed to create second Transformer");
+        model2
+            .load_weights_json(&tmp)
+            .expect("load_weights_json failed");
+
+        // Verify key count: 2 top-level + 6 per-layer × 2 layers = 14 keys
+        let file = std::fs::File::open(&tmp).expect("temp file should exist");
+        let reloaded: std::collections::HashMap<String, Vec<f32>> =
+            serde_json::from_reader(file).expect("should deserialize");
+        assert_eq!(reloaded.len(), 14, "unexpected number of weight keys");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

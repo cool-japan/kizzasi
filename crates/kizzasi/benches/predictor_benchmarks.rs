@@ -5,8 +5,9 @@
 //! cargo bench --bench predictor_benchmarks
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kizzasi::prelude::*;
+use std::hint::black_box;
 
 // Benchmark single-step prediction with different model sizes
 fn bench_step_prediction(c: &mut Criterion) {

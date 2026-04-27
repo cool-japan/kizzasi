@@ -21,7 +21,7 @@
 //! ## References
 //!
 //! - "Hungry Hungry Hippos: Towards Language Modeling with State Space Models" (Fu et al., 2023)
-//! - https://github.com/HazyResearch/H3
+//! - <https://github.com/HazyResearch/H3>
 
 use crate::{CoreError, CoreResult};
 use scirs2_core::ndarray::{s, Array1, Array2};
@@ -89,8 +89,8 @@ impl H3Config {
     /// Set number of heads
     pub fn with_n_heads(mut self, n_heads: usize) -> Self {
         self.n_heads = n_heads;
-        if n_heads > 0 {
-            self.d_head = self.d_model / n_heads;
+        if let Some(d_head) = self.d_model.checked_div(n_heads) {
+            self.d_head = d_head;
         }
         self
     }

@@ -46,6 +46,7 @@ client.publish("readings/temperature", &data).await?;
 - Video: FFmpeg, V4L2, DirectShow, AVFoundation
 - Files: WAV, CSV, HDF5
 - Optional: ROS2 bridge (requires `ros2` feature)
+- 185 comprehensive tests, all passing
 
 ## Documentation
 
@@ -54,4 +55,4 @@ client.publish("readings/temperature", &data).await?;
 
 ## License
 
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+Licensed under the Apache License, Version 2.0.

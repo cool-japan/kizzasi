@@ -29,21 +29,28 @@ pub mod advanced_features;
 pub mod advanced_quant;
 pub mod batch;
 pub mod compat;
+pub mod cross_modal;
+// continuous and gpu_quant require candle-core which is not wasm32-compatible
+#[cfg(not(target_arch = "wasm32"))]
 mod continuous;
 pub mod domain_specific;
 pub mod enhanced_multiscale;
 pub mod entropy;
 mod error;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_quant;
 pub mod metrics;
 mod mulaw;
 mod multiscale;
 #[cfg(feature = "vqvae")]
 pub mod neural_codec;
+// persistence and serde_utils depend on continuous module (candle-core, not wasm32-safe)
+#[cfg(not(target_arch = "wasm32"))]
 pub mod persistence;
 pub mod pretraining;
 pub mod profiling;
 mod quantizer;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod serde_utils;
 pub mod simd_quant;
 pub mod specialized;
@@ -51,9 +58,16 @@ pub mod transformer;
 pub mod types;
 pub mod utils;
 
+#[cfg(feature = "wasm")]
+pub mod wasm_bindings;
+
+#[cfg(feature = "vqvae")]
+pub mod vqvae_core;
+
 #[cfg(feature = "vqvae")]
 pub mod vqvae;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use continuous::{
     ContinuousTokenizer, ReconstructionMetrics, TrainableContinuousTokenizer, TrainingConfig,
 };
@@ -65,7 +79,9 @@ pub use multiscale::{
 pub use quantizer::{LinearQuantizer, Quantizer};
 
 // Re-export advanced quantizers
-pub use advanced_quant::{AdaptiveQuantizer, DeadZoneQuantizer, NonUniformQuantizer};
+pub use advanced_quant::{
+    AdaptiveQuantizer, DeadZoneQuantizer, EntropyConstrainedQuantizer, NonUniformQuantizer,
+};
 
 #[cfg(feature = "vqvae")]
 pub use vqvae::{
@@ -82,7 +98,8 @@ pub use entropy::{
     BitrateController, HuffmanDecoder, HuffmanEncoder, RangeDecoder, RangeEncoder,
 };
 
-// Re-export persistence types
+// Re-export persistence types (not available on wasm32)
+#[cfg(not(target_arch = "wasm32"))]
 pub use persistence::{load_config, save_config, ModelCheckpoint, ModelMetadata, ModelVersion};
 
 // Re-export specialized tokenizers
@@ -127,6 +144,12 @@ pub use pretraining::{
 pub use profiling::{
     AllocationEvent, EventType, MemoryProfiler, MemorySnapshot, ProfileScope, ScopeStats,
     TimelineAnalyzer,
+};
+
+// Re-export cross-modal types
+pub use cross_modal::{
+    CrossModalAligner, CrossModalSequence, CrossModalToken, CrossModalTokenizer, ModalityKind,
+    ModalityTokenizerConfig,
 };
 
 // Re-export core types

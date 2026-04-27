@@ -109,7 +109,7 @@ impl MSMConfig {
 /// Masked Signal Modeling pre-trainer
 ///
 /// Learns signal representations by predicting masked portions of the input.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MaskedSignalModeling {
     /// Configuration
     config: MSMConfig,
@@ -385,7 +385,7 @@ impl Default for ContrastiveConfig {
 ///
 /// Learns representations by maximizing agreement between augmented views
 /// of the same signal while minimizing agreement with different signals.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ContrastiveLearning {
     /// Configuration
     config: ContrastiveConfig,

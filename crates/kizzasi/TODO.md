@@ -57,8 +57,8 @@ Unified facade crate for Kizzasi AGSP.
 ### Documentation
 - [x] Tutorial examples in `examples/`
 - [x] Comprehensive API documentation (main lib.rs)
-- [ ] Performance guidelines (in progress)
-- [ ] Thread-safety documentation (documented in lib.rs)
+- [x] Performance guidelines
+- [x] Thread-safety documentation (documented in lib.rs)
 
 ### Testing
 - [x] Property-based tests with proptest
@@ -76,7 +76,7 @@ Unified facade crate for Kizzasi AGSP.
 - [x] Batch prediction API (`predict_batch`)
 - [x] Configuration checkpointing (save/load predictor config to JSON)
 - [x] Model hot-swapping (runtime model switching with dimension compatibility checks)
-- [ ] Full state serialization (SSM state, weights - requires kizzasi-core support)
+- [x] Full state serialization (SSM state, weights - ModelSnapshot in kizzasi-model::state_io)
 
 #### Presets
 - [x] `video_preset()` for frame prediction
@@ -103,7 +103,7 @@ Unified facade crate for Kizzasi AGSP.
 ### P3: Future
 
 #### Advanced Features
-- [ ] Distributed prediction
+- [x] Distributed prediction
 - [x] Model versioning
 - [x] A/B testing support
 - [x] Telemetry/metrics integration
@@ -850,4 +850,4 @@ The kizzasi crate is **production-ready** with:
 
 ---
 
-*Last Updated: 2026-01-18*
+*Last Updated: 2026-03-16*

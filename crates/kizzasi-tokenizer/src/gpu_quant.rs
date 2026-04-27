@@ -94,7 +94,7 @@ impl GpuLinearQuantizer {
     ///
     /// # Returns
     ///
-    /// Quantized levels as Vec<i32>
+    /// Quantized levels as `Vec<i32>`
     pub fn quantize_batch(&self, signals: &[f32]) -> TokenizerResult<Vec<i32>> {
         // Convert to tensor on device
         let tensor = Tensor::from_slice(signals, signals.len(), &self.device).map_err(|e| {

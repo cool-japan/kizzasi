@@ -4,8 +4,9 @@
 //! - ARM NEON SIMD Operations
 //! - Fixed-Point Arithmetic
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kizzasi_core::*;
+use std::hint::black_box;
 
 /// Benchmark fused vs unfused LayerNorm + GELU
 fn bench_fused_layernorm_gelu(c: &mut Criterion) {

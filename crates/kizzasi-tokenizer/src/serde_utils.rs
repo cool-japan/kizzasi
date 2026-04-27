@@ -147,7 +147,7 @@ impl VQVAETokenizerConfig {
     }
 }
 
-/// Custom serde module for Array2<f32>
+/// Custom serde module for `Array2<f32>`
 mod array2_serde {
     use scirs2_core::ndarray::Array2;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -181,7 +181,7 @@ mod array2_serde {
     }
 }
 
-/// Custom serde module for Vec<Array2<f32>>
+/// Custom serde module for `Vec<Array2<f32>>`
 mod vec_array2_serde {
     use scirs2_core::ndarray::Array2;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};

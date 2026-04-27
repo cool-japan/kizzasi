@@ -14,6 +14,7 @@
 mod advanced_constraints;
 mod advanced_projection;
 mod approximate_satisfaction;
+pub mod compiler;
 mod constraint;
 mod constraint_analysis;
 mod constraint_propagation;
@@ -21,13 +22,17 @@ mod constraint_repair;
 mod constraint_sensitivity;
 mod decomposition;
 mod differential_constraints;
+pub mod distributed_admm;
 mod error;
 mod gpu_acceleration;
 mod guardrail;
 mod incremental_solver;
+pub mod logic_prog;
 mod mpc;
 mod multiobjective;
 mod online_learning;
+pub mod parallel_advanced;
+pub mod parallel_solver;
 mod performance;
 mod projection;
 #[cfg(feature = "qp-solver")]
@@ -121,7 +126,23 @@ pub use violation_explanation::{
     ViolationExplainer, ViolationExplanation,
 };
 pub use visualization::{
-    ConstraintInspector, ConstraintReport, ConstraintTimeSeries, InspectionResult, ViolationStats,
+    render_constraint_network, render_violation_heatmap, Colormap, ConstraintInspector,
+    ConstraintNetworkEdge, ConstraintNetworkNode, ConstraintPlotter, ConstraintReport,
+    ConstraintTimeSeries, InspectionResult, PlotConfig, SvgBuilder, ViolationStats,
+};
+
+pub use compiler::{CompiledConstraint, ConstraintExpr, ConstraintProgram, Opcode};
+pub use logic_prog::{Atom, DatalogEngine, Rule, SignalFactBridge, Term};
+
+pub use distributed_admm::{
+    AdmmConfig, AdmmError, AdmmResult, ConsensusAdmm, DistributedAdmm, LassoSubproblem,
+    ProjectionSubproblem, QuadraticSubproblem,
+};
+
+pub use parallel_solver::{
+    BoxConstraint, ConstraintGraph, FastConstraint, HyperplaneConstraint,
+    IncrementalParallelSolver, L2BallConstraint, ParallelConfig, ParallelFeasibilityChecker,
+    PropagationResult, SimdConstraintEvaluator, SimplexConstraint, SolverResult,
 };
 
 // Re-export scirs2-core types

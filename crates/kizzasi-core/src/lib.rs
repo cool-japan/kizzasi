@@ -52,11 +52,18 @@ pub mod scan;
 pub mod scheduler;
 pub mod sequences;
 pub mod simd;
+pub mod simd_aarch64;
 pub mod simd_avx512;
 pub mod simd_neon;
+pub use simd_aarch64::{
+    add_f32, dot_product_f32, l2_norm_f32, normalize_f32, relu_f32, rms_norm_f32, scale_f32,
+    softmax_f32, ssm_state_update_f32,
+};
 mod ssm;
 mod state;
 pub mod training;
+pub mod training_core;
+pub mod training_loop;
 pub mod weights;
 
 pub use attention::{GatedLinearAttention, MultiHeadSSMAttention, MultiHeadSSMConfig};
@@ -105,8 +112,7 @@ pub use pruning::{
     StructuredPruner,
 };
 pub use pytorch_compat::{
-    detect_checkpoint_architecture, load_pytorch_checkpoint, PyTorchCheckpoint, PyTorchConverter,
-    WeightMapping,
+    detect_checkpoint_architecture, PyTorchCheckpoint, PyTorchConverter, WeightMapping,
 };
 pub use quantization::{
     DynamicQuantizer, QuantizationParams, QuantizationScheme, QuantizationType, QuantizedTensor,

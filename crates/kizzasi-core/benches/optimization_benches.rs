@@ -6,10 +6,11 @@
 //! - ILP operations
 //! - Cache-aligned data structures
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use kizzasi_core::optimizations::{ilp, CacheAligned, DiscretizationCache, WorkspaceGuard};
 use kizzasi_core::{KizzasiConfig, SelectiveSSM, SignalPredictor};
 use scirs2_core::ndarray::{arr1, Array1, Array2};
+use std::hint::black_box;
 
 fn bench_discretization_cache(c: &mut Criterion) {
     let mut group = c.benchmark_group("discretization_cache");

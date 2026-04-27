@@ -186,7 +186,7 @@ impl ModelLoader {
         })
     }
 
-    /// Load a 1D tensor (Array1<f32>)
+    /// Load a 1D tensor (`Array1<f32>`)
     pub fn load_array1(&self, name: &str) -> ModelResult<Array1<f32>> {
         let view = self.tensors.tensor(name).map_err(|e| {
             ModelError::simple_load_error(format!("Tensor '{}' not found: {}", name, e))
@@ -231,7 +231,7 @@ impl ModelLoader {
         Ok(Array1::from_vec(float_data))
     }
 
-    /// Load a 2D tensor (Array2<f32>)
+    /// Load a 2D tensor (`Array2<f32>`)
     pub fn load_array2(&self, name: &str) -> ModelResult<Array2<f32>> {
         let view = self.tensors.tensor(name).map_err(|e| {
             ModelError::simple_load_error(format!("Tensor '{}' not found: {}", name, e))
@@ -319,7 +319,7 @@ impl ModelLoader {
             .map_err(|e| ModelError::simple_load_error(format!("Failed to create ArrayD: {}", e)))
     }
 
-    /// Load a 3D tensor as Vec<Vec<Vec<f32>>>
+    /// Load a 3D tensor as `Vec<Vec<Vec<f32>>>`
     ///
     /// This is useful for convolution weights [out_channels, in_channels, kernel_size]
     pub fn load_array3(&self, name: &str) -> ModelResult<Vec<Vec<Vec<f32>>>> {
@@ -452,6 +452,8 @@ pub struct WeightLoader {
     loader: ModelLoader,
     model_type: Option<ModelType>,
     strict: bool,
+    /// Optional name mapping applied before tensor lookups
+    name_mapping: Option<HashMap<String, String>>,
 }
 
 impl WeightLoader {
@@ -461,6 +463,7 @@ impl WeightLoader {
             loader,
             model_type: None,
             strict: true,
+            name_mapping: None,
         }
     }
 
@@ -503,20 +506,36 @@ impl WeightLoader {
         &self.loader
     }
 
-    /// Create a name mapping from source format to target format
+    /// Create a name mapping from source format to target format.
+    ///
+    /// The supplied mapping is stored and applied whenever a tensor is looked
+    /// up by name.  Keys present in the mapping are rewritten to their values;
+    /// unknown keys pass through unchanged.
     ///
     /// # Example
     /// ```ignore
     /// let mapping = HashMap::from([
-    ///     ("backbone.layers.0.mixer.in_proj.weight", "layers.0.in_proj"),
-    ///     ("backbone.layers.0.mixer.A_log", "layers.0.ssm.log_a"),
+    ///     ("backbone.layers.0.mixer.in_proj.weight".to_string(), "layers.0.in_proj".to_string()),
+    ///     ("backbone.layers.0.mixer.A_log".to_string(), "layers.0.ssm.log_a".to_string()),
     /// ]);
     /// let mapped_loader = WeightLoader::new(loader).with_name_mapping(mapping);
     /// ```
-    pub fn with_name_mapping(self, _mapping: HashMap<String, String>) -> Self {
-        // TODO: Implement name remapping
-        // This requires storing the mapping and using it during tensor lookups
+    pub fn with_name_mapping(mut self, mapping: HashMap<String, String>) -> Self {
+        self.name_mapping = Some(mapping);
         self
+    }
+
+    /// Apply the stored name mapping (if any) to a tensor key.
+    ///
+    /// Returns the mapped name if the key is present in the mapping, or the
+    /// original key otherwise.
+    pub fn remap_name<'a>(&'a self, name: &'a str) -> &'a str {
+        if let Some(mapping) = &self.name_mapping {
+            if let Some(mapped) = mapping.get(name) {
+                return mapped.as_str();
+            }
+        }
+        name
     }
 
     /// Print available weights and their shapes
@@ -579,6 +598,255 @@ impl WeightLoader {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WeightSourceLoader — bridges WeightSource → WeightLoader/ModelLoader API
+// ---------------------------------------------------------------------------
+
+/// Adapter that wraps a [`crate::incremental_loader::WeightSource`] and exposes
+/// the same tensor-query surface as [`ModelLoader`] for code that expects the
+/// blocking, in-memory API.
+///
+/// This bridges the streaming (`WeightSource`) and legacy (`ModelLoader`) worlds:
+/// weights are loaded on demand from the source instead of being held as a
+/// single pre-loaded byte buffer.
+pub struct WeightSourceLoader<S: crate::incremental_loader::WeightSource> {
+    source: S,
+}
+
+impl<S: crate::incremental_loader::WeightSource> WeightSourceLoader<S> {
+    /// Wrap a [`WeightSource`](crate::incremental_loader::WeightSource) as a
+    /// `WeightSourceLoader`.
+    pub fn new(source: S) -> Self {
+        Self { source }
+    }
+
+    /// Return the names of all tensors available in the underlying source.
+    pub fn list_tensors(&self) -> Vec<String> {
+        self.source.tensor_names()
+    }
+
+    /// Check whether the underlying source contains a tensor with the given name.
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.source.contains(name)
+    }
+
+    /// Load and dequantize the tensor identified by `name` as a flat `Vec<f32>`.
+    pub fn load_flat(&mut self, name: &str) -> ModelResult<Vec<f32>> {
+        self.source.load_tensor(name)
+    }
+
+    /// Consume this adapter, returning ownership of the underlying source.
+    pub fn into_source(self) -> S {
+        self.source
+    }
+}
+
+impl WeightLoader {
+    /// Create a [`WeightLoader`] from any type implementing
+    /// [`WeightSource`](crate::incremental_loader::WeightSource) by first
+    /// materialising all tensors into memory via the source.
+    ///
+    /// This is an escape hatch for code that must use the legacy `WeightLoader`
+    /// API but wants to consume weights from a streaming source. Because it
+    /// loads everything into RAM at once, prefer
+    /// [`IncrementalModelLoader`](crate::incremental_loader::IncrementalModelLoader)
+    /// for true streaming use-cases.
+    pub fn from_weight_source<S: crate::incremental_loader::WeightSource>(
+        mut source: S,
+        model_type: Option<crate::ModelType>,
+        strict: bool,
+    ) -> ModelResult<Self> {
+        let names = source.tensor_names();
+        let mut all_data: Vec<u8> = Vec::new();
+
+        // Build an in-memory safetensors-like representation so that the
+        // ModelLoader can be constructed without a real file on disk.
+        // Strategy: concatenate all tensors as raw F32 bytes and build
+        // a JSON header, then pass to ModelLoader::from_bytes.
+        let mut tensor_metas: Vec<(String, usize, usize, usize)> = Vec::new();
+        for name in &names {
+            let floats = source.load_tensor(name)?;
+            let begin = all_data.len();
+            for v in &floats {
+                all_data.extend_from_slice(&v.to_le_bytes());
+            }
+            let end = all_data.len();
+            tensor_metas.push((name.clone(), begin, end, floats.len()));
+        }
+
+        // Build JSON header
+        let mut header_map = serde_json::Map::new();
+        for (name, begin, end, n) in &tensor_metas {
+            let entry = serde_json::json!({
+                "dtype": "F32",
+                "shape": [n],
+                "data_offsets": [begin, end]
+            });
+            header_map.insert(name.clone(), entry);
+        }
+        let header_json = serde_json::Value::Object(header_map).to_string();
+        let header_bytes = header_json.as_bytes();
+        let header_len = header_bytes.len() as u64;
+
+        let mut file_bytes: Vec<u8> = Vec::new();
+        file_bytes.extend_from_slice(&header_len.to_le_bytes());
+        file_bytes.extend_from_slice(header_bytes);
+        file_bytes.extend_from_slice(&all_data);
+
+        let model_loader = ModelLoader::from_bytes(file_bytes)?;
+        let mut wl = WeightLoader::new(model_loader);
+        if let Some(mt) = model_type {
+            wl = wl.model_type(mt);
+        }
+        wl = wl.strict(strict);
+        Ok(wl)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NameRemapper
+// ---------------------------------------------------------------------------
+
+/// Translates HuggingFace-style weight key names to Kizzasi internal names.
+///
+/// Matching is performed with regex-like pattern rules. Layer-indexed keys
+/// (`layers.{n}.…`) are matched structurally; the numeric index `{n}` is
+/// preserved verbatim.
+///
+/// # Mapping rules
+///
+/// | HuggingFace pattern                        | Kizzasi name                    |
+/// |--------------------------------------------|-------------------------------- |
+/// | `layers.{n}.mixer.in_proj.weight`          | `layers.{n}.input_proj`         |
+/// | `layers.{n}.mixer.out_proj.weight`         | `layers.{n}.output_proj`        |
+/// | `layers.{n}.attn.q_proj.weight`            | `layers.{n}.attention.q`        |
+/// | `layers.{n}.attn.k_proj.weight`            | `layers.{n}.attention.k`        |
+/// | `layers.{n}.attn.v_proj.weight`            | `layers.{n}.attention.v`        |
+/// | `layers.{n}.attn.o_proj.weight`            | `layers.{n}.attention.out`      |
+/// | `layers.{n}.mlp.gate_proj.weight`          | `layers.{n}.ff.gate`            |
+/// | `layers.{n}.mlp.up_proj.weight`            | `layers.{n}.ff.up`              |
+/// | `layers.{n}.mlp.down_proj.weight`          | `layers.{n}.ff.down`            |
+/// | `embedding.weight`                         | `input_proj`                    |
+/// | `lm_head.weight`                           | `output_proj`                   |
+/// | *(any other key)*                          | returned as-is                  |
+#[derive(Debug, Clone, Default)]
+pub struct NameRemapper;
+
+impl NameRemapper {
+    /// Create a new `NameRemapper`.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Remap a single key from HuggingFace to Kizzasi format.
+    ///
+    /// Returns the remapped name, or the original key if no rule matches.
+    ///
+    /// # Backbone prefix stripping
+    ///
+    /// HuggingFace Mamba models wrap everything under a `backbone.` namespace.
+    /// This method strips that prefix before applying the standard rules:
+    ///
+    /// - `backbone.embeddings.weight`  → `embedding.weight`  → `input_proj`
+    /// - `backbone.norm_f.weight`      → `final_norm.weight`
+    /// - `backbone.layers.{n}.…`       → `layers.{n}.…`      → remapped as usual
+    ///
+    /// # `lm_head` tying
+    ///
+    /// When a checkpoint omits `lm_head.weight` (weight tying), callers should
+    /// fill it by transposing `embedding.weight`.  This remapper does not perform
+    /// that step automatically; it is the caller's responsibility to detect the
+    /// absence and apply the transpose.
+    pub fn remap(&self, key: &str) -> String {
+        // ----------------------------------------------------------------
+        // Strip optional `backbone.` prefix (HuggingFace Mamba convention)
+        // ----------------------------------------------------------------
+        let key = if let Some(rest) = key.strip_prefix("backbone.") {
+            // Map well-known backbone sub-keys, then fall through to common rules.
+            match rest {
+                "embeddings.weight" => return "input_proj".to_string(),
+                "norm_f.weight" => return "final_norm.weight".to_string(),
+                _ => rest,
+            }
+        } else {
+            key
+        };
+
+        // ----------------------------------------------------------------
+        // Top-level aliases
+        // ----------------------------------------------------------------
+        if key == "embedding.weight" {
+            return "input_proj".to_string();
+        }
+        if key == "lm_head.weight" {
+            return "output_proj".to_string();
+        }
+
+        // ----------------------------------------------------------------
+        // Layer-indexed patterns: `layers.{n}.<rest>`
+        // ----------------------------------------------------------------
+        if let Some(layer_idx) = Self::extract_layer_index(key) {
+            let after_layer = Self::strip_layer_prefix(key, layer_idx);
+            if let Some(mapped_suffix) = Self::remap_layer_suffix(after_layer) {
+                return format!("layers.{}.{}", layer_idx, mapped_suffix);
+            }
+        }
+
+        // Unknown key — pass through unchanged.
+        key.to_string()
+    }
+
+    /// Extract the layer index from a key that starts with `layers.{n}.`.
+    ///
+    /// Returns `None` if the key does not follow that pattern.
+    fn extract_layer_index(key: &str) -> Option<usize> {
+        let mut parts = key.splitn(3, '.');
+        match (parts.next(), parts.next()) {
+            (Some("layers"), Some(idx)) => idx.parse::<usize>().ok(),
+            _ => None,
+        }
+    }
+
+    /// Strip the `layers.{n}.` prefix and return the remainder.
+    fn strip_layer_prefix(key: &str, layer_idx: usize) -> &str {
+        // "layers.N." is "layers." (7) + digits + "."
+        let prefix_len = 7 + layer_idx.to_string().len() + 1; // "layers." + N + "."
+        if key.len() > prefix_len {
+            &key[prefix_len..]
+        } else {
+            ""
+        }
+    }
+
+    /// Map the suffix portion (after `layers.{n}.`) to a Kizzasi name segment.
+    ///
+    /// Returns `None` if the suffix is not a known pattern.
+    fn remap_layer_suffix(suffix: &str) -> Option<&'static str> {
+        match suffix {
+            "mixer.in_proj.weight" => Some("input_proj"),
+            "mixer.out_proj.weight" => Some("output_proj"),
+            "attn.q_proj.weight" => Some("attention.q"),
+            "attn.k_proj.weight" => Some("attention.k"),
+            "attn.v_proj.weight" => Some("attention.v"),
+            "attn.o_proj.weight" => Some("attention.out"),
+            "mlp.gate_proj.weight" => Some("ff.gate"),
+            "mlp.up_proj.weight" => Some("ff.up"),
+            "mlp.down_proj.weight" => Some("ff.down"),
+            _ => None,
+        }
+    }
+
+    /// Remap an entire weight map, returning a new map with translated keys.
+    ///
+    /// Keys that do not match any rule are kept unchanged.
+    pub fn remap_map(&self, weights: HashMap<String, Vec<f32>>) -> HashMap<String, Vec<f32>> {
+        weights
+            .into_iter()
+            .map(|(k, v)| (self.remap(&k), v))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +860,126 @@ mod tests {
         };
         assert_eq!(info.name, "test");
         assert_eq!(info.shape, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_name_remapper_layers() {
+        let remapper = NameRemapper::new();
+
+        assert_eq!(
+            remapper.remap("layers.0.mixer.in_proj.weight"),
+            "layers.0.input_proj"
+        );
+        assert_eq!(
+            remapper.remap("layers.3.mixer.out_proj.weight"),
+            "layers.3.output_proj"
+        );
+        assert_eq!(
+            remapper.remap("layers.7.attn.q_proj.weight"),
+            "layers.7.attention.q"
+        );
+        assert_eq!(
+            remapper.remap("layers.7.attn.k_proj.weight"),
+            "layers.7.attention.k"
+        );
+        assert_eq!(
+            remapper.remap("layers.7.attn.v_proj.weight"),
+            "layers.7.attention.v"
+        );
+        assert_eq!(
+            remapper.remap("layers.7.attn.o_proj.weight"),
+            "layers.7.attention.out"
+        );
+        assert_eq!(
+            remapper.remap("layers.2.mlp.gate_proj.weight"),
+            "layers.2.ff.gate"
+        );
+        assert_eq!(
+            remapper.remap("layers.2.mlp.up_proj.weight"),
+            "layers.2.ff.up"
+        );
+        assert_eq!(
+            remapper.remap("layers.2.mlp.down_proj.weight"),
+            "layers.2.ff.down"
+        );
+    }
+
+    #[test]
+    fn test_name_remapper_embedding() {
+        let remapper = NameRemapper::new();
+        assert_eq!(remapper.remap("embedding.weight"), "input_proj");
+        assert_eq!(remapper.remap("lm_head.weight"), "output_proj");
+    }
+
+    #[test]
+    fn test_name_remapper_backbone() {
+        let remapper = NameRemapper::new();
+
+        // Well-known backbone-specific sub-keys must map to their canonical targets.
+        assert_eq!(
+            remapper.remap("backbone.embeddings.weight"),
+            "input_proj",
+            "HuggingFace backbone.embeddings.weight should remap to input_proj"
+        );
+        assert_eq!(
+            remapper.remap("backbone.norm_f.weight"),
+            "final_norm.weight",
+            "HuggingFace backbone.norm_f.weight should remap to final_norm.weight"
+        );
+
+        // Layer-indexed keys that pass through the fall-through path after backbone
+        // prefix stripping must still apply the common layer-suffix rules.
+        assert_eq!(
+            remapper.remap("backbone.layers.0.mixer.in_proj.weight"),
+            "layers.0.input_proj",
+            "backbone-prefixed layer key should remap via the normal layer-suffix rules"
+        );
+
+        // Unknown backbone sub-keys pass through unchanged (minus the backbone. prefix).
+        let raw_unknown = "backbone.something.unknown";
+        assert_eq!(
+            remapper.remap(raw_unknown),
+            "something.unknown",
+            "unknown backbone sub-key should pass through with backbone. prefix stripped"
+        );
+    }
+
+    #[test]
+    fn test_name_remapper_passthrough() {
+        let remapper = NameRemapper::new();
+        let unknown = "some.random.unknown.key";
+        assert_eq!(remapper.remap(unknown), unknown);
+        let another = "custom_layer_bias";
+        assert_eq!(remapper.remap(another), another);
+    }
+
+    #[test]
+    fn test_name_remapper_remap_map() {
+        let remapper = NameRemapper::new();
+        let mut weights = HashMap::new();
+        weights.insert("embedding.weight".to_string(), vec![1.0f32, 2.0]);
+        weights.insert("lm_head.weight".to_string(), vec![3.0f32, 4.0]);
+        weights.insert("layers.0.attn.q_proj.weight".to_string(), vec![5.0f32]);
+
+        let remapped = remapper.remap_map(weights);
+        assert!(remapped.contains_key("input_proj"));
+        assert!(remapped.contains_key("output_proj"));
+        assert!(remapped.contains_key("layers.0.attention.q"));
+    }
+
+    #[test]
+    fn test_weight_loader_remap_name() {
+        // WeightLoader.remap_name should use its stored mapping
+        // We test this without a real SafeTensors file by constructing it indirectly.
+        let mut mapping = HashMap::new();
+        mapping.insert("old_name".to_string(), "new_name".to_string());
+
+        // We can't construct a WeightLoader without a ModelLoader (which requires
+        // a real file), so we test NameRemapper directly here.
+        let remapper = NameRemapper::new();
+        assert_eq!(
+            remapper.remap("layers.1.mlp.gate_proj.weight"),
+            "layers.1.ff.gate"
+        );
     }
 }

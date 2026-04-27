@@ -29,7 +29,9 @@ kizzasi-core.workspace = true
 
 # COOLJAPAN Ecosystem (following KIZZASI_POLICY.md)
 scirs2-core.workspace = true
-tensorlogic.workspace = true
+
+# Parallelism (used by distributed_admm for parallel x-updates)
+rayon.workspace = true
 
 # Core dependencies
 thiserror.workspace = true

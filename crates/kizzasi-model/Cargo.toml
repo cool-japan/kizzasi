@@ -26,6 +26,8 @@ rwkv = []
 s4 = []
 transformer = []
 all-models = ["mamba", "rwkv", "s4", "transformer"]
+# HuggingFace Hub blocking HTTP client (reqwest + tokio already in workspace deps)
+hf-hub = []
 
 [dependencies]
 # Internal crates
@@ -52,18 +54,36 @@ half.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
+kizzasi-tokenizer.workspace = true
+kizzasi-logic.workspace = true
 
 # Platform-specific Candle dependencies
 # CUDA is only supported on Linux and Windows (not macOS)
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-candle-core = { version = "0.9.1", default-features = false, features = [] }
-candle-nn = { version = "0.9.1", default-features = false, features = [] }
+candle-core = { version = "0.10.2", default-features = false, features = [] }
+candle-nn = { version = "0.10.2", default-features = false, features = [] }
 
 # macOS uses Metal (or CPU-only by default)
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.9.1", default-features = false, features = [] }
-candle-nn = { version = "0.9.1", default-features = false, features = [] }
+candle-core = { version = "0.10.2", default-features = false, features = [] }
+candle-nn = { version = "0.10.2", default-features = false, features = [] }
 
 [[bench]]
 name = "model_bench"
+harness = false
+
+[[bench]]
+name = "inference"
+harness = false
+
+[[bench]]
+name = "architecture_comparison"
+harness = false
+
+[[bench]]
+name = "discretization_methods"
+harness = false
+
+[[bench]]
+name = "state_dim_sweep"
 harness = false

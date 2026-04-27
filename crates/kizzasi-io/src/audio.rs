@@ -198,7 +198,11 @@ impl AudioInput {
         let device = if let Some(ref name) = self.audio_config.device_name {
             host.input_devices()
                 .map_err(|e| IoError::ConfigError(e.to_string()))?
-                .find(|d| d.name().map(|n| n == *name).unwrap_or(false))
+                .find(|d| {
+                    d.description()
+                        .map(|desc| desc.name() == *name)
+                        .unwrap_or(false)
+                })
                 .ok_or_else(|| IoError::ConfigError(format!("Device not found: {}", name)))?
         } else {
             host.default_input_device()
@@ -207,7 +211,7 @@ impl AudioInput {
 
         let config = cpal::StreamConfig {
             channels: self.audio_config.channels,
-            sample_rate: cpal::SampleRate(self.audio_config.sample_rate),
+            sample_rate: self.audio_config.sample_rate,
             buffer_size: cpal::BufferSize::Fixed(self.audio_config.buffer_size),
         };
 
@@ -309,7 +313,9 @@ impl AudioInput {
             .input_devices()
             .map_err(|e| IoError::ConfigError(e.to_string()))?;
 
-        let names: Vec<String> = devices.filter_map(|d| d.name().ok()).collect();
+        let names: Vec<String> = devices
+            .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+            .collect();
         Ok(names)
     }
 
@@ -391,7 +397,11 @@ impl AudioOutput {
         let device = if let Some(ref name) = self.audio_config.device_name {
             host.output_devices()
                 .map_err(|e| IoError::ConfigError(e.to_string()))?
-                .find(|d| d.name().map(|n| n == *name).unwrap_or(false))
+                .find(|d| {
+                    d.description()
+                        .map(|desc| desc.name() == *name)
+                        .unwrap_or(false)
+                })
                 .ok_or_else(|| IoError::ConfigError(format!("Device not found: {}", name)))?
         } else {
             host.default_output_device()
@@ -400,7 +410,7 @@ impl AudioOutput {
 
         let config = cpal::StreamConfig {
             channels: self.audio_config.channels,
-            sample_rate: cpal::SampleRate(self.audio_config.sample_rate),
+            sample_rate: self.audio_config.sample_rate,
             buffer_size: cpal::BufferSize::Fixed(self.audio_config.buffer_size),
         };
 
@@ -524,7 +534,9 @@ impl AudioOutput {
             .output_devices()
             .map_err(|e| IoError::ConfigError(e.to_string()))?;
 
-        let names: Vec<String> = devices.filter_map(|d| d.name().ok()).collect();
+        let names: Vec<String> = devices
+            .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+            .collect();
         Ok(names)
     }
 

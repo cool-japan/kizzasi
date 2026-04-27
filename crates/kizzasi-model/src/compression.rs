@@ -428,6 +428,454 @@ pub mod weight_sharing {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MagnitudePruner
+// ---------------------------------------------------------------------------
+
+/// Unstructured magnitude-based weight pruner.
+///
+/// Zeroes out all weight entries whose absolute value is strictly below
+/// `threshold`. Tracks cumulative pruning statistics across calls.
+#[derive(Debug, Clone)]
+pub struct MagnitudePruner {
+    /// Magnitude threshold: entries with |w| < threshold are zeroed
+    pub threshold: f32,
+    /// Total number of entries pruned so far
+    pub pruned_count: usize,
+    /// Total number of entries processed so far
+    pub total_count: usize,
+}
+
+impl MagnitudePruner {
+    /// Create a new `MagnitudePruner` with the given magnitude threshold.
+    pub fn new(threshold: f32) -> Self {
+        Self {
+            threshold,
+            pruned_count: 0,
+            total_count: 0,
+        }
+    }
+
+    /// Prune a 2D weight matrix in-place. Returns the sparsity fraction of
+    /// this call (not cumulative).
+    pub fn prune_matrix(&mut self, w: &mut Array2<f32>) -> f32 {
+        let total = w.len();
+        let mut pruned = 0usize;
+        for v in w.iter_mut() {
+            if v.abs() < self.threshold {
+                *v = 0.0;
+                pruned += 1;
+            }
+        }
+        self.total_count += total;
+        self.pruned_count += pruned;
+        if total == 0 {
+            0.0
+        } else {
+            pruned as f32 / total as f32
+        }
+    }
+
+    /// Prune a 1D weight vector in-place. Returns the sparsity fraction of
+    /// this call (not cumulative).
+    pub fn prune_vector(&mut self, v: &mut Array1<f32>) -> f32 {
+        let total = v.len();
+        let mut pruned = 0usize;
+        for x in v.iter_mut() {
+            if x.abs() < self.threshold {
+                *x = 0.0;
+                pruned += 1;
+            }
+        }
+        self.total_count += total;
+        self.pruned_count += pruned;
+        if total == 0 {
+            0.0
+        } else {
+            pruned as f32 / total as f32
+        }
+    }
+
+    /// Cumulative sparsity fraction across all processed entries.
+    pub fn sparsity(&self) -> f32 {
+        if self.total_count == 0 {
+            0.0
+        } else {
+            self.pruned_count as f32 / self.total_count as f32
+        }
+    }
+
+    /// Reset cumulative statistics (threshold is kept).
+    pub fn reset_stats(&mut self) {
+        self.pruned_count = 0;
+        self.total_count = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StructuredPruner
+// ---------------------------------------------------------------------------
+
+/// Structured pruner: removes entire rows (neurons/channels) with the
+/// smallest L2 norms, keeping `keep_fraction` of rows.
+#[derive(Debug, Clone)]
+pub struct StructuredPruner {
+    /// Fraction of rows to retain (0.0 – 1.0)
+    pub keep_fraction: f32,
+}
+
+impl StructuredPruner {
+    /// Create a new `StructuredPruner` that keeps `keep_fraction` of rows.
+    pub fn new(keep_fraction: f32) -> Self {
+        Self { keep_fraction }
+    }
+
+    /// Compute a boolean mask over rows (true = keep).
+    ///
+    /// The top `ceil(keep_fraction * nrows)` rows by L2 norm are kept.
+    pub fn prune_rows(&self, w: &Array2<f32>) -> ModelResult<Vec<bool>> {
+        let nrows = w.nrows();
+        if nrows == 0 {
+            return Err(ModelError::invalid_config(
+                "StructuredPruner::prune_rows: empty matrix",
+            ));
+        }
+        let keep = ((self.keep_fraction * nrows as f32).ceil() as usize).min(nrows);
+
+        // Compute L2 norm per row
+        let mut row_norms: Vec<(usize, f32)> = (0..nrows)
+            .map(|i| {
+                let norm = w.row(i).iter().map(|&x| x * x).sum::<f32>().sqrt();
+                (i, norm)
+            })
+            .collect();
+
+        // Sort descending by norm
+        row_norms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut mask = vec![false; nrows];
+        for (row_idx, _) in row_norms.iter().take(keep) {
+            mask[*row_idx] = true;
+        }
+        Ok(mask)
+    }
+
+    /// Return a new matrix with pruned rows removed.
+    pub fn compress_rows(&self, w: &Array2<f32>) -> ModelResult<Array2<f32>> {
+        let mask = self.prune_rows(w)?;
+        let kept_rows: Vec<usize> = mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &keep)| if keep { Some(i) } else { None })
+            .collect();
+
+        if kept_rows.is_empty() {
+            return Err(ModelError::invalid_config(
+                "StructuredPruner::compress_rows: no rows kept",
+            ));
+        }
+
+        let ncols = w.ncols();
+        let mut out = Array2::<f32>::zeros((kept_rows.len(), ncols));
+        for (new_i, &old_i) in kept_rows.iter().enumerate() {
+            for j in 0..ncols {
+                out[(new_i, j)] = w[(old_i, j)];
+            }
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LowRankApprox
+// ---------------------------------------------------------------------------
+
+/// Low-rank approximation W ≈ U @ diag(S) @ V^T computed via pure-Rust
+/// power iteration (no LAPACK / C dependencies).
+#[derive(Debug, Clone)]
+pub struct LowRankApprox {
+    /// Target rank
+    pub rank: usize,
+    /// Left singular vectors — shape `(rows, rank)`
+    pub u: Array2<f32>,
+    /// Right singular vectors (transposed) — shape `(rank, cols)`
+    pub vt: Array2<f32>,
+    /// Singular values — shape `(rank,)`
+    pub singular_values: Array1<f32>,
+    /// Relative Frobenius reconstruction error `||W - approx||_F / ||W||_F`
+    pub reconstruction_error: f32,
+}
+
+impl LowRankApprox {
+    /// Compute a rank-`rank` approximation of `w` using power iteration.
+    ///
+    /// `num_iter` controls the number of power-iteration steps per component.
+    /// Higher values give more accurate singular vectors.
+    pub fn compute(w: &Array2<f32>, rank: usize, num_iter: usize) -> ModelResult<Self> {
+        let rows = w.nrows();
+        let cols = w.ncols();
+
+        if rank == 0 {
+            return Err(ModelError::invalid_config(
+                "LowRankApprox: rank must be > 0",
+            ));
+        }
+        let effective_rank = rank.min(rows.min(cols));
+
+        let mut u_cols: Vec<Array1<f32>> = Vec::with_capacity(effective_rank);
+        let mut vt_rows: Vec<Array1<f32>> = Vec::with_capacity(effective_rank);
+        let mut sigmas: Vec<f32> = Vec::with_capacity(effective_rank);
+
+        // Working copy for deflation
+        let mut residual = w.clone();
+
+        for k in 0..effective_rank {
+            // Initialise right singular vector (deterministic)
+            let mut v = Array1::<f32>::zeros(cols);
+            v[k % cols] = 1.0;
+
+            let iters = num_iter.max(1);
+            for _ in 0..iters {
+                // u = residual @ v  — shape (rows,)
+                let mut u_vec = Array1::<f32>::zeros(rows);
+                for i in 0..rows {
+                    u_vec[i] = (0..cols).map(|j| residual[(i, j)] * v[j]).sum();
+                }
+                // sigma = ||u||
+                let sigma = u_vec.iter().map(|&x| x * x).sum::<f32>().sqrt();
+                if sigma < 1e-12 {
+                    break;
+                }
+                // u = u / sigma
+                let u_norm = u_vec.mapv(|x| x / sigma);
+
+                // v_new = residual^T @ u_norm  — shape (cols,)
+                let mut v_new = Array1::<f32>::zeros(cols);
+                for j in 0..cols {
+                    v_new[j] = (0..rows).map(|i| residual[(i, j)] * u_norm[i]).sum();
+                }
+                let v_norm_val = v_new.iter().map(|&x| x * x).sum::<f32>().sqrt();
+                if v_norm_val < 1e-12 {
+                    break;
+                }
+                v = v_new.mapv(|x| x / v_norm_val);
+            }
+
+            // Final computation of u and sigma
+            let mut u_vec = Array1::<f32>::zeros(rows);
+            for i in 0..rows {
+                u_vec[i] = (0..cols).map(|j| residual[(i, j)] * v[j]).sum();
+            }
+            let sigma = u_vec.iter().map(|&x| x * x).sum::<f32>().sqrt();
+            if sigma < 1e-12 {
+                // No more signal — fill remaining components with zeros
+                u_cols.push(Array1::zeros(rows));
+                vt_rows.push(Array1::zeros(cols));
+                sigmas.push(0.0);
+            } else {
+                let u_final = u_vec.mapv(|x| x / sigma);
+
+                // Deflate
+                for i in 0..rows {
+                    for j in 0..cols {
+                        residual[(i, j)] -= sigma * u_final[i] * v[j];
+                    }
+                }
+
+                u_cols.push(u_final);
+                vt_rows.push(v);
+                sigmas.push(sigma);
+            }
+        }
+
+        // Assemble U (rows, rank) and Vt (rank, cols)
+        let mut u_mat = Array2::<f32>::zeros((rows, effective_rank));
+        let mut vt_mat = Array2::<f32>::zeros((effective_rank, cols));
+        for k in 0..effective_rank {
+            for i in 0..rows {
+                u_mat[(i, k)] = u_cols[k][i];
+            }
+            for j in 0..cols {
+                vt_mat[(k, j)] = vt_rows[k][j];
+            }
+        }
+        let singular_values = Array1::from_vec(sigmas);
+
+        // Reconstruction error
+        let w_frob: f32 = w.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let rec_error = if w_frob < 1e-12 {
+            0.0
+        } else {
+            // approx = U S Vt
+            let mut err_sq = 0.0_f32;
+            for i in 0..rows {
+                for j in 0..cols {
+                    let approx: f32 = (0..effective_rank)
+                        .map(|k| u_mat[(i, k)] * singular_values[k] * vt_mat[(k, j)])
+                        .sum();
+                    err_sq += (w[(i, j)] - approx).powi(2);
+                }
+            }
+            err_sq.sqrt() / w_frob
+        };
+
+        Ok(Self {
+            rank: effective_rank,
+            u: u_mat,
+            vt: vt_mat,
+            singular_values,
+            reconstruction_error: rec_error,
+        })
+    }
+
+    /// Reconstruct the full matrix: U @ diag(S) @ V^T.
+    pub fn reconstruct(&self) -> ModelResult<Array2<f32>> {
+        let rows = self.u.nrows();
+        let cols = self.vt.ncols();
+        let mut out = Array2::<f32>::zeros((rows, cols));
+        for i in 0..rows {
+            for j in 0..cols {
+                out[(i, j)] = (0..self.rank)
+                    .map(|k| self.u[(i, k)] * self.singular_values[k] * self.vt[(k, j)])
+                    .sum();
+            }
+        }
+        Ok(out)
+    }
+
+    /// Compression ratio: `(rows * cols) / (rows * rank + rank * cols)`.
+    pub fn compression_ratio(&self) -> f32 {
+        let rows = self.u.nrows();
+        let cols = self.vt.ncols();
+        let original = rows * cols;
+        let compressed = rows * self.rank + self.rank * cols;
+        if compressed == 0 {
+            return f32::INFINITY;
+        }
+        original as f32 / compressed as f32
+    }
+
+    /// Fast forward pass using factored form: `(U @ diag(S)) @ (V^T @ x)`.
+    ///
+    /// `x` must have length equal to the number of columns (original input dim).
+    pub fn forward(&self, x: &Array1<f32>) -> ModelResult<Array1<f32>> {
+        let cols = self.vt.ncols();
+        let rows = self.u.nrows();
+        if x.len() != cols {
+            return Err(ModelError::dimension_mismatch(
+                "LowRankApprox::forward",
+                cols,
+                x.len(),
+            ));
+        }
+        // intermediate = V^T @ x  — shape (rank,)
+        let mut intermediate = Array1::<f32>::zeros(self.rank);
+        for k in 0..self.rank {
+            intermediate[k] = (0..cols).map(|j| self.vt[(k, j)] * x[j]).sum();
+        }
+        // scale by singular values
+        for k in 0..self.rank {
+            intermediate[k] *= self.singular_values[k];
+        }
+        // output = U @ intermediate  — shape (rows,)
+        let mut out = Array1::<f32>::zeros(rows);
+        for i in 0..rows {
+            out[i] = (0..self.rank)
+                .map(|k| self.u[(i, k)] * intermediate[k])
+                .sum();
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CompressionReport
+// ---------------------------------------------------------------------------
+
+/// Summary report of compression applied to a set of weight matrices.
+#[derive(Debug, Clone)]
+pub struct CompressionReport {
+    /// Total number of parameters in original model
+    pub original_params: usize,
+    /// Total number of parameters after compression
+    pub compressed_params: usize,
+    /// Number of parameters set to zero (pruned)
+    pub pruned_params: usize,
+    /// `(layer_name, original_rank, compressed_rank)` per layer
+    pub rank_reductions: Vec<(String, usize, usize)>,
+    /// Overall compression ratio
+    pub overall_compression_ratio: f32,
+}
+
+impl CompressionReport {
+    /// Create a new, empty compression report.
+    pub fn new() -> Self {
+        Self {
+            original_params: 0,
+            compressed_params: 0,
+            pruned_params: 0,
+            rank_reductions: Vec::new(),
+            overall_compression_ratio: 1.0,
+        }
+    }
+
+    /// Register a layer's original and compressed weight matrices.
+    ///
+    /// Updates parameter counts and compression ratio automatically.
+    pub fn add_layer(&mut self, name: &str, original: &Array2<f32>, compressed: &Array2<f32>) {
+        let orig_params = original.nrows() * original.ncols();
+        let comp_params = compressed.nrows() * compressed.ncols();
+
+        // Count zero entries in original as "pruned"
+        let pruned = original.iter().filter(|&&x| x == 0.0).count();
+
+        self.original_params += orig_params;
+        self.compressed_params += comp_params;
+        self.pruned_params += pruned;
+
+        let orig_rank = original.nrows().min(original.ncols());
+        let comp_rank = compressed.nrows().min(compressed.ncols());
+        self.rank_reductions
+            .push((name.to_string(), orig_rank, comp_rank));
+
+        self.overall_compression_ratio = if self.compressed_params == 0 {
+            f32::INFINITY
+        } else {
+            self.original_params as f32 / self.compressed_params as f32
+        };
+    }
+
+    /// Generate a human-readable summary string.
+    pub fn summary(&self) -> String {
+        let mut lines = vec![
+            "=== Compression Report ===".to_string(),
+            format!("Original parameters : {}", self.original_params),
+            format!("Compressed parameters: {}", self.compressed_params),
+            format!("Pruned parameters   : {}", self.pruned_params),
+            format!(
+                "Overall compression ratio: {:.3}x",
+                self.overall_compression_ratio
+            ),
+            String::new(),
+            "Layer rank reductions:".to_string(),
+        ];
+        for (name, orig_rank, comp_rank) in &self.rank_reductions {
+            lines.push(format!("  {}: rank {} -> {}", name, orig_rank, comp_rank));
+        }
+        lines.join("\n")
+    }
+}
+
+impl Default for CompressionReport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,5 +983,133 @@ mod tests {
         let unique_vals: std::collections::HashSet<_> =
             quantized.iter().map(|&x| (x * 1000.0) as i32).collect();
         assert!(unique_vals.len() <= 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // MagnitudePruner tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_magnitude_pruner_basic() {
+        let mut pruner = MagnitudePruner::new(0.5);
+        // Values: 0.1, 0.2, 0.3, 0.4 are below threshold; 0.6, 0.7, 0.8, 0.9 are above
+        let mut w =
+            Array2::from_shape_vec((2, 4), vec![0.1_f32, 0.6, 0.2, 0.7, 0.3, 0.8, 0.4, 0.9])
+                .expect("shape");
+
+        let sparsity = pruner.prune_matrix(&mut w);
+        // 4 out of 8 entries are zeroed
+        assert!(sparsity > 0.0, "sparsity should be > 0");
+        let zero_count = w.iter().filter(|&&x| x == 0.0).count();
+        assert_eq!(zero_count, 4);
+        assert!(pruner.pruned_count > 0);
+        assert!(pruner.total_count > 0);
+    }
+
+    #[test]
+    fn test_magnitude_pruner_zero_threshold() {
+        let mut pruner = MagnitudePruner::new(0.0);
+        let mut w = Array2::from_shape_vec((2, 2), vec![0.5_f32, 1.0, -0.3, 2.0]).expect("shape");
+
+        let sparsity = pruner.prune_matrix(&mut w);
+        // threshold = 0 means |w| < 0, which is never true → nothing pruned
+        assert_eq!(sparsity, 0.0, "zero threshold should prune nothing");
+        assert_eq!(pruner.pruned_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // StructuredPruner tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_structured_pruner_row_mask_count() {
+        let w = Array2::from_shape_fn((10, 4), |(i, j)| (i * 4 + j) as f32);
+        let pruner = StructuredPruner::new(0.6);
+        let mask = pruner.prune_rows(&w).expect("prune_rows failed");
+
+        let keep_count = mask.iter().filter(|&&k| k).count();
+        // ceil(0.6 * 10) = 6
+        assert_eq!(keep_count, 6, "expected 6 kept rows, got {keep_count}");
+        assert_eq!(mask.len(), 10);
+    }
+
+    #[test]
+    fn test_structured_pruner_compress_reduces_rows() {
+        let w = Array2::from_shape_fn((8, 3), |(i, j)| (i + j) as f32);
+        let pruner = StructuredPruner::new(0.5);
+        let compressed = pruner.compress_rows(&w).expect("compress_rows failed");
+
+        assert!(
+            compressed.nrows() < w.nrows(),
+            "compressed rows {} should be < original {}",
+            compressed.nrows(),
+            w.nrows()
+        );
+        assert_eq!(compressed.ncols(), w.ncols());
+    }
+
+    // -----------------------------------------------------------------------
+    // LowRankApprox tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_low_rank_approx_shapes() {
+        let w = Array2::from_shape_fn((8, 6), |(i, j)| (i * j) as f32 * 0.1);
+        let lra = LowRankApprox::compute(&w, 3, 50).expect("compute failed");
+
+        assert_eq!(lra.u.nrows(), 8);
+        assert_eq!(lra.u.ncols(), 3);
+        assert_eq!(lra.vt.nrows(), 3);
+        assert_eq!(lra.vt.ncols(), 6);
+        assert_eq!(lra.singular_values.len(), 3);
+    }
+
+    #[test]
+    fn test_low_rank_approx_reconstruction_error() {
+        // Identity matrix: rank-4 approx should reconstruct perfectly
+        let mut data = vec![0.0_f32; 16];
+        for i in 0..4 {
+            data[i * 4 + i] = 1.0;
+        }
+        let w = Array2::from_shape_vec((4, 4), data).expect("shape");
+
+        let lra = LowRankApprox::compute(&w, 4, 100).expect("compute failed");
+        assert!(
+            lra.reconstruction_error < 0.01,
+            "reconstruction_error {} should be < 0.01",
+            lra.reconstruction_error
+        );
+    }
+
+    #[test]
+    fn test_low_rank_approx_compression_ratio() {
+        // 10x10, rank 2 → (10*10) / (10*2 + 2*10) = 100/40 = 2.5 > 1
+        let w = Array2::from_shape_fn((10, 10), |(i, j)| (i as f32).sin() + (j as f32).cos());
+        let lra = LowRankApprox::compute(&w, 2, 20).expect("compute failed");
+
+        assert!(
+            lra.compression_ratio() > 1.0,
+            "compression_ratio {} should be > 1.0",
+            lra.compression_ratio()
+        );
+    }
+
+    #[test]
+    fn test_low_rank_forward_shape() {
+        // w: 8x6, rank=3 → forward(x: 6) → output shape (8,)
+        let w = Array2::from_shape_fn((8, 6), |(i, j)| ((i + j) as f32) * 0.1);
+        let lra = LowRankApprox::compute(&w, 3, 30).expect("compute failed");
+
+        let x = Array1::from_vec(vec![1.0_f32; 6]);
+        let out = lra.forward(&x).expect("forward failed");
+        assert_eq!(out.len(), 8, "expected output len 8, got {}", out.len());
+    }
+
+    #[test]
+    fn test_distillation_loss_same_logits() {
+        let logits = Array1::from_vec(vec![1.0_f32, 2.0, 3.0]);
+        let loss = distillation_loss(&logits, &logits, 1.0).expect("distillation_loss failed");
+        // KL(p || p) = 0
+        assert!(loss < 1e-5, "same logits should give loss ≈ 0, got {loss}");
     }
 }

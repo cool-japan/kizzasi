@@ -244,7 +244,8 @@ impl HuggingFaceHub {
         // Verify SHA256 if enabled
         if self.verify_integrity {
             let hash = Sha256::digest(&bytes);
-            tracing::debug!("SHA256: {:x}", hash);
+            let hash_hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+            tracing::debug!("SHA256: {}", hash_hex);
         }
 
         // Create cache directory structure

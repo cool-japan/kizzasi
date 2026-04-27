@@ -198,6 +198,7 @@ impl InferenceEngine {
     /// This is the core autoregressive prediction:
     /// Given input x_t, predict x_{t+1}
     pub fn step(&mut self, input: &Array1<f32>) -> InferenceResult<Array1<f32>> {
+        let _span = tracing::debug_span!("inference_step", input_len = input.len()).entered();
         if !self.initialized {
             return Err(InferenceError::NotInitialized);
         }

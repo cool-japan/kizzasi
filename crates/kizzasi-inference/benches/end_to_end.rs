@@ -9,7 +9,7 @@
 //! - Ensemble models
 //! - Speculative decoding
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kizzasi_inference::{
     BatchConfig, BatchScheduler, EngineConfig, EnsembleBuilder, EnsembleStrategy, FusionStrategy,
     InferenceEngine, ModalityType, MultiModalPipeline, PipelineBuilder, SamplingConfig,
@@ -19,6 +19,7 @@ use kizzasi_model::rwkv::{Rwkv, RwkvConfig};
 use kizzasi_model::s4::{S4Config, S4D};
 use kizzasi_model::transformer::{Transformer, TransformerConfig};
 use scirs2_core::ndarray::Array1;
+use std::hint::black_box;
 
 /// Benchmark single-step inference with different models
 fn bench_single_step_inference(c: &mut Criterion) {

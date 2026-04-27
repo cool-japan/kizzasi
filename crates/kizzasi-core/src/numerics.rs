@@ -428,6 +428,111 @@ pub fn zoh_discretize(a: &Array2<f32>, b: &Array2<f32>, dt: f32) -> (Array2<f32>
     (a_d, b_d)
 }
 
+// ============================================================================
+// Diagonal-A Discretization Methods
+// ============================================================================
+
+/// Discretization method for SSM state-space models with diagonal A.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DiscretizationMethod {
+    /// Zero-Order Hold (exact for piecewise-constant inputs, diagonal A)
+    Zoh,
+    /// Bilinear (Tustin) transform — preserves stability for all dt > 0
+    Bilinear,
+    /// Forward Euler — first-order; unstable for dt·|a| > 2
+    ForwardEuler,
+}
+
+/// Zero-Order Hold (ZOH) discretization for **diagonal** A.
+///
+/// For each element i:
+/// - a_bar[i] = exp(dt · a[i])
+/// - b_bar[i, :] = (exp(dt · a[i]) - 1) / a[i] · b[i, :]
+///   (= dt · b[i, :] when a[i] ≈ 0)
+///
+/// This is the exact closed-form ZOH for a diagonal continuous-time system.
+pub fn zoh_discretize_diagonal(
+    a: &Array1<f32>,
+    b: &Array2<f32>,
+    dt: f32,
+) -> (Array1<f32>, Array2<f32>) {
+    let a_bar = a.mapv(|ai| (dt * ai).exp());
+    let n_in = b.ncols();
+    let state_dim = a.len();
+    let b_bar = Array2::from_shape_fn((state_dim, n_in), |(i, j)| {
+        let ai = a[i];
+        // Scale factor: expm1(dt*ai) / ai  when |dt*ai| > eps
+        //               dt                  in the limit ai -> 0
+        let scale = {
+            let y = dt * ai;
+            if y.abs() < 1e-6 {
+                dt
+            } else {
+                y.exp_m1() / ai
+            }
+        };
+        scale * b[[i, j]]
+    });
+    (a_bar, b_bar)
+}
+
+/// Bilinear (Tustin) discretization for **diagonal** A.
+///
+/// For each element i:
+/// - a_bar[i] = (1 + dt·a[i]/2) / (1 - dt·a[i]/2)
+/// - b_bar[i, :] = dt/2 · (1 + a_bar[i]) · b[i, :]
+///
+/// Preserves stability: |a_bar| < 1 for all Re(a) < 0 and dt > 0.
+pub fn bilinear_discretize(
+    a: &Array1<f32>,
+    b: &Array2<f32>,
+    dt: f32,
+) -> (Array1<f32>, Array2<f32>) {
+    let half_dt = dt * 0.5;
+    let a_bar: Array1<f32> = a.mapv(|ai| {
+        let num = 1.0 + half_dt * ai;
+        let den = 1.0 - half_dt * ai;
+        num / den
+    });
+    let n_in = b.ncols();
+    let state_dim = a.len();
+    let b_bar = Array2::from_shape_fn((state_dim, n_in), |(i, j)| {
+        half_dt * (1.0 + a_bar[i]) * b[[i, j]]
+    });
+    (a_bar, b_bar)
+}
+
+/// Forward Euler discretization for **diagonal** A.
+///
+/// For each element i:
+/// - a_bar[i] = 1 + dt·a[i]
+/// - b_bar = dt·b
+///
+/// NOTE: Unstable when dt·|a[i]| > 2. Use ZOH or Bilinear for large dt.
+pub fn forward_euler_discretize(
+    a: &Array1<f32>,
+    b: &Array2<f32>,
+    dt: f32,
+) -> (Array1<f32>, Array2<f32>) {
+    let a_bar = a.mapv(|ai| 1.0 + dt * ai);
+    let b_bar = b.mapv(|bij| dt * bij);
+    (a_bar, b_bar)
+}
+
+/// Dispatch to the requested diagonal-A discretization method.
+pub fn discretize(
+    method: DiscretizationMethod,
+    a: &Array1<f32>,
+    b: &Array2<f32>,
+    dt: f32,
+) -> (Array1<f32>, Array2<f32>) {
+    match method {
+        DiscretizationMethod::Zoh => zoh_discretize_diagonal(a, b, dt),
+        DiscretizationMethod::Bilinear => bilinear_discretize(a, b, dt),
+        DiscretizationMethod::ForwardEuler => forward_euler_discretize(a, b, dt),
+    }
+}
+
 /// Taylor series expansion for matrix exponential
 fn taylor_exp(a: &Array2<f32>, terms: usize) -> Array2<f32> {
     let n = a.shape()[0];
@@ -680,5 +785,85 @@ mod tests {
 
         // B_d should be non-zero
         assert!(b_d[[0, 0]].abs() > 0.0, "b_d[0,0] = {}", b_d[[0, 0]]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagonal-A discretization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bilinear_stable_negative_eigenvalue() {
+        // For Re(a) < 0, all dt > 0, |a_bar| < 1
+        let a = Array1::from_vec(vec![-1.0f32, -0.5, -2.0]);
+        let b = Array2::<f32>::ones((3, 1));
+        for &dt in &[0.01f32, 0.1, 0.5, 1.0, 2.0] {
+            let (a_bar, _) = bilinear_discretize(&a, &b, dt);
+            for &x in a_bar.iter() {
+                assert!(x.abs() < 1.0, "stability violated: a_bar={x} at dt={dt}");
+            }
+        }
+    }
+
+    #[test]
+    fn bilinear_exact_at_zero_eigenvalue() {
+        // a=0: a_bar should be 1, b_bar = dt * b
+        let a = Array1::<f32>::zeros(2);
+        let b = Array2::from_shape_vec((2, 1), vec![2.0f32, 3.0]).unwrap();
+        let dt = 0.1;
+        let (a_bar, b_bar) = bilinear_discretize(&a, &b, dt);
+        for &x in a_bar.iter() {
+            assert!((x - 1.0).abs() < 1e-6, "a_bar should be 1 for a=0, got {x}");
+        }
+        // b_bar = dt/2 * (1 + 1) * b = dt * b
+        let expected_b = b.mapv(|x| dt * x);
+        for (got, exp) in b_bar.iter().zip(expected_b.iter()) {
+            assert!((got - exp).abs() < 1e-6, "b_bar mismatch: {got} vs {exp}");
+        }
+    }
+
+    #[test]
+    fn forward_euler_close_to_zoh_small_dt() {
+        // Forward Euler O(dt^2) approximation to ZOH-diagonal
+        let a = Array1::from_vec(vec![-1.0f32]);
+        let b = Array2::<f32>::ones((1, 1));
+        let dt = 1e-4_f32;
+        let (a_fe, _) = forward_euler_discretize(&a, &b, dt);
+        let (a_zoh, _) = zoh_discretize_diagonal(&a, &b, dt);
+        let err = (a_fe[0] - a_zoh[0]).abs();
+        assert!(
+            err < 1e-7,
+            "FE vs ZOH-diagonal error {err} too large for dt={dt}"
+        );
+    }
+
+    #[test]
+    fn discretize_zoh_matches_zoh_discretize_diagonal() {
+        let a = Array1::from_vec(vec![-0.5f32, -1.0, -2.0]);
+        let b = Array2::<f32>::ones((3, 2));
+        let dt = 0.05;
+        let (a1, b1) = zoh_discretize_diagonal(&a, &b, dt);
+        let (a2, b2) = discretize(DiscretizationMethod::Zoh, &a, &b, dt);
+        for (x, y) in a1.iter().zip(a2.iter()) {
+            assert!((x - y).abs() < 1e-7, "ZOH mismatch: {x} vs {y}");
+        }
+        for (x, y) in b1.iter().zip(b2.iter()) {
+            assert!((x - y).abs() < 1e-7, "ZOH B mismatch: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn zoh_diagonal_exact_expm() {
+        // For diagonal A, ZOH should be exact: a_bar[i] = exp(dt * a[i])
+        let a = Array1::from_vec(vec![-1.0f32, -2.0, -0.5]);
+        let b = Array2::<f32>::ones((3, 2));
+        let dt = 0.1;
+        let (a_bar, _) = zoh_discretize_diagonal(&a, &b, dt);
+        for (i, (&ab, &ai)) in a_bar.iter().zip(a.iter()).enumerate() {
+            let expected = (dt * ai).exp();
+            assert!(
+                (ab - expected).abs() < 1e-6,
+                "ZOH-diagonal a_bar[{i}]={ab} expected {expected}"
+            );
+        }
     }
 }

@@ -265,7 +265,7 @@ impl Sampler {
     /// Sample from a categorical distribution
     fn sample_categorical(&mut self, probs: &Array1<f32>) -> InferenceResult<f32> {
         // Use simple random sampling based on system RNG
-        use scirs2_core::random::{rng, Rng};
+        use scirs2_core::random::{rng, RngExt};
 
         let mut rng_gen = rng();
         let uniform: f32 = rng_gen.random();

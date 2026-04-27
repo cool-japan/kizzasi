@@ -1,0 +1,4 @@
+[env]
+# PYO3_PYTHON and AMENT_PREFIX_PATH are set in .bashrc for the dev environment.
+# The RUSTFLAGS -C link-arg=-lpython3.11 is also set in .bashrc to allow
+# PyO3 extension-module crates to be compiled with --all-features for tests.

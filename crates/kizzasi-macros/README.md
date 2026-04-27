@@ -18,7 +18,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kizzasi-macros = "0.1.0"
+kizzasi-macros = "0.2.1"
 ```
 
 Example:
@@ -46,4 +46,4 @@ let config = MyConfig::builder()
 
 ## License
 
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+Licensed under the Apache License, Version 2.0.

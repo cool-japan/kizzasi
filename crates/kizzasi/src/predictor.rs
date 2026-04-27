@@ -12,7 +12,7 @@ use kizzasi_logic::{ConstrainedInference, GuardrailSet};
 // From Trait Implementations for Common Signal Types
 // ============================================================================
 
-/// Implements From trait for converting common signal types to Array1<f32>
+/// Implements From trait for converting common signal types to `Array1<f32>`
 /// This makes it easier to work with Kizzasi without manually creating arrays.
 impl From<f32> for SignalInput {
     fn from(value: f32) -> Self {
@@ -455,7 +455,10 @@ impl Kizzasi {
         }
 
         let result = self.step_slice(input)?;
-        output.copy_from_slice(result.as_slice().unwrap());
+        let slice = result
+            .as_slice()
+            .ok_or_else(|| KizzasiError::inference("result array not contiguous"))?;
+        output.copy_from_slice(slice);
         Ok(())
     }
 

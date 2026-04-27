@@ -211,7 +211,8 @@ pub use pool::{ConnectionFactory, ConnectionPool, PoolConfig, PoolStats};
 
 #[cfg(feature = "async")]
 pub use distributed::{
-    DistributedConfig, DistributedPredictor, LoadBalancingStrategy, WorkerStats,
+    distributed_predict, distributed_predict_with_config, DistributedConfig, DistributedPredictor,
+    LoadBalancingStrategy, WorkerStats,
 };
 
 #[cfg(feature = "config-files")]

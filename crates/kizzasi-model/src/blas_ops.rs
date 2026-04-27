@@ -222,7 +222,7 @@ pub fn transpose(matrix: &ArrayView2<f32>) -> ModelResult<Array2<f32>> {
         .map_err(|e| ModelError::numerical_instability("BLAS transpose", e.to_string()))
 }
 
-/// Batch matrix-vector multiplication: Y[i] = A[i] * x[i] for all i
+/// Batch matrix-vector multiplication: `Y[i] = A[i] * x[i]` for all i
 ///
 /// Processes multiple matrix-vector products in parallel when beneficial.
 ///

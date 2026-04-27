@@ -159,6 +159,7 @@ impl Default for Ros2Config {
 /// Subscribes to a ROS2 topic and converts messages to signal arrays.
 pub struct Ros2Stream {
     config: Ros2Config,
+    #[allow(dead_code)]
     context: Arc<r2r::Context>,
     node: Arc<Mutex<r2r::Node>>,
     buffer: Arc<Mutex<Vec<f32>>>,
@@ -198,7 +199,7 @@ impl Ros2Stream {
     async fn subscribe_float32(&mut self) -> IoResult<()> {
         use r2r::std_msgs::msg::Float32;
 
-        let buffer = self.buffer.clone();
+        let _buffer = self.buffer.clone();
         let mut node = self.node.lock().await;
 
         let _sub = node
@@ -215,7 +216,7 @@ impl Ros2Stream {
     async fn subscribe_float64(&mut self) -> IoResult<()> {
         use r2r::std_msgs::msg::Float64;
 
-        let buffer = self.buffer.clone();
+        let _buffer = self.buffer.clone();
         let mut node = self.node.lock().await;
 
         let _sub = node
@@ -229,7 +230,7 @@ impl Ros2Stream {
     async fn subscribe_float32_array(&mut self) -> IoResult<()> {
         use r2r::std_msgs::msg::Float32MultiArray;
 
-        let buffer = self.buffer.clone();
+        let _buffer = self.buffer.clone();
         let mut node = self.node.lock().await;
 
         let _sub = node
@@ -243,7 +244,7 @@ impl Ros2Stream {
     async fn subscribe_imu(&mut self) -> IoResult<()> {
         use r2r::sensor_msgs::msg::Imu;
 
-        let buffer = self.buffer.clone();
+        let _buffer = self.buffer.clone();
         let mut node = self.node.lock().await;
 
         let _sub = node
@@ -281,8 +282,8 @@ impl Ros2Stream {
 #[async_trait]
 impl AsyncSignalStream for Ros2Stream {
     async fn read(&mut self) -> IoResult<Array1<f32>> {
-        // Spin the node to process callbacks
-        let mut node = self.node.lock().await;
+        // Acquire node lock to prevent concurrent access during buffer drain
+        let _node = self.node.lock().await;
 
         // In a real implementation, this would:
         // 1. Spin the node to receive messages

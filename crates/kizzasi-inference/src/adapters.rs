@@ -46,6 +46,9 @@ pub mod mqtt;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 
+#[cfg(feature = "rest")]
+pub mod rest;
+
 #[cfg(feature = "websocket")]
 pub use websocket::WebSocketAdapter;
 
@@ -54,6 +57,9 @@ pub use mqtt::MqttAdapter;
 
 #[cfg(feature = "grpc")]
 pub use grpc::GrpcAdapter;
+
+#[cfg(feature = "rest")]
+pub use rest::{RestAdapter, RestServer};
 
 use scirs2_core::ndarray::Array1;
 use serde::{Deserialize, Serialize};

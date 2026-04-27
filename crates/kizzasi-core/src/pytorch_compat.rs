@@ -403,12 +403,6 @@ impl PyTorchConverter {
     }
 }
 
-/// Helper function to load PyTorch checkpoint from safetensors
-pub fn load_pytorch_checkpoint(path: impl AsRef<Path>) -> CoreResult<HashMap<String, Tensor>> {
-    let converter = PyTorchConverter::new_cpu();
-    converter.load_safetensors(path)
-}
-
 /// Helper function to detect architecture from checkpoint file
 pub fn detect_checkpoint_architecture(path: impl AsRef<Path>) -> CoreResult<PyTorchCheckpoint> {
     let converter = PyTorchConverter::new_cpu();

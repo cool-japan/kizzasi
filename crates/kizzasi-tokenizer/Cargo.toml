@@ -24,11 +24,10 @@ metal = ["kizzasi-core/metal"]
 vqvae = []
 mulaw = []
 parallel = ["dep:rayon"]
+# WebAssembly support (opt-in, exposes JS bindings via wasm-bindgen)
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]
 
 [dependencies]
-# Internal crates
-kizzasi-core.workspace = true
-
 # COOLJAPAN Ecosystem
 scirs2-core.workspace = true
 
@@ -41,24 +40,38 @@ oxicode.workspace = true
 chrono.workspace = true
 safetensors.workspace = true
 
-
 # Parallel processing (optional)
 rayon = { workspace = true, optional = true }
+
+# WebAssembly bindings (optional, only meaningful for wasm32 target)
+wasm-bindgen = { version = "0.2.118", optional = true }
+js-sys = { version = "0.3.95", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
 
 # Platform-specific Candle dependencies
-# CUDA is only supported on Linux and Windows (not macOS)
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-candle-core = { version = "0.9.1", default-features = false, features = [] }
-candle-nn = { version = "0.9.1", default-features = false, features = [] }
+# CUDA is only supported on Linux and Windows (not macOS), and never on wasm32
+[target.'cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))'.dependencies]
+candle-core = { version = "0.10.2", default-features = false, features = [] }
+candle-nn = { version = "0.10.2", default-features = false, features = [] }
 
-# macOS uses Metal (or CPU-only by default)
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.9.1", default-features = false, features = [] }
-candle-nn = { version = "0.9.1", default-features = false, features = [] }
+# macOS uses Metal (or CPU-only by default), never on wasm32
+[target.'cfg(all(target_os = "macos", not(target_arch = "wasm32")))'.dependencies]
+candle-core = { version = "0.10.2", default-features = false, features = [] }
+candle-nn = { version = "0.10.2", default-features = false, features = [] }
+
+# kizzasi-core is not wasm32-compatible (uses candle, std::fs, std::thread)
+# Include it only on native targets
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+kizzasi-core.workspace = true
+
+# wasm32 requires special RNG backends — uuid needs the `js` feature for wasm32-unknown-unknown
+# getrandom needs `wasm_js` for rand_core. Cargo unifies these features at resolution time.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+uuid = { version = "1", features = ["v4", "serde", "js"] }
 
 [[bench]]
 name = "tokenizer_benchmarks"

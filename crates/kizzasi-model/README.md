@@ -9,7 +9,7 @@ Production-ready implementations of state-of-the-art sequence models with unifie
 ## Features
 
 - **Mamba & Mamba2**: Selective state space models with SSD
-- **RWKV v6 & v7**: Receptance Weighted Key Value architecture
+- **RWKV v5/v6/v7**: Receptance Weighted Key Value architecture
 - **S4/S4D/S5**: Structured state space models with HiPPO initialization
 - **H3**: Hungry Hungry Hippos with shift SSMs
 - **Transformer**: KV-cache optimized attention
@@ -44,6 +44,23 @@ let large_model = Mamba::large(64, 1024); // High accuracy
 | Transformer | O(n²) | High | Short contexts |
 | Hybrid | O(n) | Medium | Balanced performance |
 
+## Mamba SSM Forward Pass
+
+```mermaid
+flowchart LR
+    X["x_t (input)"] --> PROJ["Linear Projection"]
+    PROJ --> DELTA["Δ (timescale)"]
+    PROJ --> B["B (input gate)"]
+    PROJ --> C["C (output gate)"]
+    DELTA --> DISC["ZOH Discretization\nA_bar, B_bar"]
+    H_PREV["h_{t-1} (state)"] --> SSM
+    DISC --> SSM["SSM Recurrence\nh_t = A_bar·h + B_bar·x"]
+    B --> SSM
+    SSM --> H_NEXT["h_t (new state)"]
+    C --> OUT["Output\ny_t = C·h_t"]
+    SSM --> OUT
+```
+
 ## Documentation
 
 - [API Documentation](https://docs.rs/kizzasi-model)
@@ -51,4 +68,4 @@ let large_model = Mamba::large(64, 1024); // High accuracy
 
 ## License
 
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+Licensed under the Apache License, Version 2.0.

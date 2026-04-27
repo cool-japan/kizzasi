@@ -283,26 +283,6 @@ impl WeightLoader {
 
         Ok(quantized)
     }
-
-    /// Load weights from PyTorch checkpoint
-    ///
-    /// This is a placeholder for PyTorch checkpoint loading.
-    /// Full implementation would require parsing PyTorch's pickle format.
-    pub fn load_pytorch_checkpoint<P: AsRef<Path>>(
-        &self,
-        _path: P,
-        _varmap: &VarMap,
-    ) -> CoreResult<()> {
-        // TODO: Implement PyTorch checkpoint loading
-        // This would require:
-        // 1. Parsing PyTorch's pickle format
-        // 2. Converting PyTorch tensor names to our naming convention
-        // 3. Handling state_dict structure
-
-        Err(CoreError::WeightLoadError(
-            "PyTorch checkpoint loading not yet implemented".to_string(),
-        ))
-    }
 }
 
 /// Weight pruning utilities

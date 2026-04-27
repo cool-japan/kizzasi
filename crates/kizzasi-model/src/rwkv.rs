@@ -20,16 +20,42 @@
 //!        [LayerNorm] → [Channel-Mixing] → [Add] → Output
 //! ```
 //!
+//! # WKV Attention Formula
+//!
+//! The core WKV (Weighted Key-Value) computation for RWKV v6:
+//!
+//! ```text
+//! wkv_t = (∑_{i=1}^{t-1} e^{-(t-1-i)·w + k_i} · v_i + e^{u+k_t} · v_t)
+//!       / (∑_{i=1}^{t-1} e^{-(t-1-i)·w + k_i}     + e^{u+k_t})
+//! ```
+//!
+//! where:
+//! - `w` is the learned time decay (per-channel)
+//! - `u` is the learned bonus term for current token
+//! - `k_i`, `v_i` are key and value at position i
+//!
+//! ## Efficient Recurrence
+//!
+//! The WKV sum is maintained as running state:
+//!
+//! ```text
+//! num_t = e^{-w} · num_{t-1} + e^{k_t} · v_t
+//! den_t = e^{-w} · den_{t-1} + e^{k_t}
+//! wkv_t = (num_t + e^{u+k_t} · v_t) / (den_t + e^{u+k_t})
+//! ```
+//!
+//! This gives O(1) per-step inference with constant memory.
+//!
 //! # References
 //!
-//! - RWKV paper: https://arxiv.org/abs/2305.13048
+//! - RWKV paper: <https://arxiv.org/abs/2305.13048>
 //! - RWKV v6 improvements: Enhanced stability and performance
 
 use crate::error::{ModelError, ModelResult};
 use crate::{AutoregressiveModel, ModelType};
 use kizzasi_core::{sigmoid, silu, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor};
 use scirs2_core::ndarray::{Array1, Array2};
-use scirs2_core::random::{rng, Rng};
+use scirs2_core::random::{rng, RngExt};
 #[allow(unused_imports)]
 use tracing::{debug, instrument, trace};
 
@@ -739,13 +765,266 @@ impl Rwkv {
         Ok(())
     }
 
-    /// Save weights to a SafeTensors model file (stub for future implementation)
+    /// Save model weights to a JSON file as `HashMap<String, Vec<f32>>`.
+    ///
+    /// Keys:
+    /// - `input_proj` / `output_proj`: top-level projections
+    /// - Per-layer time-mixing and channel-mixing parameters
+    pub fn save_weights_json<P: AsRef<std::path::Path>>(&self, path: P) -> ModelResult<()> {
+        let mut weights: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+
+        weights.insert(
+            "input_proj".to_string(),
+            self.input_proj.iter().copied().collect(),
+        );
+        weights.insert(
+            "output_proj".to_string(),
+            self.output_proj.iter().copied().collect(),
+        );
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+            let tm = format!("{}.time_mixing", prefix);
+            let cm = format!("{}.channel_mixing", prefix);
+
+            // Time-mixing parameters
+            weights.insert(
+                format!("{}.time_mix_k", tm),
+                layer.time_mixing.time_mix_k.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.time_mix_v", tm),
+                layer.time_mixing.time_mix_v.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.time_mix_r", tm),
+                layer.time_mixing.time_mix_r.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.time_mix_g", tm),
+                layer.time_mixing.time_mix_g.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.time_decay", tm),
+                layer.time_mixing.time_decay.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.key_proj", tm),
+                layer.time_mixing.key_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.value_proj", tm),
+                layer.time_mixing.value_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.receptance_proj", tm),
+                layer.time_mixing.receptance_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.gate_proj", tm),
+                layer.time_mixing.gate_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.output_proj", tm),
+                layer.time_mixing.output_proj.iter().copied().collect(),
+            );
+
+            // Channel-mixing parameters
+            weights.insert(
+                format!("{}.time_mix_k", cm),
+                layer.channel_mixing.time_mix_k.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.time_mix_r", cm),
+                layer.channel_mixing.time_mix_r.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.key_proj", cm),
+                layer.channel_mixing.key_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.value_proj", cm),
+                layer.channel_mixing.value_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.receptance_proj", cm),
+                layer
+                    .channel_mixing
+                    .receptance_proj
+                    .iter()
+                    .copied()
+                    .collect(),
+            );
+        }
+
+        let file = std::fs::File::create(path.as_ref()).map_err(|e| {
+            ModelError::load_error("rwkv save_weights", format!("failed to create file: {e}"))
+        })?;
+        serde_json::to_writer(file, &weights).map_err(|e| {
+            ModelError::load_error(
+                "rwkv save_weights",
+                format!("JSON serialization failed: {e}"),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Load weights from a JSON file previously written by `save_weights_json`.
+    pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
+        let file = std::fs::File::open(path.as_ref()).map_err(|e| {
+            ModelError::load_error("rwkv load_weights", format!("failed to open file: {e}"))
+        })?;
+        let weights: std::collections::HashMap<String, Vec<f32>> = serde_json::from_reader(file)
+            .map_err(|e| {
+                ModelError::load_error(
+                    "rwkv load_weights",
+                    format!("JSON deserialization failed: {e}"),
+                )
+            })?;
+
+        let load_array2 = |map: &std::collections::HashMap<String, Vec<f32>>,
+                           key: &str,
+                           rows: usize,
+                           cols: usize|
+         -> ModelResult<Option<Array2<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != rows * cols {
+                    return Err(ModelError::load_error(
+                        "rwkv load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {}×{}={} but got {}",
+                            key,
+                            rows,
+                            cols,
+                            rows * cols,
+                            data.len()
+                        ),
+                    ));
+                }
+                let arr = Array2::from_shape_vec((rows, cols), data.clone()).map_err(|e| {
+                    ModelError::load_error(
+                        "rwkv load_weights",
+                        format!("failed to reshape '{}': {e}", key),
+                    )
+                })?;
+                Ok(Some(arr))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let load_array1 = |map: &std::collections::HashMap<String, Vec<f32>>,
+                           key: &str,
+                           expected_len: usize|
+         -> ModelResult<Option<Array1<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != expected_len {
+                    return Err(ModelError::load_error(
+                        "rwkv load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {} but got {}",
+                            key,
+                            expected_len,
+                            data.len()
+                        ),
+                    ));
+                }
+                Ok(Some(Array1::from_vec(data.clone())))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let hidden = self.config.hidden_dim;
+        let intermediate = self.config.intermediate_dim;
+        let num_heads = self.config.num_heads;
+        let head_dim = self.config.head_dim;
+
+        if let Some(arr) = load_array2(&weights, "input_proj", self.config.input_dim, hidden)? {
+            self.input_proj = arr;
+        }
+        if let Some(arr) = load_array2(&weights, "output_proj", hidden, self.config.input_dim)? {
+            self.output_proj = arr;
+        }
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let prefix = format!("layers.{}", i);
+            let tm = format!("{}.time_mixing", prefix);
+            let cm = format!("{}.channel_mixing", prefix);
+
+            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_k", tm), hidden)? {
+                layer.time_mixing.time_mix_k = arr;
+            }
+            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_v", tm), hidden)? {
+                layer.time_mixing.time_mix_v = arr;
+            }
+            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_r", tm), hidden)? {
+                layer.time_mixing.time_mix_r = arr;
+            }
+            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_g", tm), hidden)? {
+                layer.time_mixing.time_mix_g = arr;
+            }
+            if let Some(arr) =
+                load_array2(&weights, &format!("{}.time_decay", tm), num_heads, head_dim)?
+            {
+                layer.time_mixing.time_decay = arr;
+            }
+            if let Some(arr) = load_array2(&weights, &format!("{}.key_proj", tm), hidden, hidden)? {
+                layer.time_mixing.key_proj = arr;
+            }
+            if let Some(arr) = load_array2(&weights, &format!("{}.value_proj", tm), hidden, hidden)?
+            {
+                layer.time_mixing.value_proj = arr;
+            }
+            if let Some(arr) =
+                load_array2(&weights, &format!("{}.receptance_proj", tm), hidden, hidden)?
+            {
+                layer.time_mixing.receptance_proj = arr;
+            }
+            if let Some(arr) = load_array2(&weights, &format!("{}.gate_proj", tm), hidden, hidden)?
+            {
+                layer.time_mixing.gate_proj = arr;
+            }
+            if let Some(arr) =
+                load_array2(&weights, &format!("{}.output_proj", tm), hidden, hidden)?
+            {
+                layer.time_mixing.output_proj = arr;
+            }
+
+            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_k", cm), hidden)? {
+                layer.channel_mixing.time_mix_k = arr;
+            }
+            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_r", cm), hidden)? {
+                layer.channel_mixing.time_mix_r = arr;
+            }
+            if let Some(arr) =
+                load_array2(&weights, &format!("{}.key_proj", cm), hidden, intermediate)?
+            {
+                layer.channel_mixing.key_proj = arr;
+            }
+            if let Some(arr) = load_array2(
+                &weights,
+                &format!("{}.value_proj", cm),
+                intermediate,
+                hidden,
+            )? {
+                layer.channel_mixing.value_proj = arr;
+            }
+            if let Some(arr) =
+                load_array2(&weights, &format!("{}.receptance_proj", cm), hidden, hidden)?
+            {
+                layer.channel_mixing.receptance_proj = arr;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Save weights to a SafeTensors model file (legacy stub — use `save_weights_json` instead).
     #[allow(unused_variables)]
     pub fn save_weights(&self, path: &str) -> ModelResult<()> {
-        // TODO: Implement SafeTensors saving
-        Err(ModelError::simple_load_error(
-            "RWKV save_weights not yet implemented".to_string(),
-        ))
+        self.save_weights_json(path)
     }
 }
 
@@ -845,6 +1124,14 @@ impl AutoregressiveModel for Rwkv {
 
         Ok(())
     }
+
+    fn load_weights_json(&mut self, path: &std::path::Path) -> ModelResult<()> {
+        Rwkv::load_weights_json(self, path)
+    }
+
+    fn save_weights_json(&self, path: &std::path::Path) -> ModelResult<()> {
+        Rwkv::save_weights_json(self, path)
+    }
 }
 
 #[cfg(test)]
@@ -884,5 +1171,59 @@ mod tests {
     fn test_invalid_config() {
         let config = RwkvConfig::new().hidden_dim(100).num_heads(3); // Not divisible
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_rwkv_save_load_roundtrip() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static RWKV_ROUNDTRIP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uid = RWKV_ROUNDTRIP_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let hidden = 64usize;
+        let config = RwkvConfig {
+            input_dim: 1,
+            hidden_dim: hidden,
+            intermediate_dim: hidden * 4,
+            num_layers: 2,
+            num_heads: 4,
+            head_dim: hidden / 4,
+            dropout: 0.0,
+            time_decay_init: -5.0,
+            use_rms_norm: true,
+        };
+
+        let model = Rwkv::new(config).expect("Failed to create RWKV model");
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("kizzasi_rwkv_roundtrip_test_{}.json", uid));
+
+        model
+            .save_weights_json(&tmp)
+            .expect("save_weights_json failed");
+
+        let config2 = RwkvConfig {
+            input_dim: 1,
+            hidden_dim: hidden,
+            intermediate_dim: hidden * 4,
+            num_layers: 2,
+            num_heads: 4,
+            head_dim: hidden / 4,
+            dropout: 0.0,
+            time_decay_init: -5.0,
+            use_rms_norm: true,
+        };
+        let mut model2 = Rwkv::new(config2).expect("Failed to create second RWKV model");
+        model2
+            .load_weights_json(&tmp)
+            .expect("load_weights_json failed");
+
+        // Verify the saved file is valid JSON with expected keys
+        let file = std::fs::File::open(&tmp).expect("temp file should exist");
+        let reloaded: std::collections::HashMap<String, Vec<f32>> =
+            serde_json::from_reader(file).expect("should deserialize");
+        // 2 top-level + (10 time_mixing + 5 channel_mixing) × 2 layers = 32 keys
+        assert_eq!(reloaded.len(), 32, "unexpected number of weight keys");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

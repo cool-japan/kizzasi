@@ -1,0 +1,23 @@
+[package]
+name = "kizzasi-embedded"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "no_std SSM inference for embedded/edge devices"
+keywords = ["embedded", "no-std", "ssm", "mamba", "signal"]
+categories = ["embedded", "no-std"]
+readme = "README.md"
+publish = false
+
+[features]
+default = ["std"]
+std = []
+fixed-point = []
+alloc = []
+
+[dependencies]
+libm = { version = "0.2", optional = true }
+
+[dev-dependencies]

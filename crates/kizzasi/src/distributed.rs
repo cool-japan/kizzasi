@@ -299,8 +299,8 @@ impl DistributedPredictor {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let nanos = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
                 Ok((nanos as usize) % self.workers.len())
             }
         }
@@ -436,6 +436,69 @@ pub struct WorkerStats {
     pub pending_requests: usize,
 }
 
+/// Convenience function for distributed prediction with default settings.
+///
+/// Creates a distributed predictor with the specified number of workers,
+/// processes all inputs in parallel, and returns the results.
+///
+/// # Arguments
+///
+/// * `model_config` - Configuration for the underlying model
+/// * `inputs` - Batch of input signals to predict
+/// * `num_workers` - Number of worker instances
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use kizzasi::distributed::distributed_predict;
+/// use kizzasi::KizzasiConfig;
+/// use scirs2_core::ndarray::array;
+///
+/// let config = KizzasiConfig::new().input_dim(3).output_dim(3).hidden_dim(64);
+/// let inputs = vec![array![0.1, 0.2, 0.3], array![0.4, 0.5, 0.6]];
+/// let outputs = distributed_predict(&config, &inputs, 4).await?;
+/// ```
+pub async fn distributed_predict(
+    model_config: &KizzasiConfig,
+    inputs: &[Array1<f32>],
+    num_workers: usize,
+) -> KizzasiResult<Vec<Array1<f32>>> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let predictor = DistributedPredictor::new(model_config.clone(), num_workers).await?;
+    predictor.predict_batch(inputs).await
+}
+
+/// Convenience function for distributed prediction with custom configuration.
+///
+/// Like [`distributed_predict`] but accepts a [`DistributedConfig`] for
+/// fine-grained control over load balancing, retry behavior, etc.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use kizzasi::distributed::{distributed_predict_with_config, DistributedConfig, LoadBalancingStrategy};
+/// use kizzasi::KizzasiConfig;
+/// use scirs2_core::ndarray::array;
+///
+/// let config = KizzasiConfig::new().input_dim(3).output_dim(3).hidden_dim(64);
+/// let dist_config = DistributedConfig::new(4).strategy(LoadBalancingStrategy::LeastLoaded);
+/// let inputs = vec![array![0.1, 0.2, 0.3]];
+/// let outputs = distributed_predict_with_config(&config, &inputs, dist_config).await?;
+/// ```
+pub async fn distributed_predict_with_config(
+    model_config: &KizzasiConfig,
+    inputs: &[Array1<f32>],
+    dist_config: DistributedConfig,
+) -> KizzasiResult<Vec<Array1<f32>>> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let predictor = DistributedPredictor::with_config(model_config.clone(), dist_config).await?;
+    predictor.predict_batch(inputs).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +630,51 @@ mod tests {
         for result in results {
             assert!(result.unwrap().is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn test_distributed_predict_convenience() {
+        let config = KizzasiConfig::new()
+            .input_dim(2)
+            .output_dim(2)
+            .hidden_dim(32);
+
+        let inputs = vec![array![0.1, 0.2], array![0.3, 0.4], array![0.5, 0.6]];
+
+        let outputs = distributed_predict(&config, &inputs, 2).await.unwrap();
+        assert_eq!(outputs.len(), 3);
+        for output in &outputs {
+            assert_eq!(output.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_distributed_predict_with_config() {
+        let config = KizzasiConfig::new()
+            .input_dim(2)
+            .output_dim(2)
+            .hidden_dim(32);
+
+        let dist_config = DistributedConfig::new(2).strategy(LoadBalancingStrategy::LeastLoaded);
+
+        let inputs = vec![array![0.1, 0.2]];
+
+        let outputs = distributed_predict_with_config(&config, &inputs, dist_config)
+            .await
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_distributed_predict_empty_batch() {
+        let config = KizzasiConfig::new()
+            .input_dim(2)
+            .output_dim(2)
+            .hidden_dim(32);
+
+        let inputs: Vec<Array1<f32>> = vec![];
+        let outputs = distributed_predict(&config, &inputs, 2).await.unwrap();
+        assert!(outputs.is_empty());
     }
 }

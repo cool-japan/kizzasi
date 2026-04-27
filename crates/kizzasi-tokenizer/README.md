@@ -47,4 +47,4 @@ let vqvae = VQVAETokenizer::new(512, 32, 64)?; // codebook_size, dim, embed_dim
 
 ## License
 
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+Licensed under the Apache License, Version 2.0.

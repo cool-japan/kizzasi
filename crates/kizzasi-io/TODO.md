@@ -209,11 +209,11 @@
   - Multiple modulation types (sinusoidal, linear/exponential chirp)
   - Dynamic ratio adjustment
 
-- [ ] Machine learning integration
-  - Neural network-based denoising
-  - Feature extraction for ML pipelines
-  - Autoencoder-based compression
-  - Anomaly detection in signals
+- [x] Machine learning integration
+  - Neural network-based denoising (SignalDenoiser)
+  - Feature extraction for ML pipelines (FeatureExtractor)
+  - Autoencoder-based compression (MiniAutoencoder)
+  - Anomaly detection in signals (AnomalyDetector)
   - Transfer learning support
 
 ## Testing and Documentation

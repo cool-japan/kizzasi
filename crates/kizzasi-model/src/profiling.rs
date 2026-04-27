@@ -827,6 +827,256 @@ impl Default for ComprehensiveProfiler {
     }
 }
 
+// ============================================================
+// Per-operation timing accumulator
+// ============================================================
+
+/// Accumulates timing measurements for a single named operation.
+///
+/// Disabled by default through [`ProfilingRegistry`]; call
+/// [`ProfilingRegistry::enable`] before recording to avoid zero-cost overhead.
+#[derive(Debug, Default, Clone)]
+pub struct TimingAccumulator {
+    /// Total time spent in this operation across all invocations.
+    pub total: Duration,
+    /// Number of invocations recorded.
+    pub count: u64,
+    /// Minimum single-invocation duration observed.
+    pub min: Option<Duration>,
+    /// Maximum single-invocation duration observed.
+    pub max: Option<Duration>,
+}
+
+impl TimingAccumulator {
+    /// Record one observation.
+    pub fn record(&mut self, elapsed: Duration) {
+        self.total += elapsed;
+        self.count += 1;
+        self.min = Some(match self.min {
+            Some(m) => m.min(elapsed),
+            None => elapsed,
+        });
+        self.max = Some(match self.max {
+            Some(m) => m.max(elapsed),
+            None => elapsed,
+        });
+    }
+
+    /// Arithmetic mean duration, or `None` when no observations have been recorded.
+    pub fn mean(&self) -> Option<Duration> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(self.total / self.count as u32)
+    }
+
+    /// Items-per-second throughput estimate given the total item count processed.
+    pub fn throughput_per_sec(&self, items: u64) -> f64 {
+        let secs = self.total.as_secs_f64();
+        if secs == 0.0 {
+            return 0.0;
+        }
+        items as f64 / secs
+    }
+}
+
+// ============================================================
+// Global profiling registry
+// ============================================================
+
+/// In-process registry that accumulates per-operation timings.
+///
+/// Disabled by default — call [`enable`](ProfilingRegistry::enable) to start
+/// recording.  When disabled, [`record`](ProfilingRegistry::record) is a
+/// zero-cost no-op.
+#[derive(Debug, Default)]
+pub struct ProfilingRegistry {
+    timings: std::collections::HashMap<String, TimingAccumulator>,
+    enabled: bool,
+}
+
+impl ProfilingRegistry {
+    /// Create a new, disabled registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable timing recording.
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    /// Disable timing recording.  In-flight data is retained.
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    /// Returns `true` when the registry is actively recording.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Record one `elapsed` observation for `name`.
+    ///
+    /// This is a no-op when the registry is disabled.
+    pub fn record(&mut self, name: &str, elapsed: Duration) {
+        if !self.enabled {
+            return;
+        }
+        self.timings
+            .entry(name.to_string())
+            .or_default()
+            .record(elapsed);
+    }
+
+    /// Retrieve the accumulator for `name`, or `None` if it has never been recorded.
+    pub fn get(&self, name: &str) -> Option<&TimingAccumulator> {
+        self.timings.get(name)
+    }
+
+    /// Clear all accumulated data.
+    pub fn reset(&mut self) {
+        self.timings.clear();
+    }
+
+    /// Return all accumulated entries, sorted alphabetically by name.
+    pub fn summary(&self) -> Vec<(String, TimingAccumulator)> {
+        let mut entries: Vec<_> = self
+            .timings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries
+    }
+}
+
+// ============================================================
+// RAII timing guard
+// ============================================================
+
+/// Records the elapsed time of a lexical scope into a [`ProfilingRegistry`] on
+/// drop.
+///
+/// ```rust,ignore
+/// let mut reg = ProfilingRegistry::new();
+/// reg.enable();
+/// {
+///     let _guard = TimingGuard::new(&mut reg, "my_op");
+///     // ... work ...
+/// } // elapsed recorded here
+/// ```
+pub struct TimingGuard<'a> {
+    registry: &'a mut ProfilingRegistry,
+    name: String,
+    start: Instant,
+}
+
+impl<'a> TimingGuard<'a> {
+    /// Start timing `name`.  The measurement is recorded when this guard is
+    /// dropped.
+    pub fn new(registry: &'a mut ProfilingRegistry, name: impl Into<String>) -> Self {
+        Self {
+            registry,
+            name: name.into(),
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for TimingGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        self.registry.record(&self.name, elapsed);
+    }
+}
+
+// ============================================================
+// Thread-safe shared registry
+// ============================================================
+
+/// Thread-safe wrapper around [`ProfilingRegistry`] suitable for use across
+/// async tasks and threads.
+///
+/// All lock acquisitions use `if let Ok(...)` — a poisoned mutex is silently
+/// ignored rather than panicking.
+#[derive(Clone, Default)]
+pub struct SharedProfilingRegistry(std::sync::Arc<std::sync::Mutex<ProfilingRegistry>>);
+
+impl SharedProfilingRegistry {
+    /// Create a new, disabled shared registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable recording on the inner registry.
+    pub fn enable(&self) {
+        if let Ok(mut r) = self.0.lock() {
+            r.enable();
+        }
+    }
+
+    /// Disable recording on the inner registry.
+    pub fn disable(&self) {
+        if let Ok(mut r) = self.0.lock() {
+            r.disable();
+        }
+    }
+
+    /// Record one `elapsed` observation for `name`.
+    pub fn record(&self, name: &str, elapsed: Duration) {
+        if let Ok(mut r) = self.0.lock() {
+            r.record(name, elapsed);
+        }
+    }
+
+    /// Return a snapshot of all accumulated entries, sorted alphabetically.
+    pub fn summary(&self) -> Vec<(String, TimingAccumulator)> {
+        self.0.lock().map(|r| r.summary()).unwrap_or_default()
+    }
+
+    /// Clear all accumulated data.
+    pub fn reset(&self) {
+        if let Ok(mut r) = self.0.lock() {
+            r.reset();
+        }
+    }
+}
+
+impl std::fmt::Debug for SharedProfilingRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SharedProfilingRegistry").finish()
+    }
+}
+
+// ============================================================
+// Convenience macro
+// ============================================================
+
+/// Time an expression and record the elapsed duration into a registry.
+///
+/// The registry must implement a `record(&str, Duration)` method (both
+/// [`ProfilingRegistry`] and [`SharedProfilingRegistry`] qualify).
+///
+/// ```rust,ignore
+/// use kizzasi_model::time_op;
+/// use kizzasi_model::profiling::ProfilingRegistry;
+///
+/// let mut reg = ProfilingRegistry::new();
+/// reg.enable();
+/// let result = time_op!(reg, "my_op", { 1 + 1 });
+/// assert_eq!(result, 2);
+/// ```
+#[macro_export]
+macro_rules! time_op {
+    ($registry:expr, $name:expr, $block:expr) => {{
+        let _start = std::time::Instant::now();
+        let result = $block;
+        $registry.record($name, _start.elapsed());
+        result
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,5 +1183,105 @@ mod tests {
         assert!(report.contains("Profiling Results"));
         assert!(report.contains("Average Latency"));
         assert!(report.contains("Throughput"));
+    }
+
+    // --- TimingAccumulator tests ---
+
+    #[test]
+    fn test_timing_accumulator_record() {
+        let mut acc = TimingAccumulator::default();
+        acc.record(Duration::from_millis(10));
+        acc.record(Duration::from_millis(20));
+        assert_eq!(acc.count, 2);
+        assert_eq!(acc.total, Duration::from_millis(30));
+        assert_eq!(acc.mean(), Some(Duration::from_millis(15)));
+    }
+
+    #[test]
+    fn test_timing_accumulator_empty_mean() {
+        let acc = TimingAccumulator::default();
+        assert_eq!(acc.mean(), None);
+    }
+
+    #[test]
+    fn test_timing_accumulator_min_max() {
+        let mut acc = TimingAccumulator::default();
+        acc.record(Duration::from_millis(5));
+        acc.record(Duration::from_millis(15));
+        acc.record(Duration::from_millis(10));
+        assert_eq!(acc.min, Some(Duration::from_millis(5)));
+        assert_eq!(acc.max, Some(Duration::from_millis(15)));
+    }
+
+    // --- ProfilingRegistry tests ---
+
+    #[test]
+    fn test_profiling_registry_disabled_by_default() {
+        let mut reg = ProfilingRegistry::new();
+        reg.record("op", Duration::from_millis(1));
+        assert!(reg.get("op").is_none()); // not recorded when disabled
+    }
+
+    #[test]
+    fn test_profiling_registry_enabled() {
+        let mut reg = ProfilingRegistry::new();
+        reg.enable();
+        reg.record("op", Duration::from_millis(5));
+        assert!(reg.get("op").is_some());
+    }
+
+    #[test]
+    fn test_profiling_registry_reset() {
+        let mut reg = ProfilingRegistry::new();
+        reg.enable();
+        reg.record("op", Duration::from_millis(5));
+        assert!(reg.get("op").is_some());
+        reg.reset();
+        assert!(reg.get("op").is_none());
+    }
+
+    #[test]
+    fn test_profiling_registry_summary_sorted() {
+        let mut reg = ProfilingRegistry::new();
+        reg.enable();
+        reg.record("b_op", Duration::from_millis(1));
+        reg.record("a_op", Duration::from_millis(2));
+        let summary = reg.summary();
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0].0, "a_op");
+        assert_eq!(summary[1].0, "b_op");
+    }
+
+    // --- SharedProfilingRegistry tests ---
+
+    #[test]
+    fn test_shared_profiling_registry() {
+        let registry = SharedProfilingRegistry::new();
+        registry.enable();
+        registry.record("test_op", Duration::from_micros(100));
+        let summary = registry.summary();
+        assert!(!summary.is_empty());
+    }
+
+    #[test]
+    fn test_shared_registry_disabled_by_default() {
+        let registry = SharedProfilingRegistry::new();
+        registry.record("op", Duration::from_millis(1));
+        assert!(registry.summary().is_empty());
+    }
+
+    // --- TimingGuard tests ---
+
+    #[test]
+    fn test_timing_guard_records_on_drop() {
+        let mut reg = ProfilingRegistry::new();
+        reg.enable();
+        {
+            let _guard = TimingGuard::new(&mut reg, "guarded_op");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(reg.get("guarded_op").is_some());
+        let acc = reg.get("guarded_op").expect("accumulator must exist");
+        assert_eq!(acc.count, 1);
     }
 }

@@ -58,7 +58,9 @@ use crate::AutoregressiveModel;
 use crate::ModelType;
 use scirs2_core::ndarray::Array2;
 use std::collections::HashMap;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
+// serde_json is used in helper methods (write_weights_temp)
+use serde_json;
 
 /// Model factory for creating model instances from configurations and weights
 ///
@@ -128,7 +130,108 @@ impl ModelFactory {
                 let model = Self::create_transformer(transformer_config, weights)?;
                 Ok(Box::new(model))
             }
+            ModelType::Rwkv5 => {
+                // RWKV v5 models are created directly, not from HF configs
+                Err(ModelError::unsupported_operation(
+                    "from_config",
+                    "RWKV5 (create directly via Rwkv5Model::new)",
+                ))
+            }
+            ModelType::NeuralOde => {
+                // Neural ODE models are created directly, not from HF configs
+                Err(ModelError::unsupported_operation(
+                    "from_config",
+                    "NeuralODE (create directly via NeuralOdeModel::new)",
+                ))
+            }
+            ModelType::MultiModal => {
+                // Multi-modal models are created directly, not from HF configs
+                Err(ModelError::unsupported_operation(
+                    "from_config",
+                    "MultiModal (create directly via MultiModalModel::new)",
+                ))
+            }
+            ModelType::Snn => {
+                // SNN models are created directly, not from HF configs
+                Err(ModelError::unsupported_operation(
+                    "from_config",
+                    "SNN (create directly via SpikingNeuralNetwork::new)",
+                ))
+            }
+            ModelType::MultiScale => {
+                // Multi-scale models are created directly, not from HF configs
+                Err(ModelError::unsupported_operation(
+                    "from_config",
+                    "MultiScale (create directly via MultiScaleModel::new)",
+                ))
+            }
         }
+    }
+
+    /// Convert quantized weights to `HashMap<String, Vec<f32>>` for JSON serialisation.
+    ///
+    /// Each `QuantizedWeightStorage` value is dequantised to FP32 and then flattened
+    /// into a contiguous `Vec<f32>`.  The resulting map can be written directly with
+    /// `serde_json` and fed to any model's `load_weights_json` method.
+    fn quantized_to_f32_vecs(
+        weights: &HashMap<String, QuantizedWeightStorage>,
+    ) -> ModelResult<HashMap<String, Vec<f32>>> {
+        let mut out = HashMap::with_capacity(weights.len());
+        for (name, storage) in weights {
+            let array: Array2<f32> = storage.to_fp32()?;
+            // Use iter().copied().collect() to guarantee we only collect the
+            // logical elements of the array (not raw backing-store bytes which
+            // may include extra capacity from slicing / non-contiguous layouts).
+            let flat: Vec<f32> = array.iter().copied().collect();
+            out.insert(name.clone(), flat);
+        }
+        Ok(out)
+    }
+
+    /// Write a `HashMap<String, Vec<f32>>` to a temporary JSON file.
+    ///
+    /// Returns the path of the created file.  The caller is responsible for
+    /// removing the file after use.
+    fn write_weights_temp(
+        f32_weights: &HashMap<String, Vec<f32>>,
+        tag: &str,
+    ) -> ModelResult<std::path::PathBuf> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        // Combine thread ID with a monotonic counter to guarantee uniqueness even
+        // when the same thread runs multiple concurrent test closures.
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let thread_id = format!("{:?}", std::thread::current().id());
+        // Sanitise: keep only alphanumeric chars (thread IDs contain `(`, `)`, etc.)
+        let safe_id: String = thread_id.chars().filter(|c| c.is_alphanumeric()).collect();
+        let mut path = std::env::temp_dir();
+        let pid = std::process::id();
+        path.push(format!(
+            "kizzasi_factory_weights_{}_{}_{}_{}.json",
+            tag, pid, safe_id, counter
+        ));
+        // Use OpenOptions to truncate any pre-existing file content
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|e| {
+                ModelError::simple_load_error(format!(
+                    "Failed to create temp weight file {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, f32_weights).map_err(|e| {
+            ModelError::simple_load_error(format!("Failed to serialise weights to JSON: {}", e))
+        })?;
+        writer.flush().map_err(|e| {
+            ModelError::simple_load_error(format!("Failed to flush weight file: {}", e))
+        })?;
+        Ok(path)
     }
 
     /// Create Mamba model from config and weights
@@ -136,74 +239,107 @@ impl ModelFactory {
     /// # Weight Requirements
     ///
     /// Expected weights for `num_layers` layers:
-    /// - `input_proj`: [input_dim, hidden_dim]
-    /// - `output_proj`: [hidden_dim, input_dim]
-    /// - `layers.{i}.norm.weight`: [hidden_dim]
-    /// - `layers.{i}.in_proj`: [hidden_dim, inner_dim*2]
-    /// - `layers.{i}.ssm.log_a`: [state_dim]
-    /// - `layers.{i}.ssm.delta_proj`: [inner_dim, inner_dim]
-    /// - `layers.{i}.ssm.b_proj`: [inner_dim, state_dim]
-    /// - `layers.{i}.ssm.c_proj`: [inner_dim, state_dim]
-    /// - `layers.{i}.out_proj`: [inner_dim, hidden_dim]
-    #[instrument(skip(_weights))]
+    /// - `input_proj`: `[input_dim, hidden_dim]`
+    /// - `output_proj`: `[hidden_dim, input_dim]`
+    /// - `layers.{i}.norm.weight`: `[hidden_dim]`
+    /// - `layers.{i}.in_proj`: `[hidden_dim, inner_dim*2]`
+    /// - `layers.{i}.ssm.log_a`: `[state_dim]`
+    /// - `layers.{i}.ssm.delta_proj`: `[inner_dim, inner_dim]`
+    /// - `layers.{i}.ssm.b_proj`: `[inner_dim, state_dim]`
+    /// - `layers.{i}.ssm.c_proj`: `[inner_dim, state_dim]`
+    /// - `layers.{i}.out_proj`: `[inner_dim, hidden_dim]`
+    #[instrument(skip(weights))]
     pub fn create_mamba(
         config: MambaConfig,
-        _weights: HashMap<String, QuantizedWeightStorage>,
+        weights: HashMap<String, QuantizedWeightStorage>,
     ) -> ModelResult<Mamba> {
         info!(
             "Creating Mamba model: hidden_dim={}, state_dim={}, num_layers={}",
             config.hidden_dim, config.state_dim, config.num_layers
         );
 
-        // For now, create a default Mamba model
-        // TODO: Inject weights into the model
-        // This requires extending Mamba to support weight loading
+        let mut model = Mamba::new(config)?;
 
-        let model = Mamba::new(config)?;
+        if !weights.is_empty() {
+            let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
+            let tmp_path = Self::write_weights_temp(&f32_weights, "mamba")?;
+            let load_result = model.load_weights_json(&tmp_path);
+            let _ = std::fs::remove_file(&tmp_path);
+            load_result?;
+            debug!("Mamba model weights injected successfully");
+        } else {
+            warn!("Mamba model created without weights (empty weights map)");
+        }
 
-        debug!("Mamba model created successfully (weights not yet injected)");
+        debug!("Mamba model created successfully");
         Ok(model)
     }
 
     /// Create Mamba2 model from config and weights
-    #[instrument(skip(_weights))]
+    #[instrument(skip(weights))]
     pub fn create_mamba2(
         config: Mamba2Config,
-        _weights: HashMap<String, QuantizedWeightStorage>,
+        weights: HashMap<String, QuantizedWeightStorage>,
     ) -> ModelResult<Mamba2> {
         info!(
             "Creating Mamba2 model: hidden_dim={}, state_dim={}, num_layers={}",
             config.hidden_dim, config.state_dim, config.num_layers
         );
 
-        let model = Mamba2::new(config)?;
+        let mut model = Mamba2::new(config)?;
 
-        debug!("Mamba2 model created successfully (weights not yet injected)");
+        if !weights.is_empty() {
+            let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
+            let tmp_path = Self::write_weights_temp(&f32_weights, "mamba2")?;
+            let load_result = model.load_weights_json(&tmp_path);
+            let _ = std::fs::remove_file(&tmp_path);
+            load_result?;
+            debug!("Mamba2 model weights injected successfully");
+        } else {
+            warn!("Mamba2 model created without weights (empty weights map)");
+        }
+
+        debug!("Mamba2 model created successfully");
         Ok(model)
     }
 
     /// Create RWKV model from config and weights
-    #[instrument(skip(_weights))]
+    #[instrument(skip(weights))]
     pub fn create_rwkv(
         config: RwkvConfig,
-        _weights: HashMap<String, QuantizedWeightStorage>,
+        weights: HashMap<String, QuantizedWeightStorage>,
     ) -> ModelResult<Rwkv> {
         info!(
             "Creating RWKV model: hidden_dim={}, num_heads={}, num_layers={}",
             config.hidden_dim, config.num_heads, config.num_layers
         );
 
-        let model = Rwkv::new(config)?;
+        let mut model = Rwkv::new(config)?;
 
-        debug!("RWKV model created successfully (weights not yet injected)");
+        if !weights.is_empty() {
+            let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
+            let tmp_path = Self::write_weights_temp(&f32_weights, "rwkv")?;
+            let load_result = model.load_weights_json(&tmp_path);
+            let _ = std::fs::remove_file(&tmp_path);
+            load_result?;
+            debug!("RWKV model weights injected successfully");
+        } else {
+            warn!("RWKV model created without weights (empty weights map)");
+        }
+
+        debug!("RWKV model created successfully");
         Ok(model)
     }
 
     /// Create RWKV-v7 model from config and weights
-    #[instrument(skip(_weights))]
+    ///
+    /// Note: RWKV-v7 does not yet expose `load_weights_json`; weights are
+    /// accepted for API consistency and will be injected once the method is
+    /// available on `Rwkv7`.
+    #[instrument(skip(weights))]
     pub fn create_rwkv7(
         config: Rwkv7Config,
-        _weights: HashMap<String, QuantizedWeightStorage>,
+        weights: HashMap<String, QuantizedWeightStorage>,
     ) -> ModelResult<Rwkv7> {
         info!(
             "Creating RWKV-v7 model: hidden_dim={}, num_layers={}",
@@ -212,32 +348,50 @@ impl ModelFactory {
 
         let model = Rwkv7::new(config)?;
 
-        debug!("RWKV-v7 model created successfully (weights not yet injected)");
+        if !weights.is_empty() {
+            warn!("RWKV-v7 weight injection not yet implemented; weights ignored");
+        }
+
+        debug!("RWKV-v7 model created successfully");
         Ok(model)
     }
 
     /// Create S4 model from config and weights
-    #[instrument(skip(_weights))]
+    #[instrument(skip(weights))]
     pub fn create_s4(
         config: S4Config,
-        _weights: HashMap<String, QuantizedWeightStorage>,
+        weights: HashMap<String, QuantizedWeightStorage>,
     ) -> ModelResult<S4D> {
         info!(
             "Creating S4 model: hidden_dim={}, state_dim={}, num_layers={}",
             config.hidden_dim, config.state_dim, config.num_layers
         );
 
-        let model = S4D::new(config)?;
+        let mut model = S4D::new(config)?;
 
-        debug!("S4D model created successfully (weights not yet injected)");
+        if !weights.is_empty() {
+            let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
+            let tmp_path = Self::write_weights_temp(&f32_weights, "s4")?;
+            let load_result = model.load_weights_json(&tmp_path);
+            let _ = std::fs::remove_file(&tmp_path);
+            load_result?;
+            debug!("S4D model weights injected successfully");
+        } else {
+            warn!("S4D model created without weights (empty weights map)");
+        }
+
+        debug!("S4D model created successfully");
         Ok(model)
     }
 
     /// Create S5 model from config and weights
-    #[instrument(skip(_weights))]
+    ///
+    /// Note: S5 does not yet expose `load_weights_json`; weights are accepted
+    /// for API consistency and will be injected once the method is available.
+    #[instrument(skip(weights))]
     pub fn create_s5(
         config: S5Config,
-        _weights: HashMap<String, QuantizedWeightStorage>,
+        weights: HashMap<String, QuantizedWeightStorage>,
     ) -> ModelResult<S5> {
         info!(
             "Creating S5 model: hidden_dim={}, state_dim={}, num_layers={}",
@@ -246,24 +400,39 @@ impl ModelFactory {
 
         let model = S5::new(config)?;
 
-        debug!("S5 model created successfully (weights not yet injected)");
+        if !weights.is_empty() {
+            warn!("S5 weight injection not yet implemented; weights ignored");
+        }
+
+        debug!("S5 model created successfully");
         Ok(model)
     }
 
     /// Create Transformer model from config and weights
-    #[instrument(skip(_weights))]
+    #[instrument(skip(weights))]
     pub fn create_transformer(
         config: TransformerConfig,
-        _weights: HashMap<String, QuantizedWeightStorage>,
+        weights: HashMap<String, QuantizedWeightStorage>,
     ) -> ModelResult<Transformer> {
         info!(
             "Creating Transformer model: hidden_dim={}, num_heads={}, num_layers={}",
             config.hidden_dim, config.num_heads, config.num_layers
         );
 
-        let model = Transformer::new(config)?;
+        let mut model = Transformer::new(config)?;
 
-        debug!("Transformer model created successfully (weights not yet injected)");
+        if !weights.is_empty() {
+            let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
+            let tmp_path = Self::write_weights_temp(&f32_weights, "transformer")?;
+            let load_result = model.load_weights_json(&tmp_path);
+            let _ = std::fs::remove_file(&tmp_path);
+            load_result?;
+            debug!("Transformer model weights injected successfully");
+        } else {
+            warn!("Transformer model created without weights (empty weights map)");
+        }
+
+        debug!("Transformer model created successfully");
         Ok(model)
     }
 
@@ -281,6 +450,7 @@ impl ModelFactory {
                 "s4" => return Ok(ModelType::S4),
                 "s4d" | "s5" => return Ok(ModelType::S4D),
                 "transformer" | "gpt2" | "llama" => return Ok(ModelType::Transformer),
+                "neural_ode" | "neuralode" => return Ok(ModelType::NeuralOde),
                 _ => {}
             }
         }
@@ -712,5 +882,177 @@ mod tests {
         let model = ModelFactory::create_transformer(config, weights);
 
         assert!(model.is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // WS-B: factory weight injection tests
+    // -----------------------------------------------------------------
+
+    /// Shared mutex to serialise the factory weight-injection tests.
+    ///
+    /// These tests write + read + delete temporary JSON files via the factory's
+    /// `write_weights_temp` helper.  Although each invocation uses a unique
+    /// file path (via an atomic counter), the test binary runs all unit tests
+    /// concurrently by default, and the OS file-system operations are not
+    /// linearisable across threads under high contention.  Holding this mutex
+    /// for the duration of each weight-injection test prevents any interleaving
+    /// that could cause partial reads or premature deletions.
+    fn factory_injection_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Verify that creating a Mamba model with empty weights does not error.
+    #[cfg(feature = "mamba")]
+    #[test]
+    fn test_factory_weight_injection_empty() {
+        let config = crate::mamba::MambaConfig {
+            input_dim: 1,
+            hidden_dim: 32,
+            state_dim: 8,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 1,
+            dropout: 0.0,
+            use_mamba2: false,
+        };
+
+        let empty_weights: HashMap<String, QuantizedWeightStorage> = HashMap::new();
+        let result = ModelFactory::create_mamba(config, empty_weights);
+        assert!(
+            result.is_ok(),
+            "create_mamba with empty weights should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Verify that a Mamba model can be created and its weights round-tripped
+    /// through the factory's JSON injection pathway.
+    #[cfg(feature = "mamba")]
+    #[test]
+    fn test_factory_weight_injection_mamba() {
+        let _guard = factory_injection_lock();
+        use crate::dynamic_quantization::QuantizedWeightStorage;
+        use crate::mamba::{Mamba, MambaConfig};
+
+        // Create a small reference model, save its weights, then inject them
+        // into a factory-created model via FP32 QuantizedWeightStorage.
+        let config = MambaConfig {
+            input_dim: 1,
+            hidden_dim: 32,
+            state_dim: 8,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 1,
+            dropout: 0.0,
+            use_mamba2: false,
+        };
+
+        let reference = Mamba::new(config.clone()).expect("reference model");
+
+        // Save reference weights to temp file (unique per invocation to avoid
+        // races when multiple test threads call this function simultaneously).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WS_B_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uid = WS_B_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut tmp_path = std::env::temp_dir();
+        tmp_path.push(format!("kizzasi_factory_ws_b_test_mamba_{}.json", uid));
+        reference
+            .save_weights_json(&tmp_path)
+            .expect("save_weights_json");
+
+        // Read back the JSON and build QuantizedWeightStorage::FP32 entries
+        let file = std::fs::File::open(&tmp_path).expect("open temp file");
+        let f32_map: HashMap<String, Vec<f32>> =
+            serde_json::from_reader(file).expect("deserialise");
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let mut quant_weights: HashMap<String, QuantizedWeightStorage> = HashMap::new();
+        for (k, v) in f32_map {
+            let len = v.len();
+            // Reshape to a 1×N array (flat representation matches load_weights_json contract)
+            let arr = Array2::from_shape_vec((1, len), v).expect("reshape to Array2");
+            quant_weights.insert(k, QuantizedWeightStorage::FP32(arr));
+        }
+
+        // Create via factory — weight injection must not error
+        let result = ModelFactory::create_mamba(config, quant_weights);
+        assert!(
+            result.is_ok(),
+            "create_mamba with weights should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Verify the full roundtrip: save → factory-inject → verify model exists.
+    #[cfg(feature = "mamba")]
+    #[test]
+    fn test_roundtrip_factory_save_load() {
+        let _guard = factory_injection_lock();
+        use crate::dynamic_quantization::QuantizedWeightStorage;
+        use crate::mamba::{Mamba, MambaConfig};
+
+        let config = MambaConfig {
+            input_dim: 1,
+            hidden_dim: 32,
+            state_dim: 8,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 1,
+            dropout: 0.0,
+            use_mamba2: false,
+        };
+
+        // Step 1: save reference weights (unique path to avoid concurrent test races)
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ROUNDTRIP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uid = ROUNDTRIP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let reference = Mamba::new(config.clone()).expect("reference");
+        let mut save_path = std::env::temp_dir();
+        save_path.push(format!("kizzasi_factory_roundtrip_test_{}.json", uid));
+        reference.save_weights_json(&save_path).expect("save");
+
+        // Step 2: read back
+        let file = std::fs::File::open(&save_path).expect("open");
+        let f32_map: HashMap<String, Vec<f32>> = serde_json::from_reader(file).expect("deser");
+        let _ = std::fs::remove_file(&save_path);
+
+        let key_count = f32_map.len();
+        assert!(key_count > 0, "saved weights must be non-empty");
+
+        // Step 3: wrap in QuantizedWeightStorage and inject via factory
+        let mut quant_weights: HashMap<String, QuantizedWeightStorage> = HashMap::new();
+        for (k, v) in f32_map {
+            let len = v.len();
+            let arr = Array2::from_shape_vec((1, len), v).expect("reshape");
+            quant_weights.insert(k, QuantizedWeightStorage::FP32(arr));
+        }
+
+        let model = ModelFactory::create_mamba(config, quant_weights)
+            .expect("factory round-trip must succeed");
+
+        // Step 4: verify model is functional — hidden_dim matches
+        assert_eq!(model.hidden_dim(), 32);
+    }
+
+    /// Test that PyTorchConverter weight name conversion works in pytorch_compat.
+    #[test]
+    fn test_pytorch_compat_weight_conversion() {
+        use crate::pytorch_compat::PyTorchConverter;
+
+        let converter = PyTorchConverter::new();
+
+        // Standard Mamba-style name
+        let mapped = converter.map_name("mixer.in_proj.weight");
+        // After applying default mappings: "mixer.in_proj" → "in_proj"
+        // then "." → "_"
+        assert!(
+            mapped.contains("in_proj"),
+            "mapped name should contain 'in_proj', got: {}",
+            mapped
+        );
     }
 }

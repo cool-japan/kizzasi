@@ -227,7 +227,7 @@ impl HuffmanEncoder {
     ///
     /// # Returns
     ///
-    /// Compressed bitstream as a Vec<u8>, with length information prepended
+    /// Compressed bitstream as a `Vec<u8>`, with length information prepended
     pub fn encode(&self, symbols: &[u32]) -> TokenizerResult<Vec<u8>> {
         let mut bits = Vec::new();
 

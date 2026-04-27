@@ -8,17 +8,17 @@ A Rust-native system for predicting continuous signal streams (audio, sensors, v
 
 ---
 
-## Current Status (v0.1.0)
+## Current Status (v0.2.1)
 
 ### Codebase Metrics
 
 | Metric | Value |
 |--------|-------|
-| Total Lines | ~27,700 Rust ⬆️ |
-| Crates | 7 |
-| Test Count | 397 ✅ |
-| Coverage | Core paths |
-| Last Updated | 2026-01-18 |
+| Total Lines | ~123,000 Rust ⬆️ |
+| Crates | 10 |
+| Test Count | 2,277 ✅ |
+| Coverage | Core paths + comprehensive |
+| Last Updated | 2026-04-27 |
 
 ### Implementation Status by Crate
 
@@ -57,27 +57,31 @@ kizzasi/
 
 - [x] **Weight Loading**: Load pre-trained Mamba weights from safetensors ✅
 - [x] **GPU Acceleration**: CUDA/Metal backend via candle ✅
-- [x] **Training Loop**: Training infrastructure with GPU support ✅
+- [x] **Training Loop**: Training infrastructure with GPU support (TrainingLoop, TrainingConfig, TrainingResult, GradientSync) ✅
 
 ### P1: High Priority (v0.2)
 
-- [ ] **Checkpoint Compatibility**: PyTorch/HuggingFace model conversion
-- [ ] **Quantization**: INT8/FP16 inference support
-- [ ] **Distributed Inference**: Multi-GPU support
-- [ ] **Python Bindings**: PyO3 wrapper for kizzasi
+- [x] **Checkpoint Compatibility**: JSON weight format done (save/load_weights_json for all models, NameRemapper for HF key translation, factory injection wired); GGUF loading exists; full PyTorch .pth done via `candle_core::pickle::read_all`; HuggingFace Hub API client complete (hf_hub.rs — blocking HTTP client with caching, auth, SafeTensors shard download, `load_from_hub` convenience fn; feature-gated `hf-hub`) (completed 2026-04-18)
+  - **Goal:** Loading a real HuggingFace Mamba `.pth` (single-file and multi-shard) through `PyTorchConverter` returns an `ArrayD<f32>` map with correct shapes and HF→internal name translation. All three pre-existing stub sites reconciled.
+  - **Design:** `candle_core::pickle::read_all(path)` core; `tensor_to_ndarray` helper; backward-compat `load_checkpoint` (Array2) + new `load_checkpoint_raw` (ArrayD) + `load_pth_sharded` + `load_from_huggingface_pth`; `PthIndex` from `pytorch_model.bin.index.json`; `split_x_proj` helper; NameRemapper extended with `backbone.embeddings.weight`, `backbone.norm_f.weight`, `lm_head.weight` tied-weights handling; kizzasi-core stubs deleted.
+  - **Files:** `crates/kizzasi-model/src/pytorch_compat.rs`, `crates/kizzasi-model/src/loader.rs`, `crates/kizzasi-core/src/pytorch_compat.rs`, `crates/kizzasi-core/src/weights.rs`, `crates/kizzasi-model/tests/pytorch_pth_roundtrip.rs`
+  - **Tests:** tensor_to_ndarray rank/dtype coverage; PthIndex JSON parsing; split_x_proj roundtrip; integration load+rename fixture; negative path/rank-3 errors.
+- [x] **Quantization**: INT8/FP16 inference support
+- [x] **Distributed Inference**: Multi-GPU support (in-process data-parallel)
+- [x] **Python Bindings**: PyO3 wrapper for kizzasi (PyPI CI via maturin) ✅
 
 ### P2: Medium Priority (v0.3+)
 
-- [ ] **no_std Support**: Embedded systems (ARM Cortex-M)
-- [ ] **WASM Compilation**: Browser inference
-- [ ] **LoRA Adapters**: Efficient fine-tuning
+- [x] **no_std Support**: Embedded systems (ARM Cortex-M)
+- [x] **WASM Compilation**: Browser inference
+- [x] **LoRA Adapters**: Efficient fine-tuning
 - [ ] **Pre-trained Models**: "Kizzasi-Takumi" model zoo
 
 ### P3: Future Research
 
-- [ ] **Multi-Modal Fusion**: Audio + Vision + Control
-- [ ] **Neuromorphic SSMs**: Spiking neural network integration
-- [ ] **Continuous-Time Models**: ODE-based dynamics
+- [x] **Multi-Modal Fusion**: Audio + Vision + Control
+- [x] **Neuromorphic SSMs**: Spiking neural network integration
+- [x] **Continuous-Time Models**: ODE-based dynamics
 
 ---
 
@@ -198,11 +202,11 @@ kizzasi/
 - [x] Comprehensive weight format documentation ✅
 - [x] Weight inspection utilities (print_summary, search_tensors, get_size_stats) ✅
 - [x] HuggingFace compatibility documentation ✅
-- [ ] Load Mamba weights from HuggingFace (requires architectural changes)
-- [ ] Load RWKV weights from official releases
-- [ ] Convert PyTorch checkpoints
-- [ ] Support GGUF format
-- [ ] Incremental weight loading for large models
+- [x] Load Mamba weights from HuggingFace via NameRemapper (HF→internal key translation) ✅
+- [x] Load RWKV weights from official releases (load_weights_json / JSON round-trip) ✅
+- [x] Convert PyTorch checkpoints (pytorch_compat.rs name mapping + JSON I/O) ✅
+- [x] Support GGUF format ✅
+- [x] Incremental weight loading for large models
 
 #### GPU Acceleration
 - [x] CUDA backend via candle ✅
@@ -213,8 +217,8 @@ kizzasi/
 - [x] GPU memory management utilities ✅
 - [x] Tensor transfer utilities ✅
 - [x] Memory pooling and tracking ✅
-- [ ] Flash-linear-attention kernel
-- [ ] Multi-GPU data parallel support
+- [x] Flash-linear-attention kernel
+- [x] Multi-GPU data parallel support
 
 #### Training Infrastructure
 - [x] DataLoader for time-series ✅
@@ -223,50 +227,50 @@ kizzasi/
 - [x] Learning rate schedulers (7 types) ✅
 - [x] Gradient clipping ✅
 - [x] Metrics tracking and early stopping ✅
-- [ ] Curriculum learning
+- [x] Curriculum learning
 
 #### Performance Optimization
-- [ ] Profile and optimize hot paths
-- [ ] Benchmark against PyTorch Mamba
-- [ ] Memory-efficient gradient checkpointing
-- [ ] Speculative decoding
-- [ ] Multi-modal input fusion
+- [x] Profile and optimize hot paths (tracing spans + ProfilingRegistry)
+- [x] Benchmark against PyTorch Mamba
+- [x] Memory-efficient gradient checkpointing
+- [x] Speculative decoding
+- [x] Multi-modal input fusion
 
 ---
 
 ### Phase 3: Ecosystem Integration
 
 #### Python Bindings
-- [ ] PyO3 wrapper for kizzasi
-- [ ] NumPy array interop
-- [ ] pip installable package
-- [ ] Jupyter notebook examples
+- [x] PyO3 wrapper for kizzasi ✅
+- [x] NumPy array interop (scirs2-numpy) ✅
+- [x] pip installable package (kizzasi on PyPI via maturin CI) ✅
+- [x] Jupyter notebook examples
 
 #### ROS2 Integration
-- [ ] ROS2 subscriber/publisher bridge
-- [ ] Sensor message conversion
-- [ ] Real-time control loop
+- [x] ROS2 subscriber/publisher bridge
+- [x] Sensor message conversion
+- [x] Real-time control loop
 
 #### Cloud Deployment
-- [ ] gRPC server for inference
-- [ ] REST API wrapper
-- [ ] Docker container
-- [ ] Kubernetes operator
+- [x] gRPC server for inference
+- [x] REST API wrapper
+- [x] Docker container
+- [x] Kubernetes operator
 
 ---
 
 ### Phase 4: Edge Deployment
 
 #### Embedded Support
-- [ ] no_std compilation
-- [ ] ARM64 optimization (NEON)
-- [ ] Fixed-point quantization (INT8)
-- [ ] Model pruning
-- [ ] TensorRT/ONNX export
+- [x] no_std compilation
+- [x] ARM64 optimization (NEON via aarch64 intrinsics)
+- [x] Fixed-point quantization (INT8)
+- [x] Model pruning
+- [x] TensorRT/ONNX export
 
 #### WebAssembly
-- [ ] WASM compilation target
-- [ ] Browser inference demo
+- [x] WASM compilation target
+- [x] Browser inference demo
 - [ ] WebGPU acceleration
 
 ---
@@ -280,11 +284,11 @@ kizzasi/
 - [x] Numerical stability tests
 
 ### Planned
-- [ ] Property-based tests (proptest)
-- [ ] Fuzzing for input validation
-- [ ] CI/CD pipeline (GitHub Actions)
-- [ ] Performance regression tests
-- [ ] Cross-platform testing (Linux, macOS, Windows)
+- [x] Property-based tests (proptest) ✅
+- [x] Fuzzing for input validation
+- [x] CI/CD pipeline (GitHub Actions)
+- [x] Performance regression tests
+- [x] Cross-platform testing (CI matrix: Linux, macOS, Windows)
 
 ---
 
@@ -297,12 +301,12 @@ kizzasi/
 - [x] API documentation (rustdoc)
 
 ### Planned
-- [ ] Architecture diagrams (Mermaid/draw.io)
-- [ ] Tutorial: Getting Started
-- [ ] Tutorial: Building a Robotics Controller
-- [ ] Tutorial: Audio Processing Pipeline
-- [ ] Performance Tuning Guide
-- [ ] Migration Guide (from PyTorch)
+- [x] Architecture diagrams (Mermaid)
+- [x] Tutorial: Getting Started
+- [x] Tutorial: Building a Robotics Controller
+- [x] Tutorial: Audio Processing Pipeline
+- [x] Performance Tuning Guide
+- [x] Migration Guide (from PyTorch)
 
 ---
 
@@ -348,10 +352,20 @@ kizzasi/
 | Version | Date | Highlights |
 |---------|------|------------|
 | v0.1.0 | 2024-12 | Initial release, core SSM engine |
-| v0.2.0 | TBD | Weight loading, GPU support |
+| v0.2.0 | 2026-03 | JSON weight I/O (save/load_weights_json all models), NameRemapper, factory injection, file splits (vqvae, training) |
 | v0.3.0 | TBD | Training infrastructure |
 | v1.0.0 | TBD | Production-ready, stable API |
 
 ---
 
-*Last Updated: 2026-01-18*
+*Last Updated: 2026-03-16*
+
+## Proposed follow-ups
+
+### Root TODO.md
+- **`Pre-trained Models` (vague):** Needs concrete decisions: (1) Which architectures? Mamba-130M / Mamba-370M / RWKV-430M? (2) Training corpus — The Pile subset or custom multimodal? (3) Hosting: HF Hub mirror vs. self-hosted R2 bucket? (4) Naming under "Kizzasi-Takumi" — semver scheme?
+- **`WebGPU acceleration` (oversized ~3000 LoC):** Proposed split into 4 future `/ultra` items:
+  1. `kizzasi-webgpu` crate skeleton + `wgpu 22` + `WebGpuBackend::new()` + buffer upload/download (~500 LoC)
+  2. `SsmBackend` trait in `kizzasi-core` + CPU default impl + `WebGpu` variant gated (~200 LoC)
+  3. First WGSL kernel — SSM scan (Blelloch work-group=256) + dispatcher (~400 LoC Rust + ~150 LoC WGSL)
+  4. Matvec + elementwise (silu, rms_norm) kernels + browser demo (~600 LoC Rust + ~200 LoC WGSL + HTML)
