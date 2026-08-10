@@ -77,6 +77,7 @@ use crate::{AutoregressiveModel, ModelType};
 use kizzasi_core::{
     gelu, CausalConv1d, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor,
 };
+use safetensors::tensor::{Dtype, TensorView};
 use scirs2_core::ndarray::{Array1, Array2};
 use scirs2_core::random::{rng, RngExt};
 #[allow(unused_imports)]
@@ -701,10 +702,82 @@ impl S4D {
         Ok(())
     }
 
-    /// Save weights to a SafeTensors model file (legacy stub — use `save_weights_json` instead).
-    #[allow(unused_variables)]
+    /// Save weights to a SafeTensors model file.
+    ///
+    /// Serializes all model parameters (input projection, output projection, and per-layer
+    /// S4D kernel matrices) into the SafeTensors binary format at the given path.
     pub fn save_weights(&self, path: &str) -> ModelResult<()> {
-        self.save_weights_json(path)
+        // Collect (name, shape, raw-f32-bytes) so byte vecs stay alive long enough
+        // to be borrowed by TensorView below.
+        let mut entries: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+
+        // Helper: push a 2-D tensor entry.
+        fn push_arr2(
+            entries: &mut Vec<(String, Vec<usize>, Vec<u8>)>,
+            name: String,
+            arr: &Array2<f32>,
+        ) {
+            let bytes: Vec<u8> = arr.iter().flat_map(|v| v.to_le_bytes()).collect();
+            entries.push((name, vec![arr.nrows(), arr.ncols()], bytes));
+        }
+
+        // Helper: push a 1-D tensor entry.
+        fn push_arr1(
+            entries: &mut Vec<(String, Vec<usize>, Vec<u8>)>,
+            name: String,
+            arr: &Array1<f32>,
+        ) {
+            let bytes: Vec<u8> = arr.iter().flat_map(|v| v.to_le_bytes()).collect();
+            entries.push((name, vec![arr.len()], bytes));
+        }
+
+        push_arr2(&mut entries, "input_proj".to_owned(), &self.input_proj);
+        push_arr2(&mut entries, "output_proj".to_owned(), &self.output_proj);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{i}");
+            let kp = format!("{prefix}.s4_kernel");
+            push_arr2(
+                &mut entries,
+                format!("{prefix}.output_proj"),
+                &layer.output_proj,
+            );
+            push_arr1(&mut entries, format!("{kp}.log_a"), &layer.s4_kernel.log_a);
+            push_arr2(
+                &mut entries,
+                format!("{kp}.b_matrix"),
+                &layer.s4_kernel.b_matrix,
+            );
+            push_arr2(
+                &mut entries,
+                format!("{kp}.c_matrix"),
+                &layer.s4_kernel.c_matrix,
+            );
+            push_arr1(
+                &mut entries,
+                format!("{kp}.d_skip"),
+                &layer.s4_kernel.d_skip,
+            );
+            push_arr1(
+                &mut entries,
+                format!("{kp}.log_dt"),
+                &layer.s4_kernel.log_dt,
+            );
+        }
+
+        // Build TensorView slice — borrows from `entries` which lives until end of fn.
+        let tensor_views: Vec<(String, TensorView<'_>)> = entries
+            .iter()
+            .map(|(name, shape, bytes)| {
+                let view = TensorView::new(Dtype::F32, shape.clone(), bytes).map_err(|e| {
+                    ModelError::load_error("s4d save_weights", format!("TensorView failed: {e}"))
+                })?;
+                Ok((name.clone(), view))
+            })
+            .collect::<ModelResult<Vec<_>>>()?;
+
+        safetensors::tensor::serialize_to_file(tensor_views, None, std::path::Path::new(path))
+            .map_err(|e| ModelError::load_error("s4d save_weights", format!("write failed: {e}")))
     }
 }
 
@@ -862,5 +935,25 @@ mod tests {
         assert_eq!(reloaded.len(), 14, "unexpected number of weight keys");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_save_weights_roundtrip_safetensors() {
+        let config = S4Config {
+            input_dim: 4,
+            hidden_dim: 8,
+            state_dim: 4,
+            num_layers: 1,
+            ..Default::default()
+        };
+        let model = S4D::new(config).expect("model creation failed");
+        let tmp = std::env::temp_dir().join("test_s4d_save_weights.safetensors");
+        model
+            .save_weights(tmp.to_str().expect("path to str"))
+            .expect("save_weights failed");
+        let data = std::fs::read(&tmp).expect("read file");
+        let tensors = safetensors::SafeTensors::deserialize(&data).expect("deserialize");
+        assert!(!tensors.names().is_empty(), "no tensors written");
+        std::fs::remove_file(&tmp).ok();
     }
 }

@@ -46,7 +46,7 @@ fn test_memory_stream_to_ring_buffer() {
 
     // Read from stream and push to ring buffer
     while stream.is_active() {
-        let buf = stream.read().unwrap();
+        let buf = stream.read().expect("MemoryStream::read should succeed");
         ring_buffer.push_slice(buf.as_slice().unwrap());
     }
 

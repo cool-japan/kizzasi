@@ -231,7 +231,10 @@ impl STLFormula {
                 let mut max_rob = f32::NEG_INFINITY;
                 for i in start..end {
                     let rob2 = phi2.robustness(trace, i as f32);
-                    let min_rob1 = (start..i)
+                    // Standard quantitative STL until semantics (Donzé & Maler 2010):
+                    // phi1 must hold over the entire prefix [t, t'], not just [t+a, t']
+                    let prefix_start = time as usize;
+                    let min_rob1 = (prefix_start..i)
                         .map(|j| phi1.robustness(trace, j as f32))
                         .fold(f32::INFINITY, f32::min);
                     max_rob = max_rob.max(rob2.min(min_rob1));
@@ -518,5 +521,105 @@ mod tests {
 
         let robustness = enforcer.stl_robustness();
         assert_eq!(robustness.len(), 1);
+    }
+
+    #[test]
+    fn test_stl_until_basic_satisfied() {
+        // phi1: x[0] >= 0 (robustness = x[0], non-negative for x >= 0)
+        // phi2: x[0] >= 2 (robustness = x[0] - 2.0, positive once x >= 2)
+        // trace: 1, 2, 3, 4, 5 — phi1 holds (all positive), phi2 becomes true at t=1 (x=2)
+        // Using strictly positive values so that min over prefix is > 0
+        let trace: Vec<Array1<f32>> = (1..=5).map(|i| Array1::from_vec(vec![i as f32])).collect();
+
+        let phi1 = STLFormula::Predicate(|x| x[0] - 0.5); // positive for all values >= 0.5
+        let phi2 = STLFormula::Predicate(|x| x[0] - 2.0);
+        let until = STLFormula::Until {
+            phi1: Box::new(phi1),
+            phi2: Box::new(phi2),
+            bound: TemporalBound::new(0.0, 5.0),
+        };
+        // At i=1 (x=2): rob2=0.0, prefix [0..1): phi1(1)=0.5 → min=0.5 → combined=0.0
+        // At i=2 (x=3): rob2=1.0, prefix [0..2): phi1(1)=0.5,phi1(2)=1.5 → min=0.5 → combined=0.5
+        // max_rob = 0.5 > 0
+        let rob = until.robustness(&trace, 0.0);
+        assert!(
+            rob > 0.0,
+            "Until should be satisfied with positive margin, robustness={}",
+            rob
+        );
+        assert!(until.is_satisfied(&trace, 0.0), "Until should be satisfied");
+    }
+
+    #[test]
+    fn test_stl_until_prefix_violation_detected() {
+        // phi1 FAILS at t=0 (the prefix), phi2 holds at t=2.
+        // With bound.lower=1: the buggy code would miss the t=0 failure.
+        // With the fix (start from t=0), robustness is reduced/negative.
+        //
+        // trace: t=0: -1.0 (phi1 fails: x < 0), t=1: 1.0 (phi1 holds), t=2..4: 5.0 (phi2 holds)
+        let trace: Vec<Array1<f32>> = vec![
+            Array1::from_vec(vec![-1.0_f32]), // t=0: phi1 fails (x - 0 = -1 < 0)
+            Array1::from_vec(vec![1.0_f32]),  // t=1: phi1 holds
+            Array1::from_vec(vec![5.0_f32]),  // t=2: phi2 holds (x - 5 = 0)
+            Array1::from_vec(vec![5.0_f32]),  // t=3
+            Array1::from_vec(vec![5.0_f32]),  // t=4
+        ];
+        let phi1 = STLFormula::Predicate(|x| x[0]);
+        let phi2 = STLFormula::Predicate(|x| x[0] - 5.0);
+        // bound.lower=1: window starts at t=1, but phi1 must hold from t=0
+        let until = STLFormula::Until {
+            phi1: Box::new(phi1),
+            phi2: Box::new(phi2),
+            bound: TemporalBound::new(1.0, 4.0),
+        };
+        let rob = until.robustness(&trace, 0.0);
+        // With the fix: phi1 infimum over [0, t'] includes t=0 → robustness should be <= 0.0
+        assert!(
+            rob <= 0.0,
+            "Prefix violation should reduce robustness, got rob={}",
+            rob
+        );
+    }
+
+    #[test]
+    fn test_stl_until_phi2_never_holds() {
+        // phi2 never becomes true → Until is not satisfied → negative robustness
+        let trace: Vec<Array1<f32>> = (0..5).map(|_| Array1::from_vec(vec![1.0_f32])).collect();
+        let phi1 = STLFormula::Predicate(|x| x[0]);
+        let phi2 = STLFormula::Predicate(|x| x[0] - 10.0); // never reached (values are 1.0)
+        let until = STLFormula::Until {
+            phi1: Box::new(phi1),
+            phi2: Box::new(phi2),
+            bound: TemporalBound::new(0.0, 4.0),
+        };
+        let rob = until.robustness(&trace, 0.0);
+        assert!(
+            rob < 0.0,
+            "phi2 never holds → should be unsatisfied, got rob={}",
+            rob
+        );
+    }
+
+    #[test]
+    fn test_stl_until_is_satisfied_agrees_with_robustness() {
+        // is_satisfied must agree with robustness >= 0
+        let trace: Vec<Array1<f32>> = (0..5)
+            .map(|i| Array1::from_vec(vec![i as f32 + 1.0]))
+            .collect();
+        let phi1 = STLFormula::Predicate(|x| x[0]);
+        let phi2 = STLFormula::Predicate(|x| x[0] - 3.0);
+        let until = STLFormula::Until {
+            phi1: Box::new(phi1),
+            phi2: Box::new(phi2),
+            bound: TemporalBound::new(0.0, 4.0),
+        };
+        let rob = until.robustness(&trace, 0.0);
+        let sat = until.is_satisfied(&trace, 0.0);
+        assert_eq!(
+            sat,
+            rob >= 0.0,
+            "is_satisfied disagrees with robustness={}",
+            rob
+        );
     }
 }

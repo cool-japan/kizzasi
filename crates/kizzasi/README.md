@@ -14,7 +14,7 @@ Kizzasi (兆し - "sign/omen") is a Rust-native system for predicting continuous
 - **O(1) Inference**: Constant-time per-step prediction for streaming
 - **Constraint Enforcement**: Safety guardrails via TensorLogic integration
 - **Real-Time I/O**: MQTT, audio, sensors, video streams
-- **Production Ready**: 158 tests, zero warnings, full documentation
+- **Production Ready**: 163 tests, zero warnings, full documentation
 - **Async/Streaming**: Tokio-based async prediction pipelines
 - **Model Versioning**: A/B testing, hot-swapping, canary deployments
 

@@ -317,16 +317,16 @@ fn entropy_coding_benchmarks(c: &mut Criterion) {
 
 #[cfg(target_arch = "x86_64")]
 fn simd_benchmarks(c: &mut Criterion) {
-    use kizzasi_tokenizer::simd_quant::*;
+    use kizzasi_tokenizer::simd_quant::{simd_adaptive_quantize, simd_mulaw_encode, simd_quantize};
 
     let mut group = c.benchmark_group("simd_optimization");
 
-    let signal = Array1::from_vec((0..1024).map(|i| (i as f32 * 0.01).sin()).collect());
+    let signal_vec: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.01).sin()).collect();
+    let signal = Array1::from_vec(signal_vec.clone());
 
-    // SIMD linear quantization
-    let simd_linear = SimdLinearQuantizer::new(-1.0, 1.0, 8).unwrap();
+    // SIMD linear quantization (free function over &[f32])
     group.bench_function("simd_linear_quant_encode", |b| {
-        b.iter(|| simd_linear.encode(black_box(&signal)))
+        b.iter(|| simd_quantize(black_box(&signal_vec), -1.0, 1.0, 8))
     });
 
     // Compare with scalar version
@@ -335,10 +335,9 @@ fn simd_benchmarks(c: &mut Criterion) {
         b.iter(|| scalar_linear.encode(black_box(&signal)))
     });
 
-    // SIMD μ-law
-    let simd_mulaw = SimdMuLawCodec::new(8);
+    // SIMD μ-law encode (free function)
     group.bench_function("simd_mulaw_encode", |b| {
-        b.iter(|| simd_mulaw.encode(black_box(&signal)))
+        b.iter(|| simd_mulaw_encode(black_box(&signal_vec), 255.0))
     });
 
     // Scalar μ-law for comparison
@@ -347,10 +346,9 @@ fn simd_benchmarks(c: &mut Criterion) {
         b.iter(|| scalar_mulaw.encode(black_box(&signal)))
     });
 
-    // SIMD adaptive quantizer
-    let simd_adaptive = SimdAdaptiveQuantizer::new(8, 32, 0.5, -1.0, 1.0).unwrap();
+    // SIMD adaptive quantize (signal, base_step, window_size, adaptation_strength)
     group.bench_function("simd_adaptive_quant", |b| {
-        b.iter(|| simd_adaptive.encode(black_box(&signal)))
+        b.iter(|| simd_adaptive_quantize(black_box(&signal_vec), 0.01, 32, 0.5))
     });
 
     group.finish();

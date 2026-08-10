@@ -881,4 +881,30 @@ kizzasi-core is **production-ready** with:
 
 ---
 
-*Last Updated: 2026-01-18*
+## v0.2.x Iteration (2026-05-17)
+
+### Proper INT8 Quantization with Scale & Zero-Point Tracking ✅
+- **Problem:** `WeightLoader::quantize_tensor` was a stub that mapped to `[0, 255]` without scale/zero-point, making quantized weights unrecoverable.
+- **Solution:** Introduced `QuantizedTensor` and `PerChannelQuantizedTensor` structs in `kizzasi_core::weights` (kept distinct from the existing `crates/kizzasi-core/src/quantization.rs` types used by `kizzasi-model`). Standard affine formulation: `scale = (max - min) / 255`, `zero_point = (-min / scale).round().clamp(0, 255)`; quantize via `tensor.affine(1/scale, zp).round().clamp(0, 255).to_dtype(U8)`. Added per-channel variant slicing via `Tensor::narrow` + `Tensor::cat`. Added `dequantize_tensor` and `dequantize_per_channel` for round-trip.
+- **Tests (7):** roundtrip MSE < 1e-3 on random `[128,64]`; all-zero tensor (scale finite, exact roundtrip); positive-only / negative-only zero-point bounds; per-channel vs per-tensor MSE on heteroscedastic input; dtype/shape preservation; F32 → quantize → dequantize → F32.
+- **Files:** `crates/kizzasi-core/src/weights.rs` (438 → 932 lines).
+
+### Training Loop: Real Gradient Norm + Real Batch Iteration ✅
+- **Problem 1:** `compute_grad_norm` returned hardcoded `Ok(1.0)`.
+- **Problem 2:** `fit()` passed empty `Vec<(Tensor, Tensor)>` to `train_epoch` instead of iterating `TimeSeriesDataLoader`.
+- **Solution:** Restructured `train_epoch` to compute `loss.backward()` explicitly (instead of `optimizer.backward_step` which discarded gradients), then: clip via `clip_gradients(&mut grads, max_norm)`, compute L2 norm via `compute_grad_norm(&grads)` over `varmap().all_vars()`, then `optimizer.step(&grads)`. Replaced empty batch `Vec` with `Self::collect_epoch_batches(loader, device)` that uses the loader's existing `iter_batches()` + `to_tensors()` API; same for validation.
+- **Tests (5):** non-zero finite grad norm after backward; analytical linearity check (`norm` scales 2× when `(p - t)` scales 2×); clipping caps global norm; clipping is no-op below threshold; `fit()` on AR(1) 200-step synthetic series converges (final epoch loss < first).
+- **Files:** `crates/kizzasi-core/src/training_loop.rs` (1005 → 1383 lines).
+
+### Parallel SSM Scan & Attention via scirs2-core ✅
+- **Problem:** Three inline TODOs flagged `// when scirs2-core parallel API is ready` — assumed blocked. Survey showed `scirs2-core 0.4.4` (pinned) already exposes the needed API (`scirs2_core::distributed::parallel_scan::parallel_scan`, `scirs2_core::parallel_ops::IntoParallelIterator`).
+- **Solution:**
+  - `scan.rs::parallel_scan_impl`: branches on `AssociativeOp::identity()` — calls `scirs2_core::distributed::parallel_scan::parallel_scan(data, id, op_closure)` when `Some`, sequential fallback when `None` (the SSM `SSMScanOp::identity()` returns `None` because the identity element is shape-dependent — documented inline as a future enhancement requiring a `identity_like(&T) -> T` trait extension).
+  - `scan.rs::parallel_ssm_batch`: replaced sequential `.map()` with `.into_par_iter().map(...)`. Also fixed a pre-existing `.unwrap()` policy violation by propagating `CoreResult` through the parallel collect.
+  - `efficient_attention.rs::forward_parallel`: stopped delegating to `Self::forward` (no-op); now actually parallelizes over output rows via `into_par_iter()`. Removed dead `forward_parallel_internal` helper.
+- **Tests (3):** `test_parallel_scan_matches_sequential` (bit-exact on 1024-length f32 array + AddOp), `test_parallel_ssm_batch_matches_sequential` (batch=4, seq=128, hidden=16, tolerance 1e-6), `test_forward_parallel_matches_sequential` (seq=64, dim=32, causal=true, tolerance 1e-6).
+- **Files:** `crates/kizzasi-core/src/scan.rs` (~560 lines), `crates/kizzasi-core/src/efficient_attention.rs` (~575 lines).
+
+---
+
+*Last Updated: 2026-05-17*

@@ -476,22 +476,81 @@ impl TrainableSSM {
             .map_err(|e| CoreError::Generic(format!("Layer norm beta add failed: {}", e)))
     }
 
-    /// SSM layer computation
-    fn ssm_layer(&self, x: &Tensor, _h: &mut Tensor, layer_idx: usize) -> CoreResult<Tensor> {
-        let _a = self.a_matrices[layer_idx].as_tensor();
-        let _b = self.b_matrices[layer_idx].as_tensor();
-        let _c = self.c_matrices[layer_idx].as_tensor();
+    /// SSM layer computation — S4D-style selective scan.
+    ///
+    /// Discretization (ZOH, Δ=1 implicit, A log-parameterized via exp):
+    ///   `A_bar = exp(A)`   (element-wise; init at -0.5 gives stable discrete poles)
+    ///   `B_bar = B`        (input matrix, no separate Δ)
+    ///
+    /// Recurrence for t = 0..seq_len:
+    ///   `h[t] = A_bar ⊙ h[t-1] + B_bar ⊙ x[t]`   (broadcast over batch)
+    ///   `y[t] = sum_s( h[t] ⊙ C ) + D ⊙ x[t]`    (contract state dim)
+    fn ssm_layer(&self, x: &Tensor, h: &mut Tensor, layer_idx: usize) -> CoreResult<Tensor> {
+        let a = self.a_matrices[layer_idx].as_tensor();
+        let b = self.b_matrices[layer_idx].as_tensor();
+        let c = self.c_matrices[layer_idx].as_tensor();
         let d = self.d_vectors[layer_idx].as_tensor();
 
-        // Simplified SSM step (full implementation would include selective scan)
-        // For now, implementing a basic skip connection
-        // TODO: Implement proper selective scan mechanism with state evolution
+        // Discretize: A_bar = exp(A), shape (hidden_dim, state_dim)
+        let a_bar = a
+            .exp()
+            .map_err(|e| CoreError::Generic(format!("SSM exp(A) failed: {}", e)))?;
 
-        // For training, we process the entire sequence in parallel (teacher forcing)
-        // Output: y = D * x (simplified - full version uses state)
-        let y = x
-            .broadcast_mul(d)
-            .map_err(|e| CoreError::Generic(format!("Skip connection failed: {}", e)))?;
+        let seq_len = x
+            .dim(1)
+            .map_err(|e| CoreError::Generic(format!("SSM get seq_len failed: {}", e)))?;
+
+        // Accumulate output slices: each is (batch, hidden_dim)
+        let mut ys: Vec<Tensor> = Vec::with_capacity(seq_len);
+
+        for t in 0..seq_len {
+            // x_t: (batch, hidden_dim)
+            let x_t = x
+                .narrow(1, t, 1)
+                .map_err(|e| CoreError::Generic(format!("SSM narrow t={} failed: {}", t, e)))?
+                .squeeze(1)
+                .map_err(|e| CoreError::Generic(format!("SSM squeeze t={} failed: {}", t, e)))?;
+
+            // b_x: (batch, hidden_dim, state_dim) = B_bar ⊙ x_t (broadcast state dim)
+            let x_t_expanded = x_t
+                .unsqueeze(candle_core::D::Minus1)
+                .map_err(|e| CoreError::Generic(format!("SSM unsqueeze t={} failed: {}", t, e)))?;
+            let bx = b
+                .broadcast_mul(&x_t_expanded)
+                .map_err(|e| CoreError::Generic(format!("SSM B*x t={} failed: {}", t, e)))?;
+
+            // h: (batch, hidden_dim, state_dim) = A_bar ⊙ h + B_bar ⊙ x_t
+            let new_h = a_bar
+                .broadcast_mul(h)
+                .map_err(|e| CoreError::Generic(format!("SSM A_bar*h t={} failed: {}", t, e)))?
+                .broadcast_add(&bx)
+                .map_err(|e| {
+                    CoreError::Generic(format!("SSM state update t={} failed: {}", t, e))
+                })?;
+
+            *h = new_h;
+
+            // y_t = sum_s( h ⊙ C ) + D ⊙ x_t  →  (batch, hidden_dim)
+            let ch = h
+                .broadcast_mul(c)
+                .map_err(|e| CoreError::Generic(format!("SSM C*h t={} failed: {}", t, e)))?
+                .sum(candle_core::D::Minus1)
+                .map_err(|e| CoreError::Generic(format!("SSM output sum t={} failed: {}", t, e)))?;
+
+            let dx = d
+                .broadcast_mul(&x_t)
+                .map_err(|e| CoreError::Generic(format!("SSM D*x t={} failed: {}", t, e)))?;
+
+            let y_t = ch
+                .broadcast_add(&dx)
+                .map_err(|e| CoreError::Generic(format!("SSM y_t add t={} failed: {}", t, e)))?;
+
+            ys.push(y_t);
+        }
+
+        // Stack along sequence dim: (batch, seq_len, hidden_dim)
+        let y = Tensor::stack(&ys, 1)
+            .map_err(|e| CoreError::Generic(format!("SSM stack failed: {}", e)))?;
 
         Ok(y)
     }

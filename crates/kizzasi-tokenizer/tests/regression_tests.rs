@@ -404,6 +404,140 @@ fn regression_multiscale_creation() {
     assert_eq!(decoded.len(), signal.len());
 }
 
+/// Golden: LinearQuantizer with 4-bit depth (16 levels) maps [-1,1] deterministically.
+/// With 4 bits = 16 levels over [-1, 1], step = 2.0/16 = 0.125.
+/// encode(0.0) maps to bin ~7 or ~8 (midpoint). Max reconstruction error = step/2 = 0.0625.
+#[test]
+fn regression_linear_quantizer_4bit_golden() {
+    let quantizer = LinearQuantizer::new(-1.0, 1.0, 4).expect("Creation failed");
+    let signal = Array1::from_vec(vec![0.0_f32]);
+    let encoded = quantizer.encode(&signal).expect("Encoding failed");
+    let decoded = quantizer.decode(&encoded).expect("Decoding failed");
+    assert_eq!(decoded.len(), 1);
+    // 4-bit quantizer: 16 levels, step = 2/16 = 0.125; max error = step/2 = 0.0625
+    assert!(
+        decoded[0].abs() <= 0.07,
+        "4-bit quantizer of 0.0 should decode near 0.0, got {}",
+        decoded[0]
+    );
+    // The encoded level for 0.0 must be deterministic across refactors.
+    let bin = encoded[0].round() as i32;
+    // 0.0 normalised in [0, 15] = 7.5, rounds to 7 or 8.
+    assert!(
+        (7..=8).contains(&bin),
+        "4-bit encode of 0.0 should land in bin 7 or 8, got {}",
+        bin
+    );
+}
+
+/// Golden: μ-law encode of 0.0 via quantize() should produce exactly the midpoint (128 for 8-bit).
+/// MuLawCodec::new(8) creates 256 levels. quantize(0.0) = (0.0 + 1.0) * 128 = 128.
+#[test]
+fn regression_mulaw_zero_maps_to_midpoint() {
+    let codec = MuLawCodec::new(8);
+    // Use the discrete quantize() method which returns i32 levels.
+    let bin = codec.quantize(0.0);
+    // From mulaw unit tests: quantize(0.0) == 128 exactly.
+    assert!(
+        (bin - 128).abs() <= 1,
+        "μ-law of 0.0 should quantize to bin 128 for 8-bit, got {}",
+        bin
+    );
+}
+
+/// Regression: SIMD quantize matches scalar (LinearQuantizer) for the same inputs.
+/// simd_quant::simd_quantize is a free function; compare against LinearQuantizer.quantize.
+#[test]
+fn regression_simd_matches_scalar() {
+    use kizzasi_tokenizer::simd_quant::simd_quantize;
+
+    let values: Vec<f32> = vec![-0.9, -0.5, -0.1, 0.0, 0.1, 0.5, 0.9, 1.0];
+    let (min, max, levels) = (-1.0_f32, 1.0_f32, 256_usize);
+
+    let simd_enc = simd_quantize(&values, min, max, levels);
+
+    // Scalar reference: same formula as LinearQuantizer.quantize
+    let scale = (levels - 1) as f32 / (max - min);
+    let scalar_enc: Vec<i32> = values
+        .iter()
+        .map(|&x| ((x.clamp(min, max) - min) * scale).round() as i32)
+        .collect();
+
+    assert_eq!(
+        simd_enc, scalar_enc,
+        "SIMD and scalar quantizers must produce identical output"
+    );
+}
+
+/// Regression: Huffman codec round-trips symbols exactly.
+/// HuffmanEncoder + HuffmanDecoder form the correct pair for lossless compression.
+#[test]
+fn regression_entropy_coding_roundtrip() {
+    use kizzasi_tokenizer::entropy::HuffmanDecoder;
+    use kizzasi_tokenizer::HuffmanEncoder;
+    use std::collections::HashMap;
+
+    let symbols: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6];
+
+    // Build frequency table from the symbol sequence.
+    let mut freqs: HashMap<u32, u64> = HashMap::new();
+    for &s in &symbols {
+        *freqs.entry(s).or_insert(0) += 1;
+    }
+
+    let encoder = HuffmanEncoder::from_frequencies(&freqs).expect("Huffman build failed");
+    let encoded = encoder.encode(&symbols).expect("Huffman encode failed");
+
+    // Decoder is constructed from the encoder's tree.
+    let decoder = HuffmanDecoder::new(encoder.tree());
+    let decoded = decoder.decode(&encoded).expect("Huffman decode failed");
+    assert_eq!(decoded, symbols, "Huffman codec round-trip failed");
+}
+
+/// Regression: Batch encoding via trait method matches individual encoding.
+/// BatchTokenizer::encode_batch takes &Array2<f32>.
+#[test]
+fn regression_batch_matches_individual() {
+    use kizzasi_tokenizer::batch::BatchTokenizer;
+
+    let quantizer = LinearQuantizer::new(-1.0, 1.0, 8).expect("Creation failed");
+
+    let s1 = Array1::from_vec(vec![0.1_f32, 0.2, 0.3]);
+    let s2 = Array1::from_vec(vec![-0.1_f32, -0.2, -0.3]);
+
+    // Build a 2×3 Array2 for the batch method.
+    let mut batch_input = Array2::<f32>::zeros((2, 3));
+    for (j, &v) in s1.iter().enumerate() {
+        batch_input[[0, j]] = v;
+    }
+    for (j, &v) in s2.iter().enumerate() {
+        batch_input[[1, j]] = v;
+    }
+
+    let batch_encoded = quantizer
+        .encode_batch(&batch_input)
+        .expect("Batch encode failed");
+
+    let ind_enc_1 = quantizer.encode(&s1).expect("Individual encode 1 failed");
+    let ind_enc_2 = quantizer.encode(&s2).expect("Individual encode 2 failed");
+
+    // batch_encoded is Array2; rows must match individual results.
+    for j in 0..3 {
+        assert_eq!(
+            batch_encoded[[0, j]],
+            ind_enc_1[j],
+            "Batch and individual encodings differ at position {} for signal 1",
+            j
+        );
+        assert_eq!(
+            batch_encoded[[1, j]],
+            ind_enc_2[j],
+            "Batch and individual encodings differ at position {} for signal 2",
+            j
+        );
+    }
+}
+
 /// Regression: Hierarchical tokenizer should be created successfully
 #[test]
 fn regression_hierarchical_creation() {

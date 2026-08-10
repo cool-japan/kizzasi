@@ -19,9 +19,10 @@ doc = false
 [dependencies]
 kizzasi = { path = "../kizzasi", default-features = false, features = ["std", "logic"] }
 kizzasi-core = { path = "../kizzasi-core" }
+kizzasi-inference = { path = "../kizzasi-inference", default-features = false, features = ["std"] }
 kizzasi-logic = { path = "../kizzasi-logic" }
-pyo3 = { version = "0.28", features = ["abi3-py310"] }
-scirs2-numpy = "0.4.2"
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+scirs2-numpy = "0.6.5"
 scirs2-core.workspace = true
 thiserror.workspace = true
 

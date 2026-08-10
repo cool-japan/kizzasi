@@ -35,6 +35,7 @@ pub use arch_search::{
 pub mod backprop;
 pub mod backprop_ssm;
 pub mod batch;
+pub(crate) mod binary_io;
 pub mod blas_ops;
 pub mod cache_friendly;
 pub mod checkpoint;
@@ -101,6 +102,9 @@ pub mod spiking;
 pub mod temporal_multiscale;
 
 pub mod transformer;
+
+pub mod tensorlogic_bridge;
+pub use tensorlogic_bridge::{compile_constraints, constraint_from_tl_expr};
 
 pub use error::{ModelError, ModelResult};
 

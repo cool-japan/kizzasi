@@ -279,13 +279,15 @@ impl LifLayer {
 
         for i in 0..self.output_neurons {
             if updated_refractory[i] > 0 {
-                // In refractory period: decrement counter, no spike, reset voltage if hard
+                // In absolute refractory period: decrement counter, no spike, and clamp the
+                // membrane at the reset value that was written when the neuron last spiked.
+                // state.voltages[i] already holds that reset value (set at spike time and
+                // persisted at the end of that step). Re-applying leak or adding synaptic
+                // current would both violate standard absolute-refractory clamping
+                // (Gerstner & Kistler, "Spiking Neuron Models" §2.1;
+                //  Dayan & Abbott, "Theoretical Neuroscience" Ch.1).
                 updated_refractory[i] -= 1;
-                // Prevent integration during refractory
-                updated_voltages[i] = match self.config.reset_mode {
-                    ResetMode::HardReset => 0.0,
-                    _ => state.voltages[i] * self.config.leak_factor,
-                };
+                updated_voltages[i] = state.voltages[i];
             } else if new_voltages[i] >= self.config.threshold {
                 // Neuron fires!
                 spikes[i] = 1.0;
@@ -845,6 +847,174 @@ mod tests {
                 "voltages should be zero after reset"
             );
         }
+    }
+
+    // 9. test_refractory_clamps_at_reset_value_soft
+    //
+    // Verifies that during absolute refractory the membrane potential is held at
+    // the reset value established when the spike occurred, not allowed to evolve.
+    // SoftReset: V_reset = V_new - threshold.
+    //
+    // We force a spike by pre-loading the voltage well above threshold via the
+    // public `voltages` field, then stepping with zero input.  Because
+    // new_voltages = state.voltages * leak_factor + W@0 + bias, even with
+    // small weights / bias the pre-loaded value ensures new_voltages > threshold.
+    #[test]
+    fn test_refractory_clamps_at_reset_value_soft() {
+        let threshold = 0.5_f32;
+        let leak_factor = 0.9_f32;
+        let config = SpikingConfig {
+            threshold,
+            leak_factor,
+            refractory_period: 3,
+            reset_mode: ResetMode::SoftReset,
+            ..SpikingConfig::new(1, 1, 1, 1)
+        };
+        let layer = LifLayer::new(1, 1, &config).expect("LIF layer creation failed");
+        let mut state = layer.init_state();
+
+        // Pre-load voltage far above threshold; with zero input the LIF equation gives
+        // new_v = 1000.0 * 0.9 + bias ≈ 900, which is >> threshold → guaranteed spike.
+        state.voltages[0] = 1_000.0;
+        let zero_input = Array1::from_vec(vec![0.0_f32]);
+        let spike_step = layer
+            .step(&zero_input, &mut state)
+            .expect("spike step failed");
+
+        assert_eq!(
+            spike_step[0], 1.0,
+            "neuron must spike when voltage is pre-loaded above threshold"
+        );
+
+        // state.voltages[0] now holds V_reset = V_new - threshold (SoftReset).
+        let reset_value = state.voltages[0];
+
+        // First refractory step: even with nonzero input the voltage must stay at reset_value.
+        let nonzero_input = Array1::from_vec(vec![50.0_f32]);
+        let refractory_spikes = layer
+            .step(&nonzero_input, &mut state)
+            .expect("refractory step 1 failed");
+
+        assert_eq!(
+            refractory_spikes[0], 0.0,
+            "neuron must not spike during refractory"
+        );
+        assert_eq!(
+            state.voltages[0], reset_value,
+            "voltage must be clamped at reset value during refractory (SoftReset): \
+             expected {reset_value}, got {}",
+            state.voltages[0]
+        );
+    }
+
+    // 10. test_refractory_hard_reset_stays_zero
+    //
+    // Verifies that HardReset holds the membrane at 0.0 throughout the entire
+    // refractory window, even when large synaptic currents arrive.
+    #[test]
+    fn test_refractory_hard_reset_stays_zero() {
+        let threshold = 0.5_f32;
+        let config = SpikingConfig {
+            threshold,
+            leak_factor: 0.9,
+            refractory_period: 3,
+            reset_mode: ResetMode::HardReset,
+            ..SpikingConfig::new(1, 1, 1, 1)
+        };
+        let layer = LifLayer::new(1, 1, &config).expect("LIF layer creation failed");
+        let mut state = layer.init_state();
+
+        // Pre-load voltage above threshold to guarantee a spike with zero input.
+        state.voltages[0] = 1_000.0;
+        let zero_input = Array1::from_vec(vec![0.0_f32]);
+        let spike_step = layer
+            .step(&zero_input, &mut state)
+            .expect("spike step failed");
+        assert_eq!(
+            spike_step[0], 1.0,
+            "neuron must spike when voltage is pre-loaded above threshold"
+        );
+
+        // HardReset sets V to 0.0 at spike time.
+        assert_eq!(
+            state.voltages[0], 0.0,
+            "HardReset must set voltage to 0 at spike time"
+        );
+
+        // Run all 3 refractory steps; voltage must remain 0.0 regardless of input.
+        let nonzero_input = Array1::from_vec(vec![50.0_f32]);
+        for refr_step in 1..=3_u32 {
+            let spikes = layer
+                .step(&nonzero_input, &mut state)
+                .expect("refractory step failed");
+            assert_eq!(
+                spikes[0], 0.0,
+                "no spike allowed during refractory (step {refr_step})"
+            );
+            assert_eq!(
+                state.voltages[0], 0.0,
+                "HardReset voltage must stay 0 during refractory (step {refr_step}): got {}",
+                state.voltages[0]
+            );
+        }
+    }
+
+    // 11. test_refractory_no_double_leak
+    //
+    // Verifies that the old bug (applying `state.voltages[i] * leak_factor` during
+    // refractory instead of holding the reset value) is fixed.
+    //
+    // Before the fix, in the first refractory step the code computed:
+    //   updated_voltages[i] = state.voltages[i] * leak_factor   (= V_reset * leak_factor)
+    // With the fix the voltage must equal V_reset exactly (no leak applied).
+    #[test]
+    fn test_refractory_no_double_leak() {
+        let leak_factor = 0.9_f32;
+        let threshold = 0.5_f32;
+        let config = SpikingConfig {
+            threshold,
+            leak_factor,
+            refractory_period: 3,
+            reset_mode: ResetMode::SoftReset,
+            ..SpikingConfig::new(1, 1, 1, 1)
+        };
+        let layer = LifLayer::new(1, 1, &config).expect("LIF layer creation failed");
+        let mut state = layer.init_state();
+
+        // Pre-load voltage to a known value well above threshold; with zero input:
+        // new_v = 10.0 * leak_factor + bias ≈ 9.0 (>> threshold).
+        // V_reset (SoftReset) = new_v - threshold ≈ 9.0 - 0.5 = 8.5.
+        state.voltages[0] = 10.0;
+        let zero_input = Array1::from_vec(vec![0.0_f32]);
+        let spike_step = layer
+            .step(&zero_input, &mut state)
+            .expect("spike step failed");
+        assert_eq!(spike_step[0], 1.0, "neuron must spike");
+
+        // V_reset stored in state after spike step.
+        let v_reset = state.voltages[0];
+        assert!(
+            v_reset > 0.0,
+            "SoftReset value must be positive for this test to be meaningful; got {v_reset}"
+        );
+
+        // The old bug produces v_reset * leak_factor after one refractory step.
+        // The correct behaviour holds v_reset unchanged.
+        let bugged_value = v_reset * leak_factor;
+
+        // Run one refractory step with zero input (isolates just the clamping logic).
+        layer
+            .step(&zero_input, &mut state)
+            .expect("first refractory step failed");
+
+        let v_after = state.voltages[0];
+
+        // Must equal V_reset, not V_reset * leak_factor.
+        assert!(
+            (v_after - v_reset).abs() < 1e-5,
+            "voltage after first refractory step must equal V_reset={v_reset}, \
+             got {v_after} (bugged value would be {bugged_value})"
+        );
     }
 
     // 8. test_stdp_update

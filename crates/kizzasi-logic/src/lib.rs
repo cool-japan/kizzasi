@@ -53,6 +53,7 @@ pub use approximate_satisfaction::{
     AnytimeSolver, ApproximateSolution, BoundedErrorSolver, HierarchicalConstraint,
     HierarchicalRelaxation,
 };
+pub use compiler::TlExprCompiler;
 pub use constraint::{
     AffineEquality, BoundType, ComposedConstraint, Constraint, ConstraintBuilder, ConstraintMode,
     ConstraintSet, GeometricSet, HysteresisChecker, HysteresisConstraint, LTLChecker, LTLFormula,
@@ -110,7 +111,8 @@ pub use projection::ConstrainedProjection;
 #[cfg(feature = "qp-solver")]
 pub use qp_solver::QPSolver;
 pub use tensorlogic_integration::{
-    ConstraintLearner, ConstraintSynthesizer, ConstraintTemplate, SymbolicExpr,
+    tl_const, tl_var, ConstraintLearner, ConstraintSynthesizer, ConstraintTemplate, TLExpr,
+    TLExprEvaluator, TlTerm, TypeAnnotation,
 };
 pub use timevarying::{
     ActivationFunction, ConstraintInterpolator, ConstraintParams, InterpolationMode,

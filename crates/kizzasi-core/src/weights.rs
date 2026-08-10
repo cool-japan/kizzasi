@@ -196,13 +196,26 @@ impl WeightLoader {
             tensor_data.insert(name.clone(), (dtype, shape, data));
         }
 
-        // Build the safetensors file manually using safetensors::tensor module
-        // For now, we'll use a simpler approach with serialize_to_file
-        // This is a placeholder - full implementation would use proper serialization
+        // Build TensorView entries borrowing from the byte buffers in tensor_data.
+        // The views are collected into a sorted BTreeMap so the header is deterministic.
+        use std::collections::BTreeMap;
+        let views: BTreeMap<String, safetensors::tensor::TensorView> = tensor_data
+            .iter()
+            .map(|(name, (dtype, shape, data))| {
+                safetensors::tensor::TensorView::new(*dtype, shape.clone(), data.as_slice())
+                    .map(|view| (name.clone(), view))
+                    .map_err(|e| {
+                        CoreError::WeightLoadError(format!(
+                            "Failed to create TensorView for '{}': {}",
+                            name, e
+                        ))
+                    })
+            })
+            .collect::<CoreResult<_>>()?;
 
-        // Temporary workaround: Return empty vec for now
-        // TODO: Implement proper safetensors serialization
-        Ok(Vec::new())
+        safetensors::serialize(&views, None).map_err(|e| {
+            CoreError::WeightLoadError(format!("Failed to serialize safetensors: {}", e))
+        })
     }
 
     /// Convert tensor to bytes
@@ -250,39 +263,324 @@ impl WeightLoader {
         }
     }
 
-    /// Quantize a tensor to INT8
-    #[allow(dead_code)]
-    fn quantize_tensor(&self, tensor: &Tensor) -> CoreResult<Tensor> {
-        // Simple quantization: scale to [-128, 127] range
-        // TODO: Implement proper quantization with scale and zero-point tracking
+    /// Quantize a candle [`Tensor`] to INT8 with per-tensor affine parameters.
+    ///
+    /// Computes per-tensor `min` and `max`, derives an affine
+    /// `(scale, zero_point)` pair that maps the original range into `[0, 255]`,
+    /// and stores the quantized payload as a `U8` tensor alongside the
+    /// reconstruction parameters in a [`QuantizedTensor`].
+    ///
+    /// Quantization formula:
+    /// ```text
+    /// q = round(x / scale + zero_point).clamp(0, 255) as u8
+    /// scale = max(max - min, EPS) / 255
+    /// zero_point = round(-min / scale).clamp(0, 255)
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::WeightLoadError`] if any candle tensor op fails
+    /// (e.g. scalar extraction, dtype conversion).
+    pub fn quantize_tensor(&self, tensor: &Tensor) -> CoreResult<QuantizedTensor> {
+        let original_dtype = tensor.dtype();
+        let original_shape = tensor.dims().to_vec();
 
-        let min_val = tensor
-            .min(candle_core::D::Minus1)
-            .map_err(|e| CoreError::WeightLoadError(format!("Failed to compute min: {}", e)))?;
-        let max_val = tensor
-            .max(candle_core::D::Minus1)
-            .map_err(|e| CoreError::WeightLoadError(format!("Failed to compute max: {}", e)))?;
+        // Cast to f32 for scalar reductions; min/max on integer or fp16 dtypes
+        // would force the caller to deal with dtype-specific scalar extraction.
+        let tensor_f32 = tensor
+            .to_dtype(DType::F32)
+            .map_err(|e| CoreError::WeightLoadError(format!("Failed to cast to f32: {}", e)))?;
 
-        let range = max_val
-            .sub(&min_val)
-            .map_err(|e| CoreError::WeightLoadError(format!("Failed to compute range: {}", e)))?;
+        let (min_val, max_val) = tensor_scalar_min_max(&tensor_f32)?;
 
-        // Scale to [0, 255]
-        let scaled = tensor
-            .broadcast_sub(&min_val)
-            .map_err(|e| CoreError::WeightLoadError(format!("Failed to subtract min: {}", e)))?
-            .broadcast_div(&range)
-            .map_err(|e| CoreError::WeightLoadError(format!("Failed to divide by range: {}", e)))?
-            .affine(255.0, 0.0)
-            .map_err(|e| CoreError::WeightLoadError(format!("Failed to scale: {}", e)))?;
+        let (scale, zero_point) = compute_affine_qparams(min_val, max_val);
 
-        // Convert to U8
-        let quantized = scaled
+        // Quantize: q = round(x * (1/scale) + zero_point).
+        // candle's `affine(mul, add)` performs `x * mul + add` element-wise.
+        let inv_scale = 1.0_f32 / scale;
+        let scaled = tensor_f32
+            .affine(inv_scale as f64, zero_point as f64)
+            .map_err(|e| CoreError::WeightLoadError(format!("Failed to scale: {}", e)))?
+            .round()
+            .map_err(|e| CoreError::WeightLoadError(format!("Failed to round: {}", e)))?
+            .clamp(0f64, 255f64)
+            .map_err(|e| CoreError::WeightLoadError(format!("Failed to clamp: {}", e)))?;
+
+        let data = scaled
             .to_dtype(DType::U8)
             .map_err(|e| CoreError::WeightLoadError(format!("Failed to convert to U8: {}", e)))?;
 
-        Ok(quantized)
+        Ok(QuantizedTensor {
+            data,
+            scale,
+            zero_point,
+            original_dtype,
+            original_shape,
+        })
     }
+
+    /// Dequantize a [`QuantizedTensor`] back to a floating-point tensor.
+    ///
+    /// Reconstruction formula:
+    /// ```text
+    /// x = (q as f32 - zero_point) * scale
+    /// ```
+    ///
+    /// The result is cast back to [`QuantizedTensor::original_dtype`] so the
+    /// returned tensor is byte-compatible with the original signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::WeightLoadError`] if any candle tensor op fails.
+    pub fn dequantize_tensor(&self, q: &QuantizedTensor) -> CoreResult<Tensor> {
+        let scale = q.scale as f64;
+        let zero_point = q.zero_point as f64;
+
+        // Cast U8 -> F32, then apply x = (q - zp) * scale  =>  q * scale + (-zp * scale).
+        let f = q
+            .data
+            .to_dtype(DType::F32)
+            .map_err(|e| CoreError::WeightLoadError(format!("Failed to cast q to f32: {}", e)))?
+            .affine(scale, -zero_point * scale)
+            .map_err(|e| CoreError::WeightLoadError(format!("Failed to dequantize: {}", e)))?;
+
+        f.to_dtype(q.original_dtype).map_err(|e| {
+            CoreError::WeightLoadError(format!("Failed to restore original dtype: {}", e))
+        })
+    }
+
+    /// Quantize a candle [`Tensor`] to INT8 with per-channel affine parameters
+    /// along the given `axis`.
+    ///
+    /// This produces a much tighter quantization error than per-tensor
+    /// quantization when the value distribution differs strongly between
+    /// channels (e.g. INT8 matmul weights for transformer / SSM projections).
+    ///
+    /// Implementation strategy: slice the input along `axis` using
+    /// [`Tensor::narrow`], quantize each slice independently with its own
+    /// `(scale, zero_point)`, then re-assemble the U8 slices with
+    /// [`Tensor::cat`] on the same axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidConfig`] if `axis` is out of bounds, or
+    /// [`CoreError::WeightLoadError`] if any candle tensor op fails.
+    pub fn quantize_per_channel(
+        &self,
+        tensor: &Tensor,
+        axis: usize,
+    ) -> CoreResult<PerChannelQuantizedTensor> {
+        let original_dtype = tensor.dtype();
+        let original_shape = tensor.dims().to_vec();
+
+        if axis >= original_shape.len() {
+            return Err(CoreError::InvalidConfig(format!(
+                "quantize_per_channel: axis {} out of bounds for shape {:?}",
+                axis, original_shape
+            )));
+        }
+
+        let tensor_f32 = tensor
+            .to_dtype(DType::F32)
+            .map_err(|e| CoreError::WeightLoadError(format!("Failed to cast to f32: {}", e)))?;
+
+        let num_channels = original_shape[axis];
+        let mut scales: Vec<f32> = Vec::with_capacity(num_channels);
+        let mut zero_points: Vec<i32> = Vec::with_capacity(num_channels);
+        let mut quantized_slices: Vec<Tensor> = Vec::with_capacity(num_channels);
+
+        for i in 0..num_channels {
+            let slice = tensor_f32.narrow(axis, i, 1).map_err(|e| {
+                CoreError::WeightLoadError(format!(
+                    "Failed to narrow channel {} on axis {}: {}",
+                    i, axis, e
+                ))
+            })?;
+
+            let (slice_min, slice_max) = tensor_scalar_min_max(&slice)?;
+            let (scale, zero_point) = compute_affine_qparams(slice_min, slice_max);
+            let inv_scale = 1.0_f32 / scale;
+
+            let q_slice = slice
+                .affine(inv_scale as f64, zero_point as f64)
+                .map_err(|e| {
+                    CoreError::WeightLoadError(format!("Failed to scale channel {}: {}", i, e))
+                })?
+                .round()
+                .map_err(|e| {
+                    CoreError::WeightLoadError(format!("Failed to round channel {}: {}", i, e))
+                })?
+                .clamp(0f64, 255f64)
+                .map_err(|e| {
+                    CoreError::WeightLoadError(format!("Failed to clamp channel {}: {}", i, e))
+                })?
+                .to_dtype(DType::U8)
+                .map_err(|e| {
+                    CoreError::WeightLoadError(format!("Failed to cast channel {} to U8: {}", i, e))
+                })?;
+
+            scales.push(scale);
+            zero_points.push(zero_point);
+            quantized_slices.push(q_slice);
+        }
+
+        // Re-assemble the per-channel slices back into a single U8 tensor.
+        let data = Tensor::cat(&quantized_slices, axis)
+            .map_err(|e| CoreError::WeightLoadError(format!("Failed to cat slices: {}", e)))?;
+
+        Ok(PerChannelQuantizedTensor {
+            data,
+            scales,
+            zero_points,
+            axis,
+            original_dtype,
+            original_shape,
+        })
+    }
+
+    /// Dequantize a [`PerChannelQuantizedTensor`] back to a floating-point
+    /// tensor by applying each channel's affine parameters independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidConfig`] if the channel metadata is
+    /// inconsistent, or [`CoreError::WeightLoadError`] if any candle tensor op
+    /// fails.
+    pub fn dequantize_per_channel(&self, q: &PerChannelQuantizedTensor) -> CoreResult<Tensor> {
+        if q.axis >= q.original_shape.len() {
+            return Err(CoreError::InvalidConfig(format!(
+                "dequantize_per_channel: axis {} out of bounds for shape {:?}",
+                q.axis, q.original_shape
+            )));
+        }
+
+        let num_channels = q.original_shape[q.axis];
+        if q.scales.len() != num_channels || q.zero_points.len() != num_channels {
+            return Err(CoreError::InvalidConfig(format!(
+                "dequantize_per_channel: expected {} scales/zero_points, got {}/{}",
+                num_channels,
+                q.scales.len(),
+                q.zero_points.len()
+            )));
+        }
+
+        let mut dequantized_slices: Vec<Tensor> = Vec::with_capacity(num_channels);
+
+        for i in 0..num_channels {
+            let slice = q.data.narrow(q.axis, i, 1).map_err(|e| {
+                CoreError::WeightLoadError(format!(
+                    "Failed to narrow channel {} on axis {}: {}",
+                    i, q.axis, e
+                ))
+            })?;
+
+            let scale = q.scales[i] as f64;
+            let zero_point = q.zero_points[i] as f64;
+
+            let f = slice
+                .to_dtype(DType::F32)
+                .map_err(|e| {
+                    CoreError::WeightLoadError(format!(
+                        "Failed to cast channel {} to f32: {}",
+                        i, e
+                    ))
+                })?
+                .affine(scale, -zero_point * scale)
+                .map_err(|e| {
+                    CoreError::WeightLoadError(format!("Failed to dequantize channel {}: {}", i, e))
+                })?;
+
+            dequantized_slices.push(f);
+        }
+
+        let result = Tensor::cat(&dequantized_slices, q.axis).map_err(|e| {
+            CoreError::WeightLoadError(format!("Failed to cat dequantized slices: {}", e))
+        })?;
+
+        result.to_dtype(q.original_dtype).map_err(|e| {
+            CoreError::WeightLoadError(format!("Failed to restore original dtype: {}", e))
+        })
+    }
+}
+
+/// INT8-quantized tensor with per-tensor affine reconstruction parameters.
+///
+/// Quantization:   `q = round(x / scale + zero_point).clamp(0, 255) as u8`
+/// Dequantization: `x = (q as f32 - zero_point as f32) * scale`
+///
+/// `scale` is always finite and strictly positive; `zero_point` is constrained
+/// to the range `[0, 255]` so that a value of `min` round-trips through
+/// `q = 0` exactly (modulo `scale * round` error).
+#[derive(Debug, Clone)]
+pub struct QuantizedTensor {
+    /// Quantized payload (`DType::U8`).
+    pub data: Tensor,
+    /// Per-tensor scale factor (always `> 0` and finite).
+    pub scale: f32,
+    /// Per-tensor zero point in `[0, 255]`.
+    pub zero_point: i32,
+    /// Original tensor dtype (for round-tripping).
+    pub original_dtype: DType,
+    /// Original tensor shape (for round-tripping).
+    pub original_shape: Vec<usize>,
+}
+
+/// INT8-quantized tensor with **per-channel** affine reconstruction parameters
+/// along a single `axis`.
+///
+/// Each entry of `scales` / `zero_points` corresponds to one slice of the
+/// quantized data along `axis`. For weight matrices `[out, in]` quantized
+/// along `axis = 0`, every output channel gets its own `(scale, zero_point)`,
+/// which is the standard accuracy-preserving form for INT8 matmul.
+#[derive(Debug, Clone)]
+pub struct PerChannelQuantizedTensor {
+    /// Quantized payload (`DType::U8`).
+    pub data: Tensor,
+    /// One scale factor per channel along `axis`.
+    pub scales: Vec<f32>,
+    /// One zero point per channel along `axis`.
+    pub zero_points: Vec<i32>,
+    /// Axis along which the per-channel parameters are indexed.
+    pub axis: usize,
+    /// Original tensor dtype (for round-tripping).
+    pub original_dtype: DType,
+    /// Original tensor shape (for round-tripping).
+    pub original_shape: Vec<usize>,
+}
+
+/// Minimum allowed range to avoid divide-by-zero on constant tensors.
+const QUANT_RANGE_EPS: f32 = 1e-12;
+
+/// Compute the per-tensor scalar min and max of an `f32` tensor.
+fn tensor_scalar_min_max(tensor: &Tensor) -> CoreResult<(f32, f32)> {
+    let flat = tensor
+        .flatten_all()
+        .map_err(|e| CoreError::WeightLoadError(format!("Failed to flatten tensor: {}", e)))?;
+
+    let min_scalar = flat
+        .min(0)
+        .map_err(|e| CoreError::WeightLoadError(format!("Failed to compute min: {}", e)))?
+        .to_scalar::<f32>()
+        .map_err(|e| CoreError::WeightLoadError(format!("Failed to extract min scalar: {}", e)))?;
+
+    let max_scalar = flat
+        .max(0)
+        .map_err(|e| CoreError::WeightLoadError(format!("Failed to compute max: {}", e)))?
+        .to_scalar::<f32>()
+        .map_err(|e| CoreError::WeightLoadError(format!("Failed to extract max scalar: {}", e)))?;
+
+    Ok((min_scalar, max_scalar))
+}
+
+/// Compute affine `(scale, zero_point)` from a value range.
+///
+/// Always returns a finite, strictly positive `scale` and a `zero_point` in
+/// `[0, 255]`.
+fn compute_affine_qparams(min_val: f32, max_val: f32) -> (f32, i32) {
+    let range = (max_val - min_val).max(QUANT_RANGE_EPS);
+    let scale = range / 255.0_f32;
+    let zero_point_f = (-min_val / scale).round().clamp(0.0_f32, 255.0_f32);
+    (scale, zero_point_f as i32)
 }
 
 /// Weight pruning utilities
@@ -421,5 +719,199 @@ mod tests {
         if save_path.exists() {
             std::fs::remove_file(save_path).ok();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // INT8 quantization tests (Track B)
+    // ------------------------------------------------------------------
+
+    /// Build a fresh `WeightLoader` for tests.
+    fn test_loader() -> WeightLoader {
+        WeightLoader::new(WeightLoadConfig::default())
+    }
+
+    /// Compute mean-squared-error between two `f32` tensors of the same shape.
+    fn mse(a: &Tensor, b: &Tensor) -> f32 {
+        let af = a.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        let bf = b.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        let av = af.to_vec1::<f32>().unwrap();
+        let bv = bf.to_vec1::<f32>().unwrap();
+        assert_eq!(av.len(), bv.len());
+        let n = av.len() as f32;
+        av.iter()
+            .zip(bv.iter())
+            .map(|(x, y)| {
+                let d = x - y;
+                d * d
+            })
+            .sum::<f32>()
+            / n
+    }
+
+    #[test]
+    fn test_quantize_tensor_roundtrip() {
+        let device = Device::Cpu;
+        let loader = test_loader();
+
+        // Normal-distributed input, shape [128, 64].
+        let tensor = Tensor::randn(0.0_f32, 1.0_f32, (128, 64), &device).unwrap();
+
+        let q = loader.quantize_tensor(&tensor).unwrap();
+        assert_eq!(q.data.dtype(), DType::U8);
+        assert!(q.scale.is_finite());
+        assert!(q.scale > 0.0);
+        assert!((0..=255).contains(&q.zero_point));
+
+        let recovered = loader.dequantize_tensor(&q).unwrap();
+        let err = mse(&tensor, &recovered);
+        assert!(err < 1e-3, "MSE too high after roundtrip: {}", err);
+    }
+
+    #[test]
+    fn test_quantize_zero_tensor() {
+        let device = Device::Cpu;
+        let loader = test_loader();
+
+        let tensor = Tensor::zeros((16, 8), DType::F32, &device).unwrap();
+        let q = loader.quantize_tensor(&tensor).unwrap();
+
+        // Scale must remain finite and strictly positive even when range == 0.
+        assert!(q.scale.is_finite(), "scale is not finite: {}", q.scale);
+        assert!(q.scale > 0.0, "scale must be positive: {}", q.scale);
+        // For an all-zero tensor, -min == 0, so zero_point should be 0.
+        assert_eq!(q.zero_point, 0);
+
+        let recovered = loader.dequantize_tensor(&q).unwrap();
+        let values = recovered.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for v in values {
+            assert_eq!(v, 0.0, "expected zero, got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_quantize_positive_only() {
+        let device = Device::Cpu;
+        let loader = test_loader();
+
+        // All values in [0, 1]
+        let values: Vec<f32> = (0..256).map(|i| i as f32 / 255.0).collect();
+        let tensor = Tensor::from_vec(values, &[256], &device).unwrap();
+        let q = loader.quantize_tensor(&tensor).unwrap();
+
+        // min == 0 => -min/scale == 0 => zero_point ~= 0.
+        assert_eq!(
+            q.zero_point, 0,
+            "expected zero_point near 0 for non-negative input, got {}",
+            q.zero_point
+        );
+
+        // Round-trip should be very accurate (linear ramp, 256 levels).
+        let recovered = loader.dequantize_tensor(&q).unwrap();
+        let err = mse(&tensor, &recovered);
+        assert!(err < 1e-5, "MSE too high: {}", err);
+    }
+
+    #[test]
+    fn test_quantize_negative_only() {
+        let device = Device::Cpu;
+        let loader = test_loader();
+
+        // All values in [-1, 0]
+        let values: Vec<f32> = (0..256).map(|i| -(i as f32) / 255.0).collect();
+        let tensor = Tensor::from_vec(values, &[256], &device).unwrap();
+        let q = loader.quantize_tensor(&tensor).unwrap();
+
+        // min == -1, scale ~= 1/255, zero_point = round(1 / (1/255)) = 255.
+        assert_eq!(
+            q.zero_point, 255,
+            "expected zero_point near 255 for non-positive input, got {}",
+            q.zero_point
+        );
+
+        let recovered = loader.dequantize_tensor(&q).unwrap();
+        let err = mse(&tensor, &recovered);
+        assert!(err < 1e-5, "MSE too high: {}", err);
+    }
+
+    #[test]
+    fn test_per_channel_vs_per_tensor_accuracy() {
+        let device = Device::Cpu;
+        let loader = test_loader();
+
+        // Heteroscedastic input:
+        //   row 0 has values in roughly [0, 1]   (small range)
+        //   row 1 has values in roughly [0, 100] (large range)
+        // Per-tensor quantization must use one global scale tuned for the
+        // larger range, which destroys the precision of row 0.
+        let mut values: Vec<f32> = Vec::with_capacity(2 * 128);
+        for i in 0..128 {
+            values.push(i as f32 / 127.0); // row 0 in [0, 1]
+        }
+        for i in 0..128 {
+            values.push((i as f32 / 127.0) * 100.0); // row 1 in [0, 100]
+        }
+        let tensor = Tensor::from_vec(values, &[2, 128], &device).unwrap();
+
+        let q_pt = loader.quantize_tensor(&tensor).unwrap();
+        let rec_pt = loader.dequantize_tensor(&q_pt).unwrap();
+        let err_pt = mse(&tensor, &rec_pt);
+
+        let q_pc = loader.quantize_per_channel(&tensor, 0).unwrap();
+        assert_eq!(q_pc.scales.len(), 2);
+        assert_eq!(q_pc.zero_points.len(), 2);
+        let rec_pc = loader.dequantize_per_channel(&q_pc).unwrap();
+        let err_pc = mse(&tensor, &rec_pc);
+
+        assert!(
+            err_pc < err_pt,
+            "per-channel MSE ({}) should be < per-tensor MSE ({})",
+            err_pc,
+            err_pt
+        );
+    }
+
+    #[test]
+    fn test_quantize_dtype_preservation() {
+        let device = Device::Cpu;
+        let loader = test_loader();
+
+        let tensor = Tensor::randn(0.0_f32, 1.0_f32, (4, 5, 6), &device).unwrap();
+        let original_dtype = tensor.dtype();
+        let original_shape = tensor.dims().to_vec();
+
+        let q = loader.quantize_tensor(&tensor).unwrap();
+        assert_eq!(q.original_dtype, original_dtype);
+        assert_eq!(q.original_shape, original_shape);
+        assert_eq!(q.data.dtype(), DType::U8);
+        assert_eq!(q.data.dims(), original_shape.as_slice());
+
+        // Per-channel: same shape/dtype metadata, plus axis preserved.
+        let q_pc = loader.quantize_per_channel(&tensor, 1).unwrap();
+        assert_eq!(q_pc.original_dtype, original_dtype);
+        assert_eq!(q_pc.original_shape, original_shape);
+        assert_eq!(q_pc.axis, 1);
+        assert_eq!(q_pc.scales.len(), original_shape[1]);
+        assert_eq!(q_pc.zero_points.len(), original_shape[1]);
+        assert_eq!(q_pc.data.dtype(), DType::U8);
+        assert_eq!(q_pc.data.dims(), original_shape.as_slice());
+    }
+
+    #[test]
+    fn test_dequantize_dtype_returns_to_original() {
+        let device = Device::Cpu;
+        let loader = test_loader();
+
+        let tensor = Tensor::randn(0.0_f32, 1.0_f32, (32, 32), &device).unwrap();
+        assert_eq!(tensor.dtype(), DType::F32);
+
+        let q = loader.quantize_tensor(&tensor).unwrap();
+        let recovered = loader.dequantize_tensor(&q).unwrap();
+        assert_eq!(recovered.dtype(), DType::F32);
+        assert_eq!(recovered.dims(), tensor.dims());
+
+        let q_pc = loader.quantize_per_channel(&tensor, 0).unwrap();
+        let recovered_pc = loader.dequantize_per_channel(&q_pc).unwrap();
+        assert_eq!(recovered_pc.dtype(), DType::F32);
+        assert_eq!(recovered_pc.dims(), tensor.dims());
     }
 }

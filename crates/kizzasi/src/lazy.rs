@@ -70,7 +70,10 @@ impl LazyKizzasi {
 
     /// Check if the predictor has been initialized
     pub fn is_initialized(&self) -> bool {
-        self.predictor.lock().unwrap().is_some()
+        self.predictor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Force initialization without making a prediction
@@ -94,7 +97,7 @@ impl LazyKizzasi {
                 predictor.set_guardrails(guardrails.clone());
             }
 
-            *self.predictor.lock().unwrap() = Some(predictor);
+            *self.predictor.lock().unwrap_or_else(|e| e.into_inner()) = Some(predictor);
         });
 
         if let Some(err) = init_error {
@@ -113,7 +116,7 @@ impl LazyKizzasi {
     {
         self.initialize()?;
 
-        let mut guard = self.predictor.lock().unwrap();
+        let mut guard = self.predictor.lock().unwrap_or_else(|e| e.into_inner());
         let predictor = guard.as_mut().ok_or_else(|| KizzasiError::InvalidState {
             reason: "Predictor initialization failed".into(),
             recovery: Some("Check configuration and try again".into()),
@@ -181,7 +184,7 @@ impl LazyKizzasi {
                 recovery: Some("Ensure no other threads are using this predictor".into()),
             })?
             .into_inner()
-            .unwrap()
+            .expect("mutex cannot be poisoned: single-owner via Arc::try_unwrap")
             .ok_or_else(|| KizzasiError::InvalidState {
                 reason: "Predictor not initialized".into(),
                 recovery: Some("Call initialize() first".into()),

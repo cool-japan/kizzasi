@@ -437,8 +437,8 @@ proptest! {
 
         let encoded = tokenizer.encode(&signal).unwrap();
 
-        // Encoded should have num_coeffs elements (quantized DCT coefficients)
-        prop_assert_eq!(encoded.len(), num_coeffs);
+        // Encoded has token[0] = max_val header, followed by num_coeffs quantized values.
+        prop_assert_eq!(encoded.len(), num_coeffs + 1);
     }
 
     /// Property: Fourier tokenizer should produce correct encoding dimension

@@ -11,10 +11,11 @@ members = [
     "crates/kizzasi-macros",
     "crates/kizzasi-python",
     "crates/kizzasi-embedded",
+    "crates/kizzasi-webgpu",
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/kizzasi"
@@ -23,32 +24,33 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 # Internal crates
-kizzasi = { path = "crates/kizzasi", version = "0.2.1" }
-kizzasi-core = { path = "crates/kizzasi-core", version = "0.2.1" }
-kizzasi-model = { path = "crates/kizzasi-model", version = "0.2.1" }
-kizzasi-tokenizer = { path = "crates/kizzasi-tokenizer", version = "0.2.1" }
-kizzasi-inference = { path = "crates/kizzasi-inference", version = "0.2.1" }
-kizzasi-logic = { path = "crates/kizzasi-logic", version = "0.2.1" }
-kizzasi-io = { path = "crates/kizzasi-io", version = "0.2.1" }
-kizzasi-macros = { path = "crates/kizzasi-macros", version = "0.2.1" }
+kizzasi = { path = "crates/kizzasi", version = "0.2.2" }
+kizzasi-core = { path = "crates/kizzasi-core", version = "0.2.2" }
+kizzasi-model = { path = "crates/kizzasi-model", version = "0.2.2" }
+kizzasi-tokenizer = { path = "crates/kizzasi-tokenizer", version = "0.2.2" }
+kizzasi-inference = { path = "crates/kizzasi-inference", version = "0.2.2" }
+kizzasi-logic = { path = "crates/kizzasi-logic", version = "0.2.2" }
+kizzasi-io = { path = "crates/kizzasi-io", version = "0.2.2" }
+kizzasi-macros = { path = "crates/kizzasi-macros", version = "0.2.2" }
+kizzasi-webgpu = { path = "crates/kizzasi-webgpu", version = "0.2.2" }
+wgpu = { version = "30" }
 
 # ============================================
 # COOLJAPAN Ecosystem Dependencies
 # ============================================
 # Following KIZZASI_POLICY.md - use scirs2 abstractions
-scirs2-core = { version = "0.4.2", features = ["array", "random", "simd", "parallel"] }
-scirs2-linalg = { version = "0.4.2", features = ["simd", "parallel"] }
-scirs2-signal = { version = "0.4.2" }
-scirs2-fft = { version = "0.4.2" }
-scirs2-series = { version = "0.4.2" }
-# tensorlogic-ir = { version = "0.1.0" } # for future usage
+scirs2-core = { version = "0.6.5", features = ["array", "random", "simd", "parallel"] }
+scirs2-linalg = { version = "0.6.5", features = ["simd", "parallel"] }
+scirs2-signal = { version = "0.6.5" }
+scirs2-fft = { version = "0.6.5" }
+scirs2-series = { version = "0.6.5" }
+tensorlogic-ir = { version = "0.1.1" }
 
 # Core dependencies
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-num-complex = "0.4"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -59,7 +61,7 @@ async-trait = "0.1"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-oxicode = { version = "0.2", features = ["serde"] }
+oxicode = { version = "0.2.6", features = ["serde"] }
 rmp-serde = "1"
 
 # Time handling
@@ -70,7 +72,7 @@ rayon = "1"
 
 # ML Backend (Candle) - each crate will specify target-specific candle dependencies
 # to avoid pulling cudarc on macOS (CUDA not supported on macOS)
-safetensors = "0.7"
+safetensors = "0.8"
 half = "2"
 
 # HTTP client for HuggingFace Hub integration
@@ -79,10 +81,10 @@ sha2 = "0.11"
 
 # IO connectors
 rumqttc = { package = "rumqttc-v4-next", version = "0.30" }
-cpal = "0.17"
-oxifft = "0.3"
+cpal = "0.18"
+oxifft = "0.4.2"
 tokio-tungstenite = "0.29"
-tokio-serial = "5.4"
+tokio-serial = "5.5"
 hound = "3.5"
 csv = "1.4"
 hdf5 = "0.8"
@@ -99,7 +101,7 @@ http-body = "1"
 tower-service = "0.3"
 axum = { version = "0.8", features = ["json"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 
 # Benchmarking
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -108,7 +110,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1"
 
 # Python bindings
-pyo3 = { version = "0.28", features = ["abi3-py310"] }
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
 
 # Additional dependencies used by subcrates
 async-stream = "0.3"
@@ -120,8 +122,8 @@ toml = "1.1"
 serde_yaml = "0.9"
 
 # OxiRS dependencies (from crates.io)
-oxirs-core = "0.2.4"
-oxirs-gql = "0.2.4"
+oxirs-core = "0.4.1"
+oxirs-gql = "0.4.1"
 
 [profile.release]
 lto = true

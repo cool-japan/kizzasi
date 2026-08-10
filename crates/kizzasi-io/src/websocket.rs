@@ -259,23 +259,44 @@ impl WebSocketStream {
     }
 
     /// Start ping task
-    pub fn start_ping_task(&self) -> tokio::task::JoinHandle<()> {
+    pub fn start_ping_task(
+        &self,
+    ) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<()>) {
         let url = self.config.url.clone();
         let ping_interval = Duration::from_millis(self.config.ping_interval_ms);
 
-        tokio::spawn(async move {
+        let (ping_tx, ping_rx) = tokio::sync::mpsc::channel::<()>(16);
+
+        let handle = tokio::spawn(async move {
             if ping_interval.as_millis() == 0 {
                 return;
             }
 
             let mut ticker = interval(ping_interval);
+            // skip the immediate first tick
+            ticker.tick().await;
             loop {
                 ticker.tick().await;
                 debug!("Ping interval elapsed for {}", url);
-                // Note: actual ping sending would need access to the WebSocket
-                // This is a placeholder for keepalive logic
+                if ping_tx.send(()).await.is_err() {
+                    // Receiver dropped, stop task
+                    break;
+                }
             }
-        })
+        });
+
+        (handle, ping_rx)
+    }
+
+    /// Drain pending ping signals and send actual WebSocket pings
+    pub async fn check_ping_signal(
+        &mut self,
+        ping_rx: &mut tokio::sync::mpsc::Receiver<()>,
+    ) -> IoResult<()> {
+        while let Ok(()) = ping_rx.try_recv() {
+            self.ping().await?;
+        }
+        Ok(())
     }
 
     /// Close the WebSocket connection
@@ -320,10 +341,73 @@ mod tests {
             buffer_size: 2048,
         };
 
-        let json = serde_json::to_string(&config).unwrap();
-        let deserialized: WebSocketConfig = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&config).expect("serialization should succeed");
+        let deserialized: WebSocketConfig =
+            serde_json::from_str(&json).expect("deserialization should succeed");
 
         assert_eq!(deserialized.url, config.url);
         assert_eq!(deserialized.reconnect, config.reconnect);
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn test_ping_task_sends_real_ping() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+        use tokio_tungstenite::tungstenite::protocol::Message as TtMessage;
+
+        // Bind to port 0 — OS assigns a free port
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind to local port");
+        let addr = listener.local_addr().expect("should have local addr");
+
+        // Spawn server task
+        let server_handle = tokio::spawn(async move {
+            let (tcp_stream, _peer) = listener.accept().await.expect("should accept connection");
+            let mut ws_server = accept_async(tcp_stream)
+                .await
+                .expect("WebSocket handshake should succeed");
+
+            // Read one message from the client and return it
+            ws_server
+                .next()
+                .await
+                .expect("should receive a message")
+                .expect("message should not be an error")
+        });
+
+        // Connect client
+        let ws_url = format!("ws://{}", addr);
+        let config = WebSocketConfig {
+            url: ws_url,
+            ping_interval_ms: 50, // short interval for the test
+            reconnect: false,
+            ..WebSocketConfig::default()
+        };
+        let mut client = WebSocketStream::connect(config)
+            .await
+            .expect("client should connect");
+
+        // Start ping task (50 ms interval)
+        let (_handle, mut ping_rx) = client.start_ping_task();
+
+        // Wait for slightly more than one tick so the channel has a signal
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // Drain the signal and send the actual ping
+        client
+            .check_ping_signal(&mut ping_rx)
+            .await
+            .expect("check_ping_signal should succeed");
+
+        // Collect what the server saw
+        let received = server_handle.await.expect("server task should complete");
+
+        assert!(
+            matches!(received, TtMessage::Ping(_)),
+            "expected Ping message, got {:?}",
+            received
+        );
     }
 }

@@ -13,7 +13,7 @@
 //! - Fault recovery in control systems
 //! - Interactive constraint debugging
 
-use crate::constraint::Constraint;
+use crate::constraint::{BoundType, Constraint};
 use crate::error::{LogicError, LogicResult};
 use scirs2_core::ndarray::Array1;
 
@@ -253,10 +253,15 @@ impl ConstraintRepairer {
         let mut total_slack = 0.0;
 
         for (i, constraint) in constraints.iter().enumerate() {
+            // Use the dimension the constraint governs, clamped to a valid index.
+            let dim = constraint
+                .dimension()
+                .unwrap_or(0)
+                .min(point.len().saturating_sub(1));
             let violation = if point.is_empty() {
                 0.0
             } else {
-                constraint.violation(point[0])
+                constraint.violation(point[dim])
             };
             if violation > self.tolerance {
                 let slack = violation.min(self.max_relaxation);
@@ -297,28 +302,37 @@ impl ConstraintRepairer {
             // Compute gradient to reduce violations
             for (&idx, &slack) in relaxed.iter().zip(slacks.iter()) {
                 let x_slice: Vec<f32> = x.iter().copied().collect();
+
+                // Determine which dimension this constraint governs.
+                // Fall back to 0 when no dimension is tagged, but clamp to
+                // the last valid index to guard against empty slices.
+                let dim = constraints[idx]
+                    .dimension()
+                    .unwrap_or(0)
+                    .min(x_slice.len().saturating_sub(1));
+
                 let violation = if x_slice.is_empty() {
                     0.0
                 } else {
-                    constraints[idx].violation(x_slice[0])
+                    constraints[idx].violation(x_slice[dim])
                 };
 
-                if violation > slack + self.tolerance {
-                    // Numerical gradient
+                // Elastic programming seeks to drive violations toward zero
+                // even when the current violation is below the initial slack
+                // budget.  The slack represents the *allowed* soft-constraint
+                // headroom, but we still descend as long as any violation exists.
+                if violation > self.tolerance {
+                    // Numerical gradient – only dimension `dim` contributes a
+                    // nonzero finite difference for a scalar-indexed constraint.
                     let eps = 1e-5;
-                    for i in 0..x.len() {
-                        let mut x_plus = x_slice.clone();
-                        x_plus[i] += eps;
-                        let viol_plus = if x_plus.is_empty() {
-                            0.0
-                        } else {
-                            constraints[idx].violation(x_plus[0])
-                        };
+                    let mut x_plus = x_slice.clone();
+                    x_plus[dim] += eps;
+                    let viol_plus = constraints[idx].violation(x_plus[dim]);
 
-                        gradient[i] += (viol_plus - violation) / eps;
-                    }
+                    gradient[dim] += (viol_plus - violation) / eps;
                     improved = true;
                 }
+                let _ = slack; // slack is used by the caller to report relaxation amounts
             }
 
             if !improved {
@@ -449,6 +463,88 @@ impl Default for IISFinder {
     }
 }
 
+/// A one-sided bound (lower or upper) of an interval, with strictness.
+#[derive(Clone, Copy)]
+struct OneSidedBound {
+    value: f32,
+    /// true = closed (≤ or ≥), false = open (< or >)
+    inclusive: bool,
+}
+
+/// Extract the feasible interval [lower, upper] for a `Constraint`.
+///
+/// Returns `(lower_bound, upper_bound)` where `None` means unbounded
+/// (−∞ for lower, +∞ for upper).
+fn feasible_interval(c: &Constraint) -> (Option<OneSidedBound>, Option<OneSidedBound>) {
+    match c.bound() {
+        BoundType::LessThan(b) => (
+            None,
+            Some(OneSidedBound {
+                value: *b,
+                inclusive: false,
+            }),
+        ),
+        BoundType::LessEq(b) => (
+            None,
+            Some(OneSidedBound {
+                value: *b,
+                inclusive: true,
+            }),
+        ),
+        BoundType::GreaterThan(b) => (
+            Some(OneSidedBound {
+                value: *b,
+                inclusive: false,
+            }),
+            None,
+        ),
+        BoundType::GreaterEq(b) => (
+            Some(OneSidedBound {
+                value: *b,
+                inclusive: true,
+            }),
+            None,
+        ),
+        BoundType::Equal(v, tol) => (
+            Some(OneSidedBound {
+                value: v - tol,
+                inclusive: true,
+            }),
+            Some(OneSidedBound {
+                value: v + tol,
+                inclusive: true,
+            }),
+        ),
+        BoundType::InRange(lo, hi) => (
+            Some(OneSidedBound {
+                value: *lo,
+                inclusive: true,
+            }),
+            Some(OneSidedBound {
+                value: *hi,
+                inclusive: true,
+            }),
+        ),
+    }
+}
+
+/// Return `true` when upper bound `hi` is strictly less than lower bound `lo`,
+/// meaning the intervals are disjoint.
+///
+/// Strict disjointness:
+/// - If both bounds are inclusive: hi < lo
+/// - If either bound is exclusive: hi <= lo (since hi and lo cannot both be reached)
+fn intervals_disjoint(
+    hi: OneSidedBound, // upper bound of the first interval
+    lo: OneSidedBound, // lower bound of the second interval
+) -> bool {
+    if hi.value < lo.value {
+        return true;
+    }
+    // hi.value == lo.value: disjoint iff at least one bound is exclusive
+    hi.value == lo.value && !(hi.inclusive && lo.inclusive)
+}
+
 /// Conflict resolution for constraint sets
 pub struct ConflictResolver {
     /// Strategy for resolving conflicts
@@ -485,12 +581,11 @@ impl ConflictResolver {
     pub fn find_conflicts(&self, constraints: &[Constraint]) -> Vec<(usize, usize)> {
         let mut conflicts = Vec::new();
 
-        // Simplified conflict detection: check if constraints are incompatible
-        // In practice, this would involve more sophisticated analysis
+        // Structural conflict detection: pairs whose feasible intervals are
+        // geometrically disjoint on the same variable cannot be satisfied
+        // simultaneously.
         for i in 0..constraints.len() {
             for j in (i + 1)..constraints.len() {
-                // Check if constraints i and j might conflict
-                // This is a placeholder - real implementation would be more sophisticated
                 if self.might_conflict(&constraints[i], &constraints[j]) {
                     conflicts.push((i, j));
                 }
@@ -500,10 +595,46 @@ impl ConflictResolver {
         conflicts
     }
 
-    /// Check if two constraints might conflict
-    fn might_conflict(&self, _c1: &Constraint, _c2: &Constraint) -> bool {
-        // Placeholder: would analyze constraint structure
-        // For now, conservatively return false
+    /// Detect structural conflicts between two constraints by checking whether
+    /// their feasible intervals on the same variable are geometrically disjoint.
+    ///
+    /// Detected cases:
+    /// - Disjoint bound pairs: e.g. x ≥ 10 and x ≤ 5 on the same dimension
+    /// - Strict boundary contradictions: x < 5 and x > 5
+    /// - Equality contradictions: x == 3 (±0.01) and x == 7 (±0.01)
+    /// - InRange intervals that do not overlap
+    ///
+    /// Conservative: returns `false` for constraints on different dimensions or
+    /// when feasibility cannot be determined from structure alone.
+    fn might_conflict(&self, c1: &Constraint, c2: &Constraint) -> bool {
+        // If both constraints name an explicit dimension and they differ,
+        // they constrain independent variables — no pairwise conflict possible.
+        if let (Some(d1), Some(d2)) = (c1.dimension(), c2.dimension()) {
+            if d1 != d2 {
+                return false;
+            }
+        }
+
+        let (lo1, hi1) = feasible_interval(c1);
+        let (lo2, hi2) = feasible_interval(c2);
+
+        // Check: does [lo1, hi1] ∩ [lo2, hi2] = ∅ ?
+        //
+        // Disjoint if hi1 < lo2  OR  hi2 < lo1
+        // (where "less than" respects strictness of the bounds)
+
+        if let (Some(hi), Some(lo)) = (hi1, lo2) {
+            if intervals_disjoint(hi, lo) {
+                return true;
+            }
+        }
+
+        if let (Some(hi), Some(lo)) = (hi2, lo1) {
+            if intervals_disjoint(hi, lo) {
+                return true;
+            }
+        }
+
         false
     }
 }
@@ -659,5 +790,178 @@ mod tests {
 
         // Repair cost should reflect the violation amount
         assert!(result.repair_cost > 0.0);
+    }
+
+    /// Verify that the gradient-descent repair moves the **tagged** dimension
+    /// toward feasibility while leaving unrelated dimensions unchanged.
+    ///
+    /// Before the fix, `compute_repaired_point` always perturbed `x_plus[0]`
+    /// and read back `x_plus[0]`, producing a zero gradient for `i > 0`, so
+    /// dimension 1 was never updated.
+    #[test]
+    fn test_suggestions_move_tagged_dimension() {
+        // 2-D initial: dim-0 = 0.0 (feasible), dim-1 = 3.0 (violates x <= 1.0)
+        let initial = vec![0.0_f32, 3.0_f32];
+
+        let constraint = ConstraintBuilder::new()
+            .name("upper_dim1")
+            .dimension(1)
+            .less_than(1.0)
+            .build()
+            .expect("constraint build failed");
+
+        let repairer = ConstraintRepairer::new(RepairStrategy::ElasticProgramming);
+        let result = repairer
+            .repair(&initial, &[constraint], None)
+            .expect("repair failed");
+
+        let repaired = result.repaired_point.expect("expected a repaired point");
+
+        // Dimension 1 must have moved toward the bound (< 2.9 means meaningful progress)
+        assert!(
+            repaired[1] < 2.9,
+            "dim-1 should have moved toward 1.0, got {}",
+            repaired[1]
+        );
+        // Dimension 0 must stay at 0.0 – the constraint never touches it
+        assert!(
+            (repaired[0] - 0.0_f32).abs() < 1e-4,
+            "dim-0 should remain ~0.0, got {}",
+            repaired[0]
+        );
+    }
+
+    /// Regression: a 1-D constraint with no dimension tag (defaults to dim-0)
+    /// must still drive the repair toward feasibility.
+    #[test]
+    fn test_suggestions_dimension_zero_regression() {
+        let initial = vec![3.0_f32];
+
+        let constraint = ConstraintBuilder::new()
+            .name("upper_dim0")
+            .less_than(1.0)
+            .build()
+            .expect("constraint build failed");
+
+        let repairer = ConstraintRepairer::new(RepairStrategy::ElasticProgramming);
+        let result = repairer
+            .repair(&initial, &[constraint], None)
+            .expect("repair failed");
+
+        let repaired = result.repaired_point.expect("expected a repaired point");
+
+        assert!(
+            repaired[0] < 3.0,
+            "dim-0 should have moved toward 1.0, got {}",
+            repaired[0]
+        );
+    }
+
+    #[test]
+    fn test_conflict_detection_disjoint_bounds() {
+        // x >= 10 and x <= 5 on the same dimension — clearly infeasible
+        let resolver = ConflictResolver::new(RepairStrategy::MinimalRelaxation);
+        let c1 = ConstraintBuilder::new()
+            .name("lb")
+            .greater_eq(10.0)
+            .build()
+            .unwrap();
+        let c2 = ConstraintBuilder::new()
+            .name("ub")
+            .less_eq(5.0)
+            .build()
+            .unwrap();
+        let conflicts = resolver.find_conflicts(&[c1, c2]);
+        assert!(
+            !conflicts.is_empty(),
+            "disjoint bounds should be detected as conflict"
+        );
+        assert_eq!(conflicts[0], (0, 1));
+    }
+
+    #[test]
+    fn test_conflict_detection_compatible() {
+        // x >= 1 and x <= 10 — feasible
+        let resolver = ConflictResolver::new(RepairStrategy::MinimalRelaxation);
+        let c1 = ConstraintBuilder::new()
+            .name("lb")
+            .greater_eq(1.0)
+            .build()
+            .unwrap();
+        let c2 = ConstraintBuilder::new()
+            .name("ub")
+            .less_eq(10.0)
+            .build()
+            .unwrap();
+        let conflicts = resolver.find_conflicts(&[c1, c2]);
+        assert!(
+            conflicts.is_empty(),
+            "compatible bounds must not be flagged as conflict"
+        );
+    }
+
+    #[test]
+    fn test_conflict_detection_equality_contradiction() {
+        // x == 3.0 (tol=0.01) and x == 7.0 (tol=0.01) — infeasible
+        let resolver = ConflictResolver::new(RepairStrategy::MinimalRelaxation);
+        let c1 = ConstraintBuilder::new()
+            .name("eq1")
+            .equal(3.0, 0.01)
+            .build()
+            .unwrap();
+        let c2 = ConstraintBuilder::new()
+            .name("eq2")
+            .equal(7.0, 0.01)
+            .build()
+            .unwrap();
+        let conflicts = resolver.find_conflicts(&[c1, c2]);
+        assert!(
+            !conflicts.is_empty(),
+            "contradictory equalities should be detected as conflict"
+        );
+    }
+
+    #[test]
+    fn test_conflict_detection_strict_bounds_at_boundary() {
+        // x < 5.0 and x > 5.0 — no x satisfies both (strict gap at boundary)
+        let resolver = ConflictResolver::new(RepairStrategy::MinimalRelaxation);
+        let c1 = ConstraintBuilder::new()
+            .name("strict_ub")
+            .less_than(5.0)
+            .build()
+            .unwrap();
+        let c2 = ConstraintBuilder::new()
+            .name("strict_lb")
+            .greater_than(5.0)
+            .build()
+            .unwrap();
+        let conflicts = resolver.find_conflicts(&[c1, c2]);
+        assert!(
+            !conflicts.is_empty(),
+            "strict boundary contradiction should be detected"
+        );
+    }
+
+    #[test]
+    fn test_no_conflict_different_dimensions() {
+        // x[0] >= 10 and x[1] <= 5 — on DIFFERENT dimensions, no conflict
+        let resolver = ConflictResolver::new(RepairStrategy::MinimalRelaxation);
+        let c1 = ConstraintBuilder::new()
+            .name("dim0_lb")
+            .dimension(0)
+            .greater_eq(10.0)
+            .build()
+            .unwrap();
+        let c2 = ConstraintBuilder::new()
+            .name("dim1_ub")
+            .dimension(1)
+            .less_eq(5.0)
+            .build()
+            .unwrap();
+        let conflicts = resolver.find_conflicts(&[c1, c2]);
+        assert!(
+            conflicts.is_empty(),
+            "constraints on different dimensions must not conflict"
+        );
     }
 }

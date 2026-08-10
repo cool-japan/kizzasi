@@ -14,7 +14,7 @@
 //!
 //! - "Simplified State Space Layers for Sequence Modeling" (Smith et al., 2023)
 
-use crate::{CoreError, CoreResult, HiddenState};
+use crate::{numerics::zoh_discretize, CoreError, CoreResult, HiddenState};
 use scirs2_core::ndarray::{s, Array1, Array2, Axis};
 use serde::{Deserialize, Serialize};
 
@@ -252,10 +252,11 @@ impl S5Layer {
         let mut a = Array2::zeros((d_state, d_state));
 
         for i in 0..d_state {
-            // Diagonal: negative values for stable dynamics
-            // Use log-uniform distribution for better coverage
+            // Diagonal: negative values for stable dynamics (Re(A) < 0 is required)
+            // log_lambda ∈ [-5, -1] so exp(log_lambda) ∈ (exp(-5), exp(-1)) > 0
+            // Negate to ensure a[i,i] < 0 — the SSM stability condition
             let log_lambda = -rng.random::<f32>() * 4.0 - 1.0; // Range: [-5, -1]
-            a[[i, i]] = log_lambda.exp();
+            a[[i, i]] = -log_lambda.exp(); // negative diagonal for stable dynamics
 
             // Add small off-diagonal elements for richer dynamics
             if i > 0 {
@@ -287,29 +288,9 @@ impl S5Layer {
         (a_bar_vec, b_bar_vec)
     }
 
-    /// Discretize a single block using zero-order hold (ZOH)
+    /// Discretize a single block using exact Zero-Order Hold (ZOH) via matrix exponential
     fn discretize_block(a: &Array2<f32>, b: &Array2<f32>, dt: f32) -> (Array2<f32>, Array2<f32>) {
-        let d_state = a.nrows();
-        let mut a_bar = Array2::zeros((d_state, d_state));
-        let mut b_bar = b.clone();
-
-        // For diagonal or near-diagonal A: A_bar = exp(A * dt)
-        // Simplified using element-wise exponential for efficiency
-        for i in 0..d_state {
-            for j in 0..d_state {
-                if i == j {
-                    a_bar[[i, j]] = (a[[i, j]] * dt).exp();
-                } else {
-                    // Off-diagonal: first-order approximation
-                    a_bar[[i, j]] = a[[i, j]] * dt;
-                }
-            }
-        }
-
-        // B_bar = (A_bar - I) * A^{-1} * B ≈ dt * B for small dt
-        b_bar *= dt;
-
-        (a_bar, b_bar)
+        zoh_discretize(a, b, dt)
     }
 
     /// Apply layer normalization
@@ -613,21 +594,148 @@ mod tests {
     fn test_discretization() {
         let a = Array2::from_shape_fn((4, 4), |(i, j)| if i == j { -0.5 } else { 0.0 });
         let b = Array2::from_shape_fn((4, 2), |_| 0.1);
-        let dt = 0.01;
+        let dt = 0.01_f32;
 
         let (a_bar, b_bar) = S5Layer::discretize_block(&a, &b, dt);
 
-        // A_bar diagonal should be close to exp(-0.5 * 0.01) ≈ 0.995
-        let expected_a = (-0.5 * dt).exp();
+        // A_bar diagonal must equal exp(a[i,i] * dt) = exp(-0.5 * 0.01) ≈ 0.99501
+        // zoh_discretize uses 8-term Taylor series which is exact to < 1e-5 here
+        let expected_a = (-0.5_f32 * dt).exp();
         for i in 0..4 {
-            assert!((a_bar[[i, i]] - expected_a).abs() < 1e-5);
+            assert!(
+                (a_bar[[i, i]] - expected_a).abs() < 1e-5,
+                "a_bar[{i},{i}]={} expected {}",
+                a_bar[[i, i]],
+                expected_a
+            );
         }
 
-        // B_bar should be approximately dt * B
+        // B_bar under ZOH: b_d = (I + A*dt/2) * B * dt
+        // For diagonal A = -0.5, dt = 0.01: scale = (1 - 0.5*0.01/2) = 0.9975
+        // So b_bar[i,j] = 0.9975 * 0.1 * 0.01 = 0.0009975
+        let expected_b = 0.9975_f32 * 0.1_f32 * dt;
         for i in 0..4 {
             for j in 0..2 {
-                assert!((b_bar[[i, j]] - 0.1 * dt).abs() < 1e-6);
+                assert!(
+                    (b_bar[[i, j]] - expected_b).abs() < 1e-5,
+                    "b_bar[{i},{j}]={} expected {}",
+                    b_bar[[i, j]],
+                    expected_b
+                );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stability correctness tests (Track 2 bug fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_s5_core_diagonal_negative_after_init() {
+        // Every diagonal of every continuous-time A matrix must be negative
+        // so that the eigenvalues have negative real parts (stability requirement)
+        let config = S5Config::new(4, 8, 4).with_dt(0.01);
+        let layer = S5Layer::new(config).expect("S5Layer::new failed");
+        for (block_idx, a) in layer.a_matrices.iter().enumerate() {
+            for i in 0..a.nrows() {
+                assert!(
+                    a[[i, i]] < 0.0,
+                    "a_matrices[{block_idx}][{i},{i}] = {} is not negative",
+                    a[[i, i]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_s5_core_a_bar_stable() {
+        // After ZOH discretization, diagonal of A_bar must be in (0, 1)
+        // This corresponds to exp(dt * a[i,i]) with a[i,i] < 0 and dt > 0
+        let config = S5Config::new(4, 8, 4).with_dt(0.01);
+        let layer = S5Layer::new(config).expect("S5Layer::new failed");
+        for (block_idx, a_bar) in layer.a_bar.iter().enumerate() {
+            let n = a_bar.nrows();
+            for i in 0..n {
+                let val = a_bar[[i, i]];
+                assert!(
+                    val > 0.0 && val < 1.0,
+                    "a_bar[{block_idx}][{i},{i}] = {val} not in (0,1)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_s5_core_state_decays() {
+        // With zero input, all hidden states must decay (not grow) over 200 steps.
+        // We use d_state=1 so each block is a 1×1 diagonal — no off-diagonal
+        // coupling can perturb stability, making the test deterministic.
+        // d_model=8, n_blocks=8 (default) => block_size=1
+        let config = S5Config::new(1, 8, 1).with_dt(0.01);
+        let mut layer = S5Layer::new(config).expect("S5Layer::new failed");
+
+        // Set all block states to 1.0
+        for state in &mut layer.hidden_states {
+            let shape = state.state().shape().to_vec();
+            let ones = Array2::ones((shape[0], shape[1]));
+            state.update(ones);
+        }
+
+        let initial_norm: f32 = layer
+            .hidden_states
+            .iter()
+            .flat_map(|s| {
+                let h = s.state();
+                h.iter().map(|&x| x * x).collect::<Vec<_>>()
+            })
+            .sum::<f32>()
+            .sqrt();
+
+        // 200 steps of zero input
+        let zero_input = Array1::zeros(1);
+        for _ in 0..200 {
+            layer.forward(&zero_input).expect("forward failed");
+        }
+
+        let final_norm: f32 = layer
+            .hidden_states
+            .iter()
+            .flat_map(|s| {
+                let h = s.state();
+                h.iter().map(|&x| x * x).collect::<Vec<_>>()
+            })
+            .sum::<f32>()
+            .sqrt();
+
+        assert!(
+            final_norm <= initial_norm + 1e-3,
+            "State grew from {} to {} — A_bar eigenvalues must be < 1",
+            initial_norm,
+            final_norm
+        );
+    }
+
+    #[test]
+    fn test_s5_core_zoh_matches_diagonal_formula() {
+        // For a purely diagonal A with negative entries,
+        // zoh_discretize a_bar[i,i] must equal exp(dt * A[i,i]) to high precision
+        use crate::numerics::zoh_discretize;
+        let dt = 0.01_f32;
+        let n = 4_usize;
+        let mut a = Array2::zeros((n, n));
+        for i in 0..n {
+            a[[i, i]] = -((i + 1) as f32); // strictly negative diagonal
+        }
+        let b = Array2::ones((n, 2));
+        let (a_bar, _) = zoh_discretize(&a, &b, dt);
+        for i in 0..n {
+            let expected = (dt * a[[i, i]]).exp();
+            let got = a_bar[[i, i]];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "a_bar[{i},{i}]={got} expected {expected} (diff {})",
+                (got - expected).abs()
+            );
         }
     }
 }

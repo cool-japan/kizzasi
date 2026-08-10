@@ -64,6 +64,7 @@ use crate::{AutoregressiveModel, ModelType};
 use kizzasi_core::{
     silu, CausalConv1d, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor,
 };
+use safetensors::tensor::{Dtype, TensorView};
 use scirs2_core::ndarray::{Array1, Array2};
 use scirs2_core::random::{rng, RngExt};
 #[allow(unused_imports)]
@@ -320,18 +321,20 @@ impl Mamba2Layer {
             // Compute A = exp(a_log) for this head (diagonal matrix)
             let a_diag = self.a_log.row(head).mapv(|x| x.exp());
 
-            // State update: h' = A * h + B * x
-            // Since A is diagonal, this is element-wise multiplication
+            // State update: h'[i,j] = A[j] * h[i,j] + x_head[i] * B_x[j]
+            // This is an outer-product recurrence: the head-local input x_head[i]
+            // scales the B projection b_x[j] for each state dimension j.
+            // A is diagonal, so a_diag[j] is the per-state-dim decay factor.
+            // a_diag.len() == state_dim by construction, so j is always a valid index.
             let mut new_h = Array2::zeros((self.head_dim, self.state_dim));
             for i in 0..self.head_dim.min(h.shape()[0]) {
+                let x_head_val = if head_start + i < x.len() {
+                    x[head_start + i]
+                } else {
+                    0.0
+                };
                 for j in 0..self.state_dim {
-                    // Diagonal A matrix: only scales the state
-                    let a_val = if j < a_diag.len() {
-                        a_diag[j]
-                    } else {
-                        0.99 // Default decay
-                    };
-                    new_h[[i, j]] = a_val * h[[i, j]] + b_x[j] * 0.01; // Small coupling
+                    new_h[[i, j]] = a_diag[j] * h[[i, j]] + x_head_val * b_x[j];
                 }
             }
 
@@ -743,10 +746,107 @@ impl Mamba2 {
         Ok(())
     }
 
-    /// Save weights to a SafeTensors model file (legacy stub — use `save_weights_json` instead).
-    #[allow(unused_variables)]
+    /// Save weights to a SafeTensors file at the given path.
+    ///
+    /// All model tensors are serialised as `F32` with little-endian byte order.
+    /// The resulting file can be re-loaded with any SafeTensors-compatible reader.
     pub fn save_weights(&self, path: &str) -> ModelResult<()> {
-        self.save_weights_json(path)
+        // Collect (name, raw_bytes, shape) for every tensor.
+        let mut entries: Vec<(String, Vec<u8>, Vec<usize>)> = Vec::new();
+
+        let f32_to_bytes =
+            |data: &[f32]| -> Vec<u8> { data.iter().flat_map(|f| f.to_le_bytes()).collect() };
+
+        entries.push((
+            "input_proj".to_string(),
+            f32_to_bytes(self.input_proj.as_slice().ok_or_else(|| {
+                ModelError::load_error("mamba2 save_weights", "input_proj is not contiguous")
+            })?),
+            vec![self.config.input_dim, self.config.hidden_dim],
+        ));
+
+        entries.push((
+            "output_proj".to_string(),
+            f32_to_bytes(self.output_proj.as_slice().ok_or_else(|| {
+                ModelError::load_error("mamba2 save_weights", "output_proj is not contiguous")
+            })?),
+            vec![self.config.hidden_dim, self.config.input_dim],
+        ));
+
+        let hidden_dim = self.config.hidden_dim;
+        let state_dim = self.config.state_dim;
+        let num_heads = self.config.num_heads;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+
+            entries.push((
+                format!("{}.a_log", prefix),
+                f32_to_bytes(layer.a_log.as_slice().ok_or_else(|| {
+                    ModelError::load_error("mamba2 save_weights", "a_log is not contiguous")
+                })?),
+                vec![num_heads, state_dim],
+            ));
+            entries.push((
+                format!("{}.b_proj", prefix),
+                f32_to_bytes(layer.b_proj.as_slice().ok_or_else(|| {
+                    ModelError::load_error("mamba2 save_weights", "b_proj is not contiguous")
+                })?),
+                vec![hidden_dim, state_dim],
+            ));
+            entries.push((
+                format!("{}.c_proj", prefix),
+                f32_to_bytes(layer.c_proj.as_slice().ok_or_else(|| {
+                    ModelError::load_error("mamba2 save_weights", "c_proj is not contiguous")
+                })?),
+                vec![hidden_dim, state_dim],
+            ));
+            entries.push((
+                format!("{}.d_skip", prefix),
+                f32_to_bytes(layer.d_skip.as_slice().ok_or_else(|| {
+                    ModelError::load_error("mamba2 save_weights", "d_skip is not contiguous")
+                })?),
+                vec![hidden_dim],
+            ));
+            entries.push((
+                format!("{}.gate_proj", prefix),
+                f32_to_bytes(layer.gate_proj.as_slice().ok_or_else(|| {
+                    ModelError::load_error("mamba2 save_weights", "gate_proj is not contiguous")
+                })?),
+                vec![hidden_dim, hidden_dim],
+            ));
+            entries.push((
+                format!("{}.out_proj", prefix),
+                f32_to_bytes(layer.out_proj.as_slice().ok_or_else(|| {
+                    ModelError::load_error("mamba2 save_weights", "out_proj is not contiguous")
+                })?),
+                vec![hidden_dim, hidden_dim],
+            ));
+        }
+
+        // Build TensorView references into the byte vecs we just collected.
+        let views: Vec<(String, TensorView<'_>)> = entries
+            .iter()
+            .map(|(name, bytes, shape)| {
+                let view =
+                    TensorView::new(Dtype::F32, shape.clone(), bytes.as_slice()).map_err(|e| {
+                        ModelError::load_error(
+                            "mamba2 save_weights",
+                            format!("TensorView error: {}", e),
+                        )
+                    })?;
+                Ok((name.clone(), view))
+            })
+            .collect::<ModelResult<Vec<_>>>()?;
+
+        safetensors::tensor::serialize_to_file(views, None, std::path::Path::new(path)).map_err(
+            |e| {
+                ModelError::load_error(
+                    "mamba2 save_weights",
+                    format!("safetensors write error: {}", e),
+                )
+            },
+        )
     }
 }
 
@@ -943,5 +1043,98 @@ mod tests {
         assert_eq!(reloaded.len(), 14, "unexpected number of weight keys");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_mamba2_ssd_input_sensitivity() {
+        // The same model, reset between runs, must produce different outputs for different inputs.
+        // Before the fix, `b_x[j] * 0.01` replaced `x_head_val * b_x[j]`, causing every
+        // head-local input value to be ignored — so x1 and x2 would produce identical outputs.
+        let config = Mamba2Config::new()
+            .hidden_dim(64)
+            .num_heads(4)
+            .state_dim(8)
+            .num_layers(2);
+        let mut model = Mamba2::new(config.clone()).expect("create model");
+        let x1 = Array1::from_vec(vec![1.0_f32; config.input_dim]);
+        let x2 = Array1::from_vec(vec![2.0_f32; config.input_dim]);
+        let out1 = model.step(&x1).expect("step 1");
+        model.reset();
+        let out2 = model.step(&x2).expect("step 2");
+        // Outputs must differ when inputs differ
+        let diff: f32 = out1
+            .iter()
+            .zip(out2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            diff > 1e-4,
+            "Outputs identical for different inputs (input ignored): diff={}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_mamba2_ssd_zero_input_decay() {
+        // With zero input, the state should decay toward zero and all steps must succeed.
+        let config = Mamba2Config::new()
+            .hidden_dim(64)
+            .num_heads(4)
+            .state_dim(8)
+            .num_layers(2);
+        let mut model = Mamba2::new(config.clone()).expect("create model");
+        // Drive with nonzero input to set state
+        let x_init = Array1::from_vec(vec![1.0_f32; config.input_dim]);
+        model.step(&x_init).expect("init step");
+        // Now drive with zero input for 10 steps — each step must succeed
+        let x_zero = Array1::zeros(config.input_dim);
+        for _ in 0..10 {
+            model.step(&x_zero).expect("zero step");
+        }
+    }
+
+    #[test]
+    fn test_mamba2_ssd_input_scales_output() {
+        // The same model, reset between runs, must produce different outputs for x vs 2x.
+        // Before the fix, scaling the input had no effect on the SSM state update.
+        let config = Mamba2Config::new()
+            .hidden_dim(64)
+            .num_heads(4)
+            .state_dim(8)
+            .num_layers(2);
+        let mut model = Mamba2::new(config.clone()).expect("create model");
+        let x = Array1::from_vec(vec![1.0_f32; config.input_dim]);
+        let x2 = Array1::from_vec(vec![2.0_f32; config.input_dim]);
+        let out1 = model.step(&x).expect("step x");
+        model.reset();
+        let out2 = model.step(&x2).expect("step 2x");
+        // Out(2x) should differ from Out(x) by more than noise
+        let diff: f32 = out1
+            .iter()
+            .zip(out2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(diff > 1e-4, "Scaling input had no effect: diff={}", diff);
+    }
+
+    #[test]
+    fn test_save_weights_roundtrip_safetensors() {
+        let config = Mamba2Config {
+            input_dim: 4,
+            hidden_dim: 8,
+            state_dim: 4,
+            num_layers: 1,
+            num_heads: 2,
+            ..Default::default()
+        };
+        let model = Mamba2::new(config).expect("model creation failed");
+        let tmp = std::env::temp_dir().join("test_mamba2_save_weights.safetensors");
+        model
+            .save_weights(tmp.to_str().expect("path to str"))
+            .expect("save_weights failed");
+        let data = std::fs::read(&tmp).expect("read file");
+        let tensors = safetensors::SafeTensors::deserialize(&data).expect("deserialize");
+        assert!(!tensors.names().is_empty(), "no tensors written");
+        std::fs::remove_file(&tmp).ok();
     }
 }

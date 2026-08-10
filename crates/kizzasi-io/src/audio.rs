@@ -228,7 +228,7 @@ impl AudioInput {
 
         let stream = device
             .build_input_stream(
-                &config,
+                config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     // Store interleaved samples
                     if let Ok(mut buf) = buffer.lock() {
@@ -426,7 +426,7 @@ impl AudioOutput {
 
         let stream = device
             .build_output_stream(
-                &config,
+                config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut buf = match buffer.lock() {
                         Ok(b) => b,

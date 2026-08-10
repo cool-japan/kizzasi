@@ -492,7 +492,7 @@ impl InspectionResult {
 #[derive(Debug, Clone, Copy, Default)]
 pub enum Colormap {
     #[default]
-    /// Blue → green → yellow (approximate viridis)
+    /// Perceptually-uniform blue→teal→yellow (matplotlib Viridis)
     Viridis,
     /// Red (violation) → green (satisfied)
     RdGn,
@@ -500,17 +500,40 @@ pub enum Colormap {
     Grayscale,
 }
 
+/// Piecewise-linear interpolation over 9 published Viridis reference anchors.
+/// At t=0 → (68,1,84); at t=0.5 → (33,145,140); at t=1 → (253,231,37).
+fn viridis_lerp(t: f64) -> (u8, u8, u8) {
+    const ANCHORS: [(f64, f64, f64); 9] = [
+        (68.0, 1.0, 84.0),
+        (71.0, 44.0, 122.0),
+        (59.0, 82.0, 139.0),
+        (44.0, 113.0, 142.0),
+        (33.0, 145.0, 140.0),
+        (53.0, 183.0, 121.0),
+        (94.0, 201.0, 98.0),
+        (162.0, 218.0, 55.0),
+        (253.0, 231.0, 37.0),
+    ];
+    let t = t.clamp(0.0, 1.0);
+    let idx_f = t * 8.0;
+    let lo = (idx_f as usize).min(7);
+    let hi = lo + 1;
+    let frac = idx_f - lo as f64;
+    let (r0, g0, b0) = ANCHORS[lo];
+    let (r1, g1, b1) = ANCHORS[hi];
+    (
+        (r0 + frac * (r1 - r0)).round() as u8,
+        (g0 + frac * (g1 - g0)).round() as u8,
+        (b0 + frac * (b1 - b0)).round() as u8,
+    )
+}
+
 impl Colormap {
     /// Map scalar value `t` in `[0, 1]` to an RGB triple.
     pub fn map(&self, t: f64) -> (u8, u8, u8) {
         let t = t.clamp(0.0, 1.0);
         match self {
-            Colormap::Viridis => {
-                let r = (255.0 * (t * t * t * 0.5 + t * 0.5)).min(255.0) as u8;
-                let g = (255.0 * (0.5 * (1.0 - (2.0 * t - 1.0).abs()))).min(255.0) as u8;
-                let b = (255.0 * ((1.0 - t) * 0.9)).min(255.0) as u8;
-                (r, g, b)
-            }
+            Colormap::Viridis => viridis_lerp(t),
             Colormap::RdGn => {
                 let r = (255.0 * (1.0 - t)).min(255.0) as u8;
                 let g = (255.0 * t).min(255.0) as u8;
@@ -1249,5 +1272,47 @@ mod tests {
         };
         let svg = render_violation_heatmap(&pts, &violations, &config);
         assert!(!svg.is_empty());
+    }
+
+    #[test]
+    fn test_viridis_endpoint_colors() {
+        // Reference anchors: t=0 → (68,1,84); t=1 → (253,231,37).
+        // The old ad-hoc polynomial gives (0,0,229) and (255,0,0) respectively — both wrong.
+        let (r0, g0, b0) = Colormap::Viridis.map(0.0);
+        assert!(
+            (r0 as i32 - 68).abs() <= 2
+                && (g0 as i32 - 1).abs() <= 2
+                && (b0 as i32 - 84).abs() <= 2,
+            "t=0 expected ≈(68,1,84), got ({},{},{})",
+            r0,
+            g0,
+            b0
+        );
+        let (r1, g1, b1) = Colormap::Viridis.map(1.0);
+        assert!(
+            (r1 as i32 - 253).abs() <= 2
+                && (g1 as i32 - 231).abs() <= 2
+                && (b1 as i32 - 37).abs() <= 2,
+            "t=1 expected ≈(253,231,37), got ({},{},{})",
+            r1,
+            g1,
+            b1
+        );
+    }
+
+    #[test]
+    fn test_viridis_midpoint_color() {
+        // Reference anchor at t=0.5 → (33,145,140).
+        // The old polynomial gives (≈191,127,128) — wrong by >100 units in red channel.
+        let (r, g, b) = Colormap::Viridis.map(0.5);
+        assert!(
+            (r as i32 - 33).abs() <= 3
+                && (g as i32 - 145).abs() <= 3
+                && (b as i32 - 140).abs() <= 3,
+            "t=0.5 expected ≈(33,145,140), got ({},{},{})",
+            r,
+            g,
+            b
+        );
     }
 }

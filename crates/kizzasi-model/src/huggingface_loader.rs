@@ -187,11 +187,22 @@ impl HuggingFaceModelLoader {
                 if let Ok(x_proj) = loader.load_array2(&hf_name) {
                     let (_intermediate_size, combined_dim) = x_proj.dim();
 
-                    // Try to infer dimensions (this is heuristic, may need config)
-                    // Common Mamba configs: dt_rank = 64, state_size = 16
-                    // So combined_dim = 64 + 16*2 = 96
-                    let state_size = 16; // TODO: Get from config
-                    let dt_rank = combined_dim - 2 * state_size;
+                    // Probe well-known Mamba state-size values (16, 32, 64, 128).
+                    // For each candidate, verify combined_dim = dt_rank + 2*state_size
+                    // with dt_rank > 0 and dt_rank being a power-of-two (Mamba always
+                    // uses power-of-two dt_rank).  The first match wins.
+                    let candidate_sizes: &[usize] = &[16, 32, 64, 128];
+                    let inferred = candidate_sizes.iter().find_map(|&ss| {
+                        if combined_dim > 2 * ss {
+                            let candidate_dt = combined_dim - 2 * ss;
+                            if candidate_dt.is_power_of_two() {
+                                return Some(ss);
+                            }
+                        }
+                        None
+                    });
+                    let state_size = inferred.unwrap_or(16);
+                    let dt_rank = combined_dim.saturating_sub(2 * state_size);
 
                     if dt_rank > 0 && dt_rank + 2 * state_size == combined_dim {
                         // Extract delta_proj

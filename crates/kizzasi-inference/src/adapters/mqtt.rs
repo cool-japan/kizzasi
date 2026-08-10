@@ -8,10 +8,14 @@ use super::{InferenceMessage, InferenceResponse, NetworkAdapter};
 use crate::error::{InferenceError, InferenceResult};
 use crate::streaming::StreamingEngine;
 use rumqttc::{AsyncClient, Broker, Event, EventLoop, MqttOptions, Packet, QoS};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tokio::sync::{oneshot, Mutex, RwLock};
+use tracing::{debug, error, info, warn};
+
+/// Default request timeout when waiting for an MQTT response.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// MQTT adapter for streaming inference
 pub struct MqttAdapter {
@@ -32,6 +36,12 @@ pub struct MqttAdapter {
 
     /// Running state
     running: Arc<RwLock<bool>>,
+
+    /// Pending request/response correlations.
+    ///
+    /// Maps a `request_id` to the oneshot channel that the `run()` loop will
+    /// complete when a matching response arrives on the output topic.
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<InferenceResponse>>>>,
 }
 
 impl MqttAdapter {
@@ -80,6 +90,7 @@ impl MqttAdapter {
             input_topic: input_topic.into(),
             output_topic: output_topic.into(),
             running: Arc::new(RwLock::new(false)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -103,20 +114,23 @@ impl MqttAdapter {
 
             match event {
                 Ok(Event::Incoming(Packet::Publish(publish))) => {
+                    let topic = String::from_utf8_lossy(&publish.topic).into_owned();
                     debug!(
                         "Received message on topic: {} ({} bytes)",
-                        String::from_utf8_lossy(&publish.topic),
+                        topic,
                         publish.payload.len()
                     );
 
-                    // Parse message
+                    // Parse message as an inference request.
                     let request: InferenceMessage = match serde_json::from_slice(&publish.payload) {
                         Ok(req) => req,
                         Err(e) => {
-                            error!("Failed to parse message: {}", e);
+                            error!("Failed to parse message on {}: {}", topic, e);
                             continue;
                         }
                     };
+
+                    let request_id = request.request_id.clone();
 
                     // Process inference
                     let start = std::time::Instant::now();
@@ -127,7 +141,7 @@ impl MqttAdapter {
                         match engine.step_async(input).await {
                             Ok(out) => out,
                             Err(e) => {
-                                error!("Inference error: {}", e);
+                                error!("Inference error for request {}: {}", request_id, e);
                                 continue;
                             }
                         }
@@ -137,17 +151,33 @@ impl MqttAdapter {
 
                     // Create response
                     let response = InferenceResponse::new(
-                        request.request_id,
+                        request_id.clone(),
                         output.to_vec(),
                         latency_ms,
                         output.len(),
                     );
 
-                    // Publish response
+                    // If there is a pending in-process caller waiting for this request_id,
+                    // resolve it directly via the oneshot channel — no MQTT round-trip needed.
+                    let pending_sender = {
+                        let mut pending = self.pending.lock().await;
+                        pending.remove(&request_id)
+                    };
+                    if let Some(tx) = pending_sender {
+                        if tx.send(response.clone()).is_err() {
+                            warn!(
+                                "Pending request {} was dropped before response could be delivered",
+                                request_id
+                            );
+                        }
+                    }
+
+                    // Also publish to the output topic so external MQTT subscribers
+                    // (if any) receive the response as well.
                     let payload = match serde_json::to_vec(&response) {
                         Ok(p) => p,
                         Err(e) => {
-                            error!("Failed to serialize response: {}", e);
+                            error!("Failed to serialize response for {}: {}", request_id, e);
                             continue;
                         }
                     };
@@ -157,11 +187,11 @@ impl MqttAdapter {
                         .publish(&self.output_topic, QoS::AtLeastOnce, false, payload)
                         .await
                     {
-                        error!("Failed to publish response: {}", e);
+                        error!("Failed to publish response for {}: {}", request_id, e);
                     }
                 }
                 Ok(Event::Incoming(_)) => {
-                    // Ignore other packet types
+                    // Ignore other packet types (ConnAck, SubAck, PingResp, etc.)
                 }
                 Ok(Event::Outgoing(_)) => {
                     // Ignore outgoing events
@@ -177,26 +207,66 @@ impl MqttAdapter {
         Ok(())
     }
 
-    /// Publish a single message and get response
+    /// Publish a single inference request and wait for the response.
+    ///
+    /// This method publishes to the `input_topic` so the [`Self::run`] loop can
+    /// process it, then awaits the response on an internal oneshot channel.
+    /// The call times out after the internal `REQUEST_TIMEOUT` (30 seconds).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::NetworkError`] if the publish fails,
+    /// or [`InferenceError::Timeout`] if no response arrives within the
+    /// deadline.
     pub async fn request(
         &self,
         input: Vec<f32>,
         request_id: &str,
     ) -> InferenceResult<InferenceResponse> {
+        // Register a oneshot channel *before* publishing so there is no window
+        // in which a very fast run() loop could respond before we register.
+        let (tx, rx) = oneshot::channel::<InferenceResponse>();
+        {
+            let mut pending = self.pending.lock().await;
+            pending.insert(request_id.to_string(), tx);
+        }
+
+        // Build and publish the inference request.
         let msg = InferenceMessage::new(request_id, input);
         let payload = serde_json::to_vec(&msg)
             .map_err(|e| InferenceError::SerializationError(e.to_string()))?;
 
-        self.client
+        if let Err(e) = self
+            .client
             .publish(&self.input_topic, QoS::AtLeastOnce, false, payload)
             .await
-            .map_err(|e| InferenceError::NetworkError(e.to_string()))?;
+        {
+            // Clean up the pending entry if the publish fails.
+            let mut pending = self.pending.lock().await;
+            pending.remove(request_id);
+            return Err(InferenceError::NetworkError(e.to_string()));
+        }
 
-        // Note: In a real implementation, you would need to set up a response handler
-        // This is a simplified version
-        Err(InferenceError::NotImplemented(
-            "Response handling not implemented in this example".to_string(),
-        ))
+        // Wait for run() to dispatch the response via the oneshot channel.
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => {
+                // The sender was dropped (run() exited or encountered an error).
+                Err(InferenceError::NetworkError(
+                    "Response channel closed before response was delivered".to_string(),
+                ))
+            }
+            Err(_timeout) => {
+                // Timed out — remove the stale pending entry.
+                let mut pending = self.pending.lock().await;
+                pending.remove(request_id);
+                Err(InferenceError::Timeout(format!(
+                    "No response for request {} within {}s",
+                    request_id,
+                    REQUEST_TIMEOUT.as_secs()
+                )))
+            }
+        }
     }
 }
 

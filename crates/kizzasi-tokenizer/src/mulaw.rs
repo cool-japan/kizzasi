@@ -61,7 +61,9 @@ impl MuLawCodec {
     pub fn quantize(&self, x: f32) -> i32 {
         let encoded = self.encode_sample(x);
         let half_levels = (self.levels / 2) as f32;
-        ((encoded + 1.0) * half_levels).round() as i32
+        ((encoded + 1.0) * half_levels)
+            .round()
+            .clamp(0.0, (self.levels - 1) as f32) as i32
     }
 
     /// Dequantize from integer level
@@ -127,7 +129,19 @@ mod tests {
         assert_eq!(level, 0);
 
         let level = codec.quantize(1.0);
-        assert_eq!(level, 256);
+        assert_eq!(level, 255);
+    }
+
+    #[test]
+    fn test_mulaw_quantize_within_vocab() {
+        let codec = MuLawCodec::new(8);
+        // Boundary values must be within vocab
+        assert!((codec.quantize(1.0) as usize) < codec.vocab_size());
+        assert!((codec.quantize(-1.0) as usize) < codec.vocab_size());
+        // Mid-range values unchanged from before
+        assert_eq!(codec.quantize(0.0), 128);
+        assert_eq!(codec.quantize(-1.0), 0);
+        assert_eq!(codec.quantize(1.0), 255);
     }
 
     #[test]

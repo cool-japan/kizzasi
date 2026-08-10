@@ -89,16 +89,39 @@ where
 
 /// Work-efficient parallel scan implementation
 ///
-/// NOTE: Currently uses sequential implementation.
-/// Parallel version will be implemented when scirs2-core parallel API is stable.
+/// Uses `scirs2_core::distributed::parallel_scan::parallel_scan` (Blelloch
+/// three-phase algorithm) when the associative operation has a known identity
+/// element. Otherwise falls back to a sequential scan, since the scirs2
+/// API requires an identity for its tile-reduction phase.
 fn parallel_scan_impl<T, Op>(data: &[T], op: &Op) -> Vec<T>
 where
     T: Clone + Send + Sync,
     Op: AssociativeOp<T>,
 {
-    // For now, use sequential scan
-    // TODO: Implement true parallel Blelloch scan when scirs2-core API is ready
-    sequential_scan(data, op)
+    // Hot path: emit a debug-level span so the parallel scan kernel can be
+    // identified in tracing-subscriber output. We log only the input length;
+    // logging the actual data would be prohibitively expensive on long
+    // sequences (and is mostly noise for profiling).
+    let _span = tracing::debug_span!("parallel_scan_impl", len = data.len()).entered();
+    // Take a reference to op that is Copy (and therefore Clone), so it can be
+    // captured by the closure required by scirs2_core::distributed::parallel_scan.
+    // The closure itself becomes Copy + Clone because it captures only a shared
+    // reference (&Op is Copy).
+    match op.identity() {
+        Some(identity) => {
+            let op_ref = op;
+            let op_closure = move |a: T, b: T| op_ref.combine(&a, &b);
+            scirs2_core::distributed::parallel_scan::parallel_scan(data, identity, op_closure)
+        }
+        None => {
+            // Without an identity, scirs2's parallel_scan cannot be used directly:
+            // its tile-reduction phase initializes each tile accumulator with
+            // `identity`. We fall back to the sequential implementation, which
+            // is still correct (and the common case for SSMScanOp where the
+            // identity depends on per-element shape).
+            sequential_scan(data, op)
+        }
+    }
 }
 
 /// SSM Scan Element: (A_bar, B_bar) for diagonal SSM
@@ -149,6 +172,15 @@ pub fn parallel_ssm_scan(
     parallel_config: &ParallelConfig,
 ) -> CoreResult<Array2<f32>> {
     let (seq_len, state_dim) = a_bars.dim();
+    // Per-call top-level span: one per SSM scan invocation. Records the
+    // sequence length and state dimension so trace consumers can spot
+    // which call corresponds to which input shape.
+    let _span = tracing::debug_span!(
+        "parallel_ssm_scan",
+        seq_len = seq_len,
+        state_dim = state_dim,
+    )
+    .entered();
 
     if b_bars.dim() != (seq_len, state_dim) {
         return Err(CoreError::DimensionMismatch {
@@ -205,6 +237,16 @@ pub fn parallel_ssm_batch(
     parallel_config: &ParallelConfig,
 ) -> CoreResult<Array2<f32>> {
     let (batch_size, seq_len, state_dim) = a_bars.dim();
+    // Batched SSM forward: span records batch_size, seq_len, state_dim so a
+    // trace can distinguish small "latency" batches from large training
+    // batches at a glance.
+    let _span = tracing::debug_span!(
+        "parallel_ssm_batch",
+        batch_size = batch_size,
+        seq_len = seq_len,
+        state_dim = state_dim,
+    )
+    .entered();
 
     if b_bars.dim() != (batch_size, seq_len, state_dim) {
         return Err(CoreError::InvalidConfig(
@@ -212,16 +254,22 @@ pub fn parallel_ssm_batch(
         ));
     }
 
-    // Process each batch item
-    // TODO: Use scirs2-core parallel when API is stable
-    let outputs: Vec<Array1<f32>> = (0..batch_size)
-        .map(|b| {
+    // Process each batch item in parallel via scirs2-core's parallel_ops layer.
+    // When the `parallel` feature is enabled (default in this crate), this
+    // dispatches to rayon under the hood; otherwise it falls back to a
+    // sequential iterator. We collect into a `CoreResult<Vec<_>>` so a scan
+    // failure on any batch element propagates instead of being swallowed.
+    use scirs2_core::parallel_ops::{IntoParallelIterator, ParallelIterator};
+
+    let outputs: CoreResult<Vec<Array1<f32>>> = (0..batch_size)
+        .into_par_iter()
+        .map(|b| -> CoreResult<Array1<f32>> {
             // Get this batch's A and B
             let a_batch = a_bars.slice(s![b, .., ..]).to_owned();
             let b_batch = b_bars.slice(s![b, .., ..]).to_owned();
 
             // Perform scan for this sequence
-            let states = parallel_ssm_scan(&a_batch, &b_batch, c, parallel_config).unwrap();
+            let states = parallel_ssm_scan(&a_batch, &b_batch, c, parallel_config)?;
 
             // Compute outputs: y_t = C · h_t + D · x_t
             // (for simplicity, assuming D*x is already included in b_bar)
@@ -231,9 +279,11 @@ pub fn parallel_ssm_batch(
                 output[t] = c.dot(&h_t) + d;
             }
 
-            output
+            Ok(output)
         })
         .collect();
+
+    let outputs = outputs?;
 
     // Stack into output array
     let mut result = Array2::zeros((batch_size, seq_len));
@@ -421,5 +471,140 @@ mod tests {
 
         let result = parallel_scan(&data, &op, true);
         assert_eq!(result, vec![42.0]);
+    }
+
+    #[test]
+    fn test_parallel_scan_matches_sequential() {
+        // Exercise the scirs2-core Blelloch path: length 1024 forces the
+        // local parallel_scan into parallel_scan_impl (>= 64) and crosses
+        // scirs2-core's SEQUENTIAL_THRESHOLD boundary.
+        //
+        // We use integer-valued f32s so that summation is exact regardless
+        // of evaluation order; this lets us assert bit-exact equality
+        // between the parallel and sequential implementations.
+        let len = 1024usize;
+        let data: Vec<f32> = (0..len).map(|i| (i % 128) as f32).collect();
+        let op = AddOp;
+
+        let parallel_result = parallel_scan(&data, &op, true);
+        let sequential_result = sequential_scan(&data, &op);
+
+        assert_eq!(parallel_result.len(), sequential_result.len());
+        assert_eq!(parallel_result.len(), len);
+
+        // Bit-exact (no rounding) comparison — possible because all inputs
+        // and partial sums fit exactly in f32 mantissa.
+        for (i, (p, s)) in parallel_result
+            .iter()
+            .zip(sequential_result.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                p.to_bits(),
+                s.to_bits(),
+                "mismatch at index {}: parallel={} sequential={}",
+                i,
+                p,
+                s,
+            );
+        }
+
+        // Order preservation: the i-th element of result must be the
+        // cumulative scan up to and including index i.
+        let mut acc = 0.0f32;
+        for (i, &v) in data.iter().enumerate() {
+            acc += v;
+            assert_eq!(parallel_result[i].to_bits(), acc.to_bits());
+        }
+    }
+
+    #[test]
+    fn test_parallel_scan_with_tracing() {
+        // Verify that the tracing instrumentation added to parallel_scan_impl
+        // does not perturb its results. We initialise tracing-subscriber via
+        // try_init so the call is a no-op if any other test already installed
+        // a global subscriber in this process.
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let len = 1024usize;
+        let data: Vec<f32> = (0..len).map(|i| (i % 64) as f32).collect();
+        let op = AddOp;
+
+        // This goes through parallel_scan -> parallel_scan_impl, exercising
+        // the freshly-added debug_span!("parallel_scan_impl").
+        let result = parallel_scan(&data, &op, true);
+        assert_eq!(result.len(), len);
+
+        // Verify cumulative sum semantics are preserved under instrumentation.
+        let mut acc = 0.0f32;
+        for (i, &v) in data.iter().enumerate() {
+            acc += v;
+            assert_eq!(
+                result[i].to_bits(),
+                acc.to_bits(),
+                "tracing must not alter scan semantics (index {i})",
+            );
+        }
+    }
+
+    #[test]
+    fn test_parallel_ssm_batch_matches_sequential() {
+        // Compare batched parallel SSM forward against per-batch sequential
+        // reference. Use deterministic deterministic values for reproducibility.
+        let batch_size = 4;
+        let seq_len = 128;
+        let state_dim = 16;
+
+        // Construct A_bars near identity-but-less-than-one for numerical
+        // stability across 128 steps.
+        let mut a_data = Vec::with_capacity(batch_size * seq_len * state_dim);
+        let mut b_data = Vec::with_capacity(batch_size * seq_len * state_dim);
+        for b in 0..batch_size {
+            for t in 0..seq_len {
+                for d in 0..state_dim {
+                    let mix = ((b * 7 + t * 3 + d) % 19) as f32;
+                    a_data.push(0.90 + mix * 0.001);
+                    b_data.push(0.01 + mix * 0.0005);
+                }
+            }
+        }
+
+        let a_bars = Array3::from_shape_vec((batch_size, seq_len, state_dim), a_data).unwrap();
+        let b_bars = Array3::from_shape_vec((batch_size, seq_len, state_dim), b_data).unwrap();
+        let c = Array1::from_shape_fn(state_dim, |d| 0.5 + (d as f32) * 0.01);
+        let d_skip = 0.05f32;
+
+        // Parallel batch path (default config triggers parallel processing).
+        let cfg_par = ParallelConfig::default();
+        let par_out = parallel_ssm_batch(&a_bars, &b_bars, &c, d_skip, &cfg_par).unwrap();
+
+        // Sequential reference: process each batch element directly.
+        let cfg_seq = ParallelConfig::latency();
+        let mut seq_out = Array2::zeros((batch_size, seq_len));
+        for b in 0..batch_size {
+            let a_batch = a_bars.slice(s![b, .., ..]).to_owned();
+            let b_batch = b_bars.slice(s![b, .., ..]).to_owned();
+            let states = parallel_ssm_scan(&a_batch, &b_batch, &c, &cfg_seq).unwrap();
+            for t in 0..seq_len {
+                let h_t = states.row(t);
+                seq_out[[b, t]] = c.dot(&h_t) + d_skip;
+            }
+        }
+
+        // The per-batch computation is identical (each batch's scan is its
+        // own sequential reduction), so results should match closely.
+        assert_eq!(par_out.dim(), seq_out.dim());
+        for ((b, t), v) in par_out.indexed_iter() {
+            let diff = (v - seq_out[[b, t]]).abs();
+            assert!(
+                diff < 1e-6,
+                "parallel_ssm_batch mismatch at ({},{}): par={} seq={} diff={}",
+                b,
+                t,
+                v,
+                seq_out[[b, t]],
+                diff
+            );
+        }
     }
 }

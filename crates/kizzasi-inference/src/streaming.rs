@@ -372,8 +372,52 @@ pub trait StreamTransformer<I, O>: Send {
     ) -> Pin<Box<dyn Stream<Item = O> + Send>>;
 }
 
-// Note: FilterTransformer temporarily disabled due to lifetime complexity
-// TODO: Implement a simpler version or use external crate
+/// Filter transformer: yields only items where the predicate returns true.
+///
+/// The predicate takes `&I` and runs synchronously inside the stream's filter
+/// step, so there is no borrow held across an `.await` point — the future
+/// returned to `StreamExt::filter` is already-ready (`futures::future::ready`).
+/// This sidesteps the async lifetime issues that a naive predicate signature
+/// (`async fn(&I) -> bool`) would otherwise introduce.
+pub struct FilterTransformer<I, F>
+where
+    F: Fn(&I) -> bool + Send + Sync + 'static,
+    I: Send + 'static,
+{
+    predicate: Arc<F>,
+    _phantom: std::marker::PhantomData<I>,
+}
+
+impl<I, F> FilterTransformer<I, F>
+where
+    F: Fn(&I) -> bool + Send + Sync + 'static,
+    I: Send + 'static,
+{
+    /// Create a new filter transformer with the given predicate.
+    pub fn new(predicate: F) -> Self {
+        Self {
+            predicate: Arc::new(predicate),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<I, F> StreamTransformer<I, I> for FilterTransformer<I, F>
+where
+    F: Fn(&I) -> bool + Send + Sync + 'static,
+    I: Send + 'static,
+{
+    fn transform(
+        &self,
+        input: Pin<Box<dyn Stream<Item = I> + Send>>,
+    ) -> Pin<Box<dyn Stream<Item = I> + Send>> {
+        let predicate = self.predicate.clone();
+        Box::pin(input.filter(move |item| {
+            let keep = (predicate)(item);
+            futures::future::ready(keep)
+        }))
+    }
+}
 
 /// Map transformer: transforms each item using a function
 pub struct MapTransformer<I, O, F>
@@ -617,5 +661,46 @@ mod tests {
         assert_eq!(metrics.samples_processed, 15);
         assert_eq!(metrics.batches_processed, 2);
         assert!((metrics.avg_batch_size - 7.5).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_filter_transformer_basic() {
+        let transformer = FilterTransformer::new(|x: &i32| *x % 2 == 0);
+        let input: Pin<Box<dyn Stream<Item = i32> + Send>> =
+            Box::pin(futures::stream::iter(vec![1, 2, 3, 4, 5, 6]));
+        let output = transformer.transform(input);
+        let collected: Vec<i32> = output.collect().await;
+        assert_eq!(collected, vec![2, 4, 6]);
+    }
+
+    #[tokio::test]
+    async fn test_filter_transformer_passes_all() {
+        let transformer = FilterTransformer::new(|_: &i32| true);
+        let data = vec![10, 20, 30, 40, 50];
+        let expected = data.clone();
+        let input: Pin<Box<dyn Stream<Item = i32> + Send>> = Box::pin(futures::stream::iter(data));
+        let output = transformer.transform(input);
+        let collected: Vec<i32> = output.collect().await;
+        assert_eq!(collected, expected);
+    }
+
+    #[tokio::test]
+    async fn test_filter_transformer_passes_none() {
+        let transformer = FilterTransformer::new(|_: &i32| false);
+        let input: Pin<Box<dyn Stream<Item = i32> + Send>> =
+            Box::pin(futures::stream::iter(vec![1, 2, 3, 4, 5]));
+        let output = transformer.transform(input);
+        let collected: Vec<i32> = output.collect().await;
+        assert!(collected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_filter_transformer_preserves_order() {
+        let transformer = FilterTransformer::new(|x: &i32| *x > 3);
+        let input: Pin<Box<dyn Stream<Item = i32> + Send>> =
+            Box::pin(futures::stream::iter(vec![3, 1, 4, 1, 5, 9, 2, 6]));
+        let output = transformer.transform(input);
+        let collected: Vec<i32> = output.collect().await;
+        assert_eq!(collected, vec![4, 5, 9, 6]);
     }
 }

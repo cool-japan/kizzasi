@@ -60,6 +60,7 @@ pub use simd_aarch64::{
     softmax_f32, ssm_state_update_f32,
 };
 mod ssm;
+pub mod ssm_backend;
 mod state;
 pub mod training;
 pub mod training_core;
@@ -134,6 +135,7 @@ pub use sequences::{
     SequenceMask,
 };
 pub use ssm::{SelectiveSSM, StateSpaceModel};
+pub use ssm_backend::{default_backend, CpuSsmBackend, SsmBackend};
 pub use state::HiddenState;
 pub use training::{
     CheckpointMetadata, ConstraintLoss, Loss, MixedPrecision, SchedulerType, TrainableSSM, Trainer,

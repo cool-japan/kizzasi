@@ -10,6 +10,8 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::vec::Vec;
 
+use crate::math::core_math;
+
 /// Maximum absolute value of a slice (no_std compatible).
 pub fn max_abs(values: &[f32]) -> f32 {
     values.iter().map(|v| v.abs()).fold(0.0_f32, f32::max)
@@ -32,7 +34,9 @@ pub fn compute_scale(values: &[f32]) -> f32 {
 ///
 /// Clamps the result to `[-127, 127]` (symmetric range).
 pub fn quantize_scalar(value: f32, scale: f32) -> i8 {
-    let q = (value / scale).round();
+    // Routed through `core_math::round` so the call works under both
+    // `std` (libstd's `f32::round`) and `no_std + libm` (`libm::roundf`).
+    let q = core_math::round(value / scale);
     q.clamp(-127.0, 127.0) as i8
 }
 

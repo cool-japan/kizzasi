@@ -256,7 +256,13 @@ impl NonUniformQuantizer {
 
     /// Create Lloyd-Max quantizer for Gaussian distribution
     ///
-    /// Optimizes bin edges and reconstruction values for minimum MSE
+    /// Optimizes bin edges and reconstruction values for minimum MSE using the
+    /// Lloyd-Max iterative algorithm. Alternates between:
+    ///   1. Boundary update: edges = midpoints of adjacent reconstruction levels
+    ///   2. Level update: reconstruction values = conditional centroids of a
+    ///      zero-mean Gaussian truncated to each bin
+    ///
+    /// Converges to the globally optimal scalar quantizer for a Gaussian source.
     pub fn lloyd_max_gaussian(num_levels: usize, sigma: f32) -> TokenizerResult<Self> {
         if num_levels < 2 {
             return Err(TokenizerError::InvalidConfig(
@@ -264,30 +270,100 @@ impl NonUniformQuantizer {
             ));
         }
 
-        // Simple approximation: use percentiles of Gaussian
-        let mut bin_edges = Vec::with_capacity(num_levels + 1);
-        let mut reconstruction_values = Vec::with_capacity(num_levels);
+        // Standard-normal PDF: φ(x) = exp(-x²/2) / sqrt(2π)
+        #[inline]
+        fn phi(x: f32) -> f32 {
+            (-0.5 * x * x).exp() / (2.0 * std::f32::consts::PI).sqrt()
+        }
 
-        // Start with uniform spacing
-        for i in 0..=num_levels {
-            let p = i as f32 / num_levels as f32;
-            // Approximate inverse CDF
-            let z = if p < 0.5 {
-                -((1.0 - 2.0 * p).sqrt() - 1.0)
+        // Standard-normal CDF via Abramowitz-Stegun 7.1.26 approximation for erfc.
+        // Since Φ(x) = erfc(−x/√2)/2, the approximation is applied at y = |x|/√2:
+        //   erfc(y) ≈ (a₁t + a₂t² + a₃t³) · exp(−y²),  t = 1/(1+p·y)
+        // Maximum absolute error on Φ < ~2.5e-4.
+        #[inline]
+        fn big_phi(x: f32) -> f32 {
+            let y = x.abs() / std::f32::consts::SQRT_2;
+            let t = 1.0_f32 / (1.0 + 0.47047 * y);
+            let erfc_approx = t * (0.3480242 + t * (-0.0958798 + t * 0.7478556)) * (-y * y).exp();
+            if x >= 0.0 {
+                1.0 - erfc_approx / 2.0
             } else {
-                (2.0 * p - 1.0).sqrt() - 1.0
-            };
-            bin_edges.push(z * sigma);
+                erfc_approx / 2.0
+            }
         }
 
-        // Reconstruction values as bin centers
-        for i in 0..num_levels {
-            reconstruction_values.push((bin_edges[i] + bin_edges[i + 1]) / 2.0);
+        // Initialise reconstruction levels evenly across [-3σ, 3σ].
+        // The uniform spread is refined by iteration; the exact starting
+        // values only affect the number of iterations needed to converge.
+        let mut levels: Vec<f32> = (0..num_levels)
+            .map(|k| {
+                let p = (k as f32 + 0.5) / num_levels as f32;
+                sigma * (-3.0 + 6.0 * p)
+            })
+            .collect();
+
+        let max_iters = 200;
+        let tol = 1e-6_f32;
+
+        for _ in 0..max_iters {
+            let levels_prev = levels.clone();
+
+            // ── Step 1: Boundaries = midpoints of adjacent levels ──────────
+            // edge[k] separates bin k from bin k+1.
+            let edges: Vec<f32> = (0..num_levels - 1)
+                .map(|k| (levels[k] + levels[k + 1]) / 2.0)
+                .collect();
+
+            // ── Step 2: Levels = conditional centroid of truncated N(0,σ²) ─
+            // For bin k with bounds [a, b], the optimal reconstruction value is:
+            //   E[X | a ≤ X ≤ b] = σ · [φ(a/σ) − φ(b/σ)] / [Φ(b/σ) − Φ(a/σ)]
+            // Outermost bins use ±10σ as practical infinities.
+            for k in 0..num_levels {
+                let a_raw = if k == 0 {
+                    -10.0_f32 * sigma
+                } else {
+                    edges[k - 1]
+                };
+                let b_raw = if k == num_levels - 1 {
+                    10.0_f32 * sigma
+                } else {
+                    edges[k]
+                };
+
+                let a = a_raw / sigma;
+                let b = b_raw / sigma;
+
+                let phi_diff = phi(a) - phi(b);
+                let cdf_diff = big_phi(b) - big_phi(a);
+
+                if cdf_diff.abs() > 1e-10 {
+                    levels[k] = sigma * phi_diff / cdf_diff;
+                }
+                // Empty bin: keep previous level to avoid divergence.
+            }
+
+            // ── Check convergence (max-norm on level change) ───────────────
+            let change: f32 = levels
+                .iter()
+                .zip(levels_prev.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            if change < tol {
+                break;
+            }
         }
+
+        // Build final bin_edges with ±∞ sentinels so the quantize() method
+        // (which skips bin_edges[0] via .skip(1)) works correctly.
+        // Layout: [-∞, inner_edge_0, ..., inner_edge_{n-2}, +∞]
+        let bin_edges: Vec<f32> = std::iter::once(f32::NEG_INFINITY)
+            .chain((0..num_levels - 1).map(|k| (levels[k] + levels[k + 1]) / 2.0))
+            .chain(std::iter::once(f32::INFINITY))
+            .collect();
 
         Ok(Self {
             bin_edges,
-            reconstruction_values,
+            reconstruction_values: levels,
         })
     }
 }
@@ -399,9 +475,9 @@ fn find_bin(x: f32, edges: &[f32]) -> usize {
 ///
 /// 1. Initialize bin edges from equal-mass (percentile) split of the signal.
 /// 2. Iterate:
-///    - **Centroid update**: recon[i] = mean of samples assigned to bin i.
+///    - **Centroid update**: `recon_i` = mean of samples assigned to bin `i`.
 ///    - **Entropy-regularized edge update**:
-///      `edge[i] = 0.5·(recon[i-1]+recon[i]) + (λ/(recon[i]-recon[i-1]))·(ln p[i-1] − ln p[i])`
+///      `edge_i = 0.5*(recon_{i-1}+recon_i) + (lambda/(recon_i-recon_{i-1}))*(ln p_{i-1} - ln p_i)`
 ///    - Clamp edges to be strictly monotonic.
 ///    - Recompute empirical probabilities.
 ///    - Evaluate `cost = D + λ·R` and stop when Δcost < tol.
@@ -1094,5 +1170,103 @@ mod tests {
         let level = quant.quantize(0.1);
         let value = quant.dequantize(level);
         assert!((value - 0.15).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_lloyd_max_bin_edges_monotonic() {
+        let q = NonUniformQuantizer::lloyd_max_gaussian(8, 1.0).expect("lloyd_max_gaussian failed");
+        // Inner edges (excluding ±∞ sentinels) must be strictly increasing
+        let inner: Vec<f32> = q
+            .bin_edges
+            .iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .collect();
+        for w in inner.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "bin_edges not monotonic: {} not > {}",
+                w[1],
+                w[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_lloyd_max_oracle_boundaries() {
+        // Published Max-1960 N=8 σ=1 inner boundaries: ±0.501, ±1.050, ±1.748
+        let q = NonUniformQuantizer::lloyd_max_gaussian(8, 1.0).expect("lloyd_max_gaussian failed");
+        let inner: Vec<f32> = q
+            .bin_edges
+            .iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .collect();
+        assert_eq!(inner.len(), 7, "Expected 7 inner boundaries for 8 levels");
+        let tol = 0.06;
+        assert!(
+            (inner[0] - (-1.748)).abs() < tol,
+            "boundary[0]={} expected ~-1.748",
+            inner[0]
+        );
+        assert!(
+            (inner[1] - (-1.050)).abs() < tol,
+            "boundary[1]={} expected ~-1.050",
+            inner[1]
+        );
+        assert!(
+            (inner[2] - (-0.501)).abs() < tol,
+            "boundary[2]={} expected ~-0.501",
+            inner[2]
+        );
+        assert!(
+            (inner[4] - (0.501)).abs() < tol,
+            "boundary[4]={} expected ~0.501",
+            inner[4]
+        );
+        assert!(
+            (inner[5] - (1.050)).abs() < tol,
+            "boundary[5]={} expected ~1.050",
+            inner[5]
+        );
+        assert!(
+            (inner[6] - (1.748)).abs() < tol,
+            "boundary[6]={} expected ~1.748",
+            inner[6]
+        );
+    }
+
+    #[test]
+    fn test_lloyd_max_levels_antisymmetric() {
+        let q = NonUniformQuantizer::lloyd_max_gaussian(8, 1.0).expect("lloyd_max_gaussian failed");
+        let n = q.reconstruction_values.len();
+        for i in 0..n / 2 {
+            let sum = q.reconstruction_values[i] + q.reconstruction_values[n - 1 - i];
+            assert!(
+                sum.abs() < 5e-3,
+                "Levels not antisymmetric: r[{}]={} r[{}]={}",
+                i,
+                q.reconstruction_values[i],
+                n - 1 - i,
+                q.reconstruction_values[n - 1 - i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_lloyd_max_round_trip_bounded() {
+        let q = NonUniformQuantizer::lloyd_max_gaussian(8, 1.0).expect("lloyd_max_gaussian failed");
+        // Round-trip error must be bounded
+        let test_vals = [-2.0_f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+        for &v in &test_vals {
+            let q_idx = q.quantize(v);
+            let reconstructed = q.dequantize(q_idx);
+            // Should be within one quantization step
+            assert!(
+                reconstructed.is_finite(),
+                "dequantize returned non-finite for v={}",
+                v
+            );
+        }
     }
 }

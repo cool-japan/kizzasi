@@ -67,39 +67,23 @@
 //! - RWKV: <https://github.com/BlinkDL/RWKV-LM>
 //! - RWKV v7 paper: <https://arxiv.org/abs/2503.14456>
 
+pub mod channel_mixing;
+pub mod time_mixing;
+
+pub use time_mixing::Rwkv7TimeMixing;
+
+use channel_mixing::Rwkv7ChannelMixing;
+use time_mixing::SeededRng;
+
 use crate::error::{ModelError, ModelResult};
 use crate::{AutoregressiveModel, ModelType};
-use kizzasi_core::{sigmoid, silu, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor};
+use kizzasi_core::{CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor};
 use scirs2_core::ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
+use serde_json;
 
 #[allow(unused_imports)]
 use tracing::{debug, instrument, trace};
-
-// ---------------------------------------------------------------------------
-// Seeded deterministic RNG for reproducible weight initialization
-// ---------------------------------------------------------------------------
-
-/// Simple xorshift64 PRNG for deterministic weight initialization.
-/// This avoids platform-dependent randomness in tests and benchmarks.
-struct SeededRng {
-    state: u64,
-}
-
-impl SeededRng {
-    fn new(seed: u64) -> Self {
-        Self { state: seed.max(1) }
-    }
-
-    /// Returns a float in [-1, 1)
-    fn next_f32(&mut self) -> f32 {
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
-        // Map u64 to [-1, 1)
-        (self.state as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -296,318 +280,6 @@ impl Rwkv7State {
 }
 
 // ---------------------------------------------------------------------------
-// Time Mixing v7
-// ---------------------------------------------------------------------------
-
-/// RWKV v7 time-mixing block with data-dependent decay, value gate, and bonus attention
-pub struct Rwkv7TimeMixing {
-    // Projection weights
-    w_r: Array2<f32>, // receptance
-    w_w: Array2<f32>, // decay input projection (data-dependent decay)
-    w_k: Array2<f32>, // key
-    w_v: Array2<f32>, // value
-    w_o: Array2<f32>, // output
-    w_g: Array2<f32>, // value gate
-    w_a: Array2<f32>, // bonus/attention gate
-    w_b: Array2<f32>, // decay gate
-
-    // Learned interpolation coefficients for token shift
-    lerp_r: Array1<f32>,
-    lerp_w: Array1<f32>,
-    lerp_k: Array1<f32>,
-    lerp_v: Array1<f32>,
-
-    // Group normalization applied to concatenated head outputs
-    ln_x: LayerNorm,
-
-    num_heads: usize,
-    head_dim: usize,
-}
-
-impl Rwkv7TimeMixing {
-    /// Create a new time-mixing block
-    pub fn new(config: &Rwkv7Config) -> ModelResult<Self> {
-        let d = config.hidden_dim;
-        let mut rng = SeededRng::new(42 + d as u64);
-        let scale = (2.0 / d as f32).sqrt();
-
-        let make_proj = |rng: &mut SeededRng| -> Array2<f32> {
-            Array2::from_shape_fn((d, d), |_| rng.next_f32() * scale)
-        };
-
-        let w_r = make_proj(&mut rng);
-        let w_w = make_proj(&mut rng);
-        let w_k = make_proj(&mut rng);
-        let w_v = make_proj(&mut rng);
-        let w_o = make_proj(&mut rng);
-        let w_g = make_proj(&mut rng);
-        let w_a = make_proj(&mut rng);
-        let w_b = make_proj(&mut rng);
-
-        let lerp_r = Array1::from_shape_fn(d, |_| rng.next_f32().abs() * 0.5 + 0.25);
-        let lerp_w = Array1::from_shape_fn(d, |_| rng.next_f32().abs() * 0.5 + 0.25);
-        let lerp_k = Array1::from_shape_fn(d, |_| rng.next_f32().abs() * 0.5 + 0.25);
-        let lerp_v = Array1::from_shape_fn(d, |_| rng.next_f32().abs() * 0.5 + 0.25);
-
-        let ln_x = LayerNorm::new(d, NormType::RMSNorm).with_eps(1e-5);
-
-        Ok(Self {
-            w_r,
-            w_w,
-            w_k,
-            w_v,
-            w_o,
-            w_g,
-            w_a,
-            w_b,
-            lerp_r,
-            lerp_w,
-            lerp_k,
-            lerp_v,
-            ln_x,
-            num_heads: config.num_heads,
-            head_dim: config.head_dim,
-        })
-    }
-
-    /// Single-step forward pass for layer `layer_idx`.
-    ///
-    /// Reads and mutates the corresponding layer in `state`.
-    pub fn forward(
-        &self,
-        x: &Array1<f32>,
-        state: &mut Rwkv7State,
-        layer_idx: usize,
-    ) -> ModelResult<Array1<f32>> {
-        let d = x.len();
-
-        // 1. Token shift
-        let prev = &state.shift_states[layer_idx];
-        let dx = x - prev;
-        state.shift_states[layer_idx] = x.clone();
-
-        // 2. Mixed inputs for each projection path
-        let xr = x + &(&self.lerp_r * &dx);
-        let xw = x + &(&self.lerp_w * &dx);
-        let xk = x + &(&self.lerp_k * &dx);
-        let xv = x + &(&self.lerp_v * &dx);
-
-        // 3. Linear projections
-        let r_raw = self.matvec(&self.w_r, &xr);
-        let w_raw = self.matvec(&self.w_w, &xw);
-        let k_raw = self.matvec(&self.w_k, &xk);
-        let v_raw = self.matvec(&self.w_v, &xv);
-
-        // 4. Activations
-        let r = sigmoid(&r_raw); // receptance
-        let w = sigmoid(&w_raw); // data-dependent decay (v7)
-        let g = silu(&self.matvec(&self.w_g, x)); // value gate (v7)
-        let a = sigmoid(&self.matvec(&self.w_a, x)); // bonus gate (v7)
-        let b = sigmoid(&self.matvec(&self.w_b, x)); // decay gate (v7)
-
-        // 5. Per-head WKV computation
-        let mut output_heads = Array1::zeros(d);
-
-        for h in 0..self.num_heads {
-            let lo = h * self.head_dim;
-            let hi = lo + self.head_dim;
-
-            // Extract per-head slices
-            let r_h = r.slice(scirs2_core::ndarray::s![lo..hi]).to_owned();
-            let k_h = k_raw.slice(scirs2_core::ndarray::s![lo..hi]).to_owned();
-            let v_h = v_raw.slice(scirs2_core::ndarray::s![lo..hi]).to_owned();
-            let w_h = w.slice(scirs2_core::ndarray::s![lo..hi]).to_owned();
-            let a_h = a.slice(scirs2_core::ndarray::s![lo..hi]).to_owned();
-            let b_h = b.slice(scirs2_core::ndarray::s![lo..hi]).to_owned();
-
-            let head_state = &mut state.wkv_states[layer_idx][h];
-
-            // state_h = diag(w_h) @ state_h  (data-dependent decay)
-            // Then add rank-1 update: + outer(k_h, v_h)
-            for i in 0..self.head_dim {
-                let decay = w_h[i].clamp(0.0, 1.0);
-                for j in 0..self.head_dim {
-                    head_state[[i, j]] = decay * head_state[[i, j]] + k_h[i] * v_h[j];
-                }
-            }
-
-            // output_h = r_h * (state_h @ b_h + a_h * v_h)
-            // The bonus attention term `a_h * v_h` provides direct value bypass
-            let state_b = self.matvec_small(head_state, &b_h);
-            for i in 0..self.head_dim {
-                let val = r_h[i] * (state_b[i] + a_h[i] * v_h[i]);
-                output_heads[lo + i] = val;
-            }
-        }
-
-        // 6. Apply group normalization then value gate
-        let normed = self.ln_x.forward(&output_heads);
-        let gated = &g * &normed;
-
-        // 7. Output projection
-        let out = self.matvec(&self.w_o, &gated);
-        Ok(out)
-    }
-
-    // Matrix-vector multiply: y = W @ x
-    fn matvec(&self, w: &Array2<f32>, x: &Array1<f32>) -> Array1<f32> {
-        let rows = w.shape()[0];
-        let cols = w.shape()[1];
-        let xlen = x.len();
-        let mut out = Array1::zeros(rows);
-        for i in 0..rows {
-            let mut sum = 0.0f32;
-            for j in 0..cols.min(xlen) {
-                sum += w[[i, j]] * x[j];
-            }
-            out[i] = sum;
-        }
-        out
-    }
-
-    fn matvec_small(&self, w: &Array2<f32>, x: &Array1<f32>) -> Array1<f32> {
-        let rows = w.shape()[0];
-        let cols = w.shape()[1];
-        let xlen = x.len();
-        let mut out = Array1::zeros(rows);
-        for i in 0..rows {
-            let mut sum = 0.0f32;
-            for j in 0..cols.min(xlen) {
-                sum += w[[i, j]] * x[j];
-            }
-            out[i] = sum;
-        }
-        out
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Channel Mixing v7
-// ---------------------------------------------------------------------------
-
-/// Channel mixing (FFN) block for RWKV v7 with expanded intermediate dim
-struct Rwkv7ChannelMixing {
-    hidden_dim: usize,
-    intermediate_dim: usize,
-
-    time_mix_k: Array1<f32>,
-    time_mix_r: Array1<f32>,
-
-    key_proj: Array2<f32>,        // (hidden_dim, intermediate_dim)
-    value_proj: Array2<f32>,      // (intermediate_dim, hidden_dim)
-    receptance_proj: Array2<f32>, // (hidden_dim, hidden_dim)
-
-    prev_x: Array1<f32>,
-}
-
-impl Rwkv7ChannelMixing {
-    fn new(config: &Rwkv7Config) -> ModelResult<Self> {
-        let d = config.hidden_dim;
-        let inter = (d as f32 * config.expand_factor) as usize;
-        let mut rng = SeededRng::new(137 + d as u64 + inter as u64);
-        let scale = (2.0 / d as f32).sqrt();
-
-        let time_mix_k = Array1::from_shape_fn(d, |_| rng.next_f32().abs() * 0.5 + 0.25);
-        let time_mix_r = Array1::from_shape_fn(d, |_| rng.next_f32().abs() * 0.5 + 0.25);
-
-        let key_proj = Array2::from_shape_fn((d, inter), |_| rng.next_f32() * scale);
-        let value_proj = Array2::from_shape_fn((inter, d), |_| rng.next_f32() * scale);
-        let receptance_proj = Array2::from_shape_fn((d, d), |_| rng.next_f32() * scale);
-
-        Ok(Self {
-            hidden_dim: d,
-            intermediate_dim: inter,
-            time_mix_k,
-            time_mix_r,
-            key_proj,
-            value_proj,
-            receptance_proj,
-            prev_x: Array1::zeros(d),
-        })
-    }
-
-    fn forward(&mut self, x: &Array1<f32>) -> CoreResult<Array1<f32>> {
-        let d = x.len().min(self.hidden_dim);
-
-        // Time-mixed inputs
-        let mut xk = Array1::zeros(d);
-        let mut xr = Array1::zeros(d);
-        for i in 0..d {
-            let prev = if i < self.prev_x.len() {
-                self.prev_x[i]
-            } else {
-                0.0
-            };
-            xk[i] = self.time_mix_k[i] * x[i] + (1.0 - self.time_mix_k[i]) * prev;
-            xr[i] = self.time_mix_r[i] * x[i] + (1.0 - self.time_mix_r[i]) * prev;
-        }
-
-        // Key path: project up, squared ReLU, project back down
-        let k = self.project_up(&xk);
-        let k_act = k.mapv(|v| {
-            let relu = v.max(0.0);
-            relu * relu
-        });
-        let vk = self.project_down(&k_act);
-
-        // Receptance gating
-        let r = self.project_r(&xr);
-        let r_sig = sigmoid(&r);
-
-        let mut output = Array1::zeros(d);
-        for i in 0..d.min(vk.len()).min(r_sig.len()) {
-            output[i] = r_sig[i] * vk[i];
-        }
-
-        self.prev_x = x.slice(scirs2_core::ndarray::s![..d]).to_owned();
-        Ok(output)
-    }
-
-    fn project_up(&self, x: &Array1<f32>) -> Array1<f32> {
-        let out_dim = self.intermediate_dim;
-        let mut output = Array1::zeros(out_dim);
-        for i in 0..out_dim {
-            let mut sum = 0.0f32;
-            for j in 0..x.len().min(self.key_proj.shape()[0]) {
-                sum += self.key_proj[[j, i]] * x[j];
-            }
-            output[i] = sum;
-        }
-        output
-    }
-
-    fn project_down(&self, x: &Array1<f32>) -> Array1<f32> {
-        let out_dim = self.hidden_dim;
-        let mut output = Array1::zeros(out_dim);
-        for i in 0..out_dim {
-            let mut sum = 0.0f32;
-            for j in 0..x.len().min(self.value_proj.shape()[0]) {
-                sum += self.value_proj[[j, i]] * x[j];
-            }
-            output[i] = sum;
-        }
-        output
-    }
-
-    fn project_r(&self, x: &Array1<f32>) -> Array1<f32> {
-        let out_dim = self.receptance_proj.shape()[0];
-        let mut output = Array1::zeros(out_dim.min(x.len()));
-        for i in 0..output.len() {
-            let mut sum = 0.0f32;
-            for j in 0..x.len().min(self.receptance_proj.shape()[1]) {
-                sum += self.receptance_proj[[i, j]] * x[j];
-            }
-            output[i] = sum;
-        }
-        output
-    }
-
-    fn reset(&mut self) {
-        self.prev_x.fill(0.0);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Rwkv7 Layer
 // ---------------------------------------------------------------------------
 
@@ -670,7 +342,7 @@ pub struct Rwkv7Model {
     pub config: Rwkv7Config,
     layers: Vec<Rwkv7Layer>,
     ln_out: LayerNorm,
-    input_proj: Array2<f32>,
+    pub(crate) input_proj: Array2<f32>,
     output_proj: Array2<f32>,
     state: Rwkv7State,
 }
@@ -736,6 +408,258 @@ impl Rwkv7Model {
     /// Get the configuration
     pub fn config(&self) -> &Rwkv7Config {
         &self.config
+    }
+
+    /// Save model weights to a JSON file as `HashMap<String, Vec<f32>>`.
+    ///
+    /// Keys serialised:
+    /// - `input_proj` / `output_proj`: top-level input/output projections
+    /// - Per-layer time-mixing: `layers.{i}.time_mixing.{w_r,w_w,w_k,w_v,w_o,w_g,w_a,w_b,lerp_r,lerp_w,lerp_k,lerp_v}`
+    /// - Per-layer channel-mixing: `layers.{i}.channel_mixing.{time_mix_k,time_mix_r,key_proj,value_proj,receptance_proj}`
+    pub fn save_weights_json<P: AsRef<std::path::Path>>(&self, path: P) -> ModelResult<()> {
+        use std::collections::HashMap;
+        let mut weights: HashMap<String, Vec<f32>> = HashMap::new();
+
+        weights.insert(
+            "input_proj".to_string(),
+            self.input_proj.iter().copied().collect(),
+        );
+        weights.insert(
+            "output_proj".to_string(),
+            self.output_proj.iter().copied().collect(),
+        );
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let tm = format!("layers.{}.time_mixing", i);
+            let cm = format!("layers.{}.channel_mixing", i);
+
+            // Time-mixing projection weights (2D)
+            weights.insert(
+                format!("{}.w_r", tm),
+                layer.time_mixing.w_r.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.w_w", tm),
+                layer.time_mixing.w_w.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.w_k", tm),
+                layer.time_mixing.w_k.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.w_v", tm),
+                layer.time_mixing.w_v.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.w_o", tm),
+                layer.time_mixing.w_o.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.w_g", tm),
+                layer.time_mixing.w_g.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.w_a", tm),
+                layer.time_mixing.w_a.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.w_b", tm),
+                layer.time_mixing.w_b.iter().copied().collect(),
+            );
+            // Lerp coefficients (1D)
+            weights.insert(
+                format!("{}.lerp_r", tm),
+                layer.time_mixing.lerp_r.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.lerp_w", tm),
+                layer.time_mixing.lerp_w.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.lerp_k", tm),
+                layer.time_mixing.lerp_k.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.lerp_v", tm),
+                layer.time_mixing.lerp_v.iter().copied().collect(),
+            );
+
+            // Channel-mixing lerp coefficients (1D)
+            weights.insert(
+                format!("{}.time_mix_k", cm),
+                layer.channel_mixing.time_mix_k.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.time_mix_r", cm),
+                layer.channel_mixing.time_mix_r.iter().copied().collect(),
+            );
+            // Channel-mixing projections (2D)
+            weights.insert(
+                format!("{}.key_proj", cm),
+                layer.channel_mixing.key_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.value_proj", cm),
+                layer.channel_mixing.value_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.receptance_proj", cm),
+                layer
+                    .channel_mixing
+                    .receptance_proj
+                    .iter()
+                    .copied()
+                    .collect(),
+            );
+        }
+
+        let file = std::fs::File::create(path.as_ref()).map_err(|e| {
+            ModelError::load_error("rwkv7 save_weights", format!("failed to create file: {e}"))
+        })?;
+        serde_json::to_writer(file, &weights).map_err(|e| {
+            ModelError::load_error(
+                "rwkv7 save_weights",
+                format!("JSON serialization failed: {e}"),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Load weights from a JSON file previously written by `save_weights_json`.
+    pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
+        use std::collections::HashMap;
+        let file = std::fs::File::open(path.as_ref()).map_err(|e| {
+            ModelError::load_error("rwkv7 load_weights", format!("failed to open file: {e}"))
+        })?;
+        let weights: HashMap<String, Vec<f32>> = serde_json::from_reader(file).map_err(|e| {
+            ModelError::load_error(
+                "rwkv7 load_weights",
+                format!("JSON deserialization failed: {e}"),
+            )
+        })?;
+
+        let load_2d = |map: &HashMap<String, Vec<f32>>,
+                       key: &str,
+                       rows: usize,
+                       cols: usize|
+         -> ModelResult<Option<Array2<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != rows * cols {
+                    return Err(ModelError::load_error(
+                        "rwkv7 load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {}×{}={} but got {}",
+                            key,
+                            rows,
+                            cols,
+                            rows * cols,
+                            data.len()
+                        ),
+                    ));
+                }
+                let arr = Array2::from_shape_vec((rows, cols), data.clone()).map_err(|e| {
+                    ModelError::load_error(
+                        "rwkv7 load_weights",
+                        format!("failed to reshape '{}': {e}", key),
+                    )
+                })?;
+                Ok(Some(arr))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let load_1d = |map: &HashMap<String, Vec<f32>>,
+                       key: &str,
+                       expected_len: usize|
+         -> ModelResult<Option<Array1<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != expected_len {
+                    return Err(ModelError::load_error(
+                        "rwkv7 load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {} but got {}",
+                            key,
+                            expected_len,
+                            data.len()
+                        ),
+                    ));
+                }
+                Ok(Some(Array1::from_vec(data.clone())))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let d = self.config.hidden_dim;
+        let inter = (d as f32 * self.config.expand_factor) as usize;
+
+        if let Some(arr) = load_2d(&weights, "input_proj", self.config.input_dim, d)? {
+            self.input_proj = arr;
+        }
+        if let Some(arr) = load_2d(&weights, "output_proj", d, self.config.input_dim)? {
+            self.output_proj = arr;
+        }
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let tm = format!("layers.{}.time_mixing", i);
+            let cm = format!("layers.{}.channel_mixing", i);
+
+            if let Some(arr) = load_2d(&weights, &format!("{}.w_r", tm), d, d)? {
+                layer.time_mixing.w_r = arr;
+            }
+            if let Some(arr) = load_2d(&weights, &format!("{}.w_w", tm), d, d)? {
+                layer.time_mixing.w_w = arr;
+            }
+            if let Some(arr) = load_2d(&weights, &format!("{}.w_k", tm), d, d)? {
+                layer.time_mixing.w_k = arr;
+            }
+            if let Some(arr) = load_2d(&weights, &format!("{}.w_v", tm), d, d)? {
+                layer.time_mixing.w_v = arr;
+            }
+            if let Some(arr) = load_2d(&weights, &format!("{}.w_o", tm), d, d)? {
+                layer.time_mixing.w_o = arr;
+            }
+            if let Some(arr) = load_2d(&weights, &format!("{}.w_g", tm), d, d)? {
+                layer.time_mixing.w_g = arr;
+            }
+            if let Some(arr) = load_2d(&weights, &format!("{}.w_a", tm), d, d)? {
+                layer.time_mixing.w_a = arr;
+            }
+            if let Some(arr) = load_2d(&weights, &format!("{}.w_b", tm), d, d)? {
+                layer.time_mixing.w_b = arr;
+            }
+            if let Some(arr) = load_1d(&weights, &format!("{}.lerp_r", tm), d)? {
+                layer.time_mixing.lerp_r = arr;
+            }
+            if let Some(arr) = load_1d(&weights, &format!("{}.lerp_w", tm), d)? {
+                layer.time_mixing.lerp_w = arr;
+            }
+            if let Some(arr) = load_1d(&weights, &format!("{}.lerp_k", tm), d)? {
+                layer.time_mixing.lerp_k = arr;
+            }
+            if let Some(arr) = load_1d(&weights, &format!("{}.lerp_v", tm), d)? {
+                layer.time_mixing.lerp_v = arr;
+            }
+
+            if let Some(arr) = load_1d(&weights, &format!("{}.time_mix_k", cm), d)? {
+                layer.channel_mixing.time_mix_k = arr;
+            }
+            if let Some(arr) = load_1d(&weights, &format!("{}.time_mix_r", cm), d)? {
+                layer.channel_mixing.time_mix_r = arr;
+            }
+            if let Some(arr) = load_2d(&weights, &format!("{}.key_proj", cm), d, inter)? {
+                layer.channel_mixing.key_proj = arr;
+            }
+            if let Some(arr) = load_2d(&weights, &format!("{}.value_proj", cm), inter, d)? {
+                layer.channel_mixing.value_proj = arr;
+            }
+            if let Some(arr) = load_2d(&weights, &format!("{}.receptance_proj", cm), d, d)? {
+                layer.channel_mixing.receptance_proj = arr;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1058,5 +982,121 @@ mod tests {
         assert_eq!(model.state_dim(), 64); // head_dim * num_heads = 16 * 4
         assert_eq!(model.num_layers(), 2);
         assert_eq!(model.model_type(), ModelType::Rwkv);
+    }
+
+    #[test]
+    fn test_rwkv7_save_load_weights_roundtrip() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        // Build two models: one with deterministic seed weights (the "fresh" model
+        // that load_weights_json will target) and a *mutated* reference whose
+        // input_proj has been scaled by 2×.  Because Rwkv7Model::new uses a fixed
+        // SeededRng, both would normally produce identical outputs — scaling the
+        // reference projection makes them genuinely diverge before loading.
+        let config = tiny_config();
+        let mut reference = Rwkv7Model::new(config.clone()).expect("reference model");
+
+        // Mutate reference.input_proj so reference ≠ a default-seeded model.
+        reference.input_proj = &reference.input_proj * 2.0_f32;
+
+        // Save the *mutated* weights to a unique temp file
+        let uid = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let mut path = std::env::temp_dir();
+        path.push(format!("kizzasi_rwkv7_test_{}_{}.json", pid, uid));
+
+        reference
+            .save_weights_json(&path)
+            .expect("save_weights_json");
+
+        // Load into a fresh model — starts with original (unscaled) weights
+        let mut loaded = Rwkv7Model::new(config).expect("loaded model");
+
+        // Verify the models genuinely differ BEFORE loading
+        let probe = Array1::from_vec(vec![0.5]);
+        let mut ref_clone = reference;
+        let out_before = loaded
+            .step(&probe.clone())
+            .expect("loaded step before load");
+        loaded.reset();
+
+        // Load the saved (mutated) weights
+        loaded.load_weights_json(&path).expect("load_weights_json");
+        let _ = std::fs::remove_file(&path);
+
+        // After loading, outputs must match the (mutated) reference
+        let out_ref = ref_clone.step(&probe.clone()).expect("ref step");
+        let out_after = loaded.step(&probe).expect("loaded step after load");
+
+        assert_eq!(out_ref.len(), out_after.len());
+
+        // The outputs before and after load must differ (non-vacuousness check)
+        let diverged_before_load = out_before
+            .iter()
+            .zip(out_ref.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(
+            diverged_before_load,
+            "pre-load outputs must differ from reference; check that input_proj mutation took effect"
+        );
+
+        // After loading, outputs must match
+        for (a, b) in out_ref.iter().zip(out_after.iter()) {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "weight roundtrip: outputs diverge after load: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rwkv7_factory_weight_injection() {
+        use crate::dynamic_quantization::QuantizedWeightStorage;
+        use crate::factory::ModelFactory;
+        use scirs2_core::ndarray::Array2;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let config = tiny_config();
+        let reference = Rwkv7Model::new(config.clone()).expect("reference");
+
+        // Save reference weights to temp JSON
+        let uid = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("kizzasi_rwkv7_factory_{}_{}.json", pid, uid));
+        reference.save_weights_json(&tmp).expect("save");
+
+        // Read back and build QuantizedWeightStorage map
+        let file = std::fs::File::open(&tmp).expect("open temp JSON");
+        let f32_map: HashMap<String, Vec<f32>> =
+            serde_json::from_reader(file).expect("deserialise JSON");
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(!f32_map.is_empty(), "saved weights must be non-empty");
+
+        let mut quant_weights: HashMap<String, QuantizedWeightStorage> = HashMap::new();
+        for (k, v) in f32_map {
+            let len = v.len();
+            let arr = Array2::from_shape_vec((1, len), v).expect("reshape to Array2");
+            quant_weights.insert(k, QuantizedWeightStorage::FP32(arr));
+        }
+
+        // ModelFactory::create_rwkv7 must succeed with weight injection
+        let result = ModelFactory::create_rwkv7(config, quant_weights);
+        assert!(
+            result.is_ok(),
+            "create_rwkv7 with weights should succeed: {:?}",
+            result.err()
+        );
+
+        // Verify the created model is functional
+        let mut factory_model = result.expect("model from factory");
+        let input = Array1::from_vec(vec![0.5]);
+        let out = factory_model.step(&input).expect("factory model step");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_finite(), "factory model output must be finite");
     }
 }

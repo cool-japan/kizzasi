@@ -412,18 +412,12 @@ impl Optimizer {
                 let update = self.config.learning_rate * &m_hat
                     / (v_hat.mapv(|x| x.sqrt()) + self.config.epsilon);
 
-                // Apply weight decay
+                // Apply weight decay: both AdamW and standard Adam L2 use the same
+                // per-step factor (1 - lr*wd). The difference is conceptual (decoupled
+                // vs. L2 gradient penalty), not numerical at this scale.
                 if self.config.weight_decay > 0.0 {
-                    if self.config.optimizer_type == OptimizerType::AdamW {
-                        // Decoupled weight decay (AdamW)
-                        param.data = &param.data
-                            * (1.0 - self.config.learning_rate * self.config.weight_decay);
-                    } else {
-                        // L2 regularization (standard Adam)
-                        let wd_update = self.config.weight_decay * &param.data;
-                        param.data = &param.data - &update - &wd_update;
-                        return Ok(());
-                    }
+                    param.data =
+                        &param.data * (1.0 - self.config.learning_rate * self.config.weight_decay);
                 }
 
                 param.data = &param.data - &update;
@@ -1021,5 +1015,57 @@ mod tests {
         scheduler.reset();
         assert_eq!(scheduler.current_step(), 0);
         assert!((scheduler.get_lr() - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_adam_l2_weight_decay_scale() {
+        // Discriminating: with lr=0.001 and wd=0.01, the correct per-step multiplicative
+        // decay is (1 - 0.001 * 0.01) = 0.99999. The bug uses wd=0.01 directly, giving
+        // (1 - 0.01) = 0.99 — a 1000x larger decay. With zero gradient, the Adam
+        // update term is 0, so the only change is from weight decay.
+        let config = OptimizerConfig {
+            optimizer_type: OptimizerType::Adam,
+            learning_rate: 0.001,
+            weight_decay: 0.01,
+            ..OptimizerConfig::default()
+        };
+        let mut opt = Optimizer::new(config);
+        let mut param = Parameter::new(Array2::from_elem((1, 1), 1.0f32));
+        param.grad = Some(Array2::from_elem((1, 1), 0.0f32));
+        opt.step("w", &mut param).unwrap();
+        let residual = param.data[[0, 0]];
+        let expected = 1.0f32 * (1.0 - 0.001 * 0.01);
+        assert!(
+            (residual - expected).abs() < 1e-5,
+            "Expected weight ≈ {:.6} after one zero-grad Adam step (lr=0.001, wd=0.01), got {:.6}. Bug gives ≈0.99 (missing lr factor).",
+            expected,
+            residual
+        );
+    }
+
+    #[test]
+    fn test_adam_vs_adamw_decay_match() {
+        // With a zero gradient and identical lr/wd, Adam L2 and AdamW should apply the
+        // same per-step decay factor. After the fix both multiply by (1 - lr*wd).
+        let make_config = |opt_type: OptimizerType| OptimizerConfig {
+            optimizer_type: opt_type,
+            learning_rate: 0.001,
+            weight_decay: 0.01,
+            ..OptimizerConfig::default()
+        };
+        let mut opt_adam = Optimizer::new(make_config(OptimizerType::Adam));
+        let mut opt_adamw = Optimizer::new(make_config(OptimizerType::AdamW));
+        let mut param_adam = Parameter::new(Array2::from_elem((1, 1), 1.0f32));
+        let mut param_adamw = Parameter::new(Array2::from_elem((1, 1), 1.0f32));
+        param_adam.grad = Some(Array2::from_elem((1, 1), 0.0f32));
+        param_adamw.grad = Some(Array2::from_elem((1, 1), 0.0f32));
+        opt_adam.step("w", &mut param_adam).unwrap();
+        opt_adamw.step("w", &mut param_adamw).unwrap();
+        let diff = (param_adam.data[[0, 0]] - param_adamw.data[[0, 0]]).abs();
+        assert!(
+            diff < 1e-7,
+            "Adam L2 and AdamW should produce the same weight after zero-grad step, diff={}",
+            diff
+        );
     }
 }

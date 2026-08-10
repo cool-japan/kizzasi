@@ -15,6 +15,7 @@ TensorLogic bridge providing constraint satisfaction, optimization, and safety g
 - **Optimization**: MPC, Benders decomposition, multi-objective
 - **GPU Acceleration**: Parallel constraint checking
 - **Incremental Solving**: Real-time constraint updates
+- **TensorLogic-IR integration**: compile symbolic `TLExpr` expressions into executable constraints for use with `kizzasi-model`'s constraint bridge
 
 ## Quick Start
 
@@ -39,7 +40,7 @@ let safe_prediction = guardrails.project(&prediction)?; // Projects to [10.0, 3.
 - Projection algorithms: <10μs for simple constraints
 - Batch processing: 1M constraint checks/sec
 - GPU acceleration: 10x speedup for large batches
-- 293 comprehensive tests, all passing
+- 307 comprehensive tests, all passing
 
 ## Documentation
 

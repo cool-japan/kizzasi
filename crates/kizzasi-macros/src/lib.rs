@@ -54,9 +54,14 @@
 //! // }
 //! ```
 
+extern crate proc_macro;
 use proc_macro::TokenStream;
-use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields};
+use syn::{parse_macro_input, DeriveInput};
+
+mod attrs;
+mod config;
+mod instrumented;
+mod preset;
 
 /// Derive macro for custom Kizzasi configurations.
 ///
@@ -83,77 +88,9 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields};
 #[proc_macro_derive(KizzasiConfig, attributes(config))]
 pub fn derive_kizzasi_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
-    let builder_name = syn::Ident::new(&format!("{}Builder", name), name.span());
-
-    let fields = match &input.data {
-        Data::Struct(data) => match &data.fields {
-            Fields::Named(fields) => &fields.named,
-            _ => panic!("KizzasiConfig only supports named fields"),
-        },
-        _ => panic!("KizzasiConfig only supports structs"),
-    };
-
-    let mut builder_fields = Vec::new();
-    let mut builder_methods = Vec::new();
-    let mut build_assignments = Vec::new();
-
-    for field in fields {
-        let field_name = field.ident.as_ref().unwrap();
-        let field_type = &field.ty;
-
-        // Simplified: no attribute parsing for now, just basic builder
-        // Builder field (Option<T>)
-        builder_fields.push(quote! {
-            #field_name: Option<#field_type>
-        });
-
-        // Builder method
-        builder_methods.push(quote! {
-            pub fn #field_name(mut self, value: #field_type) -> Self {
-                self.#field_name = Some(value);
-                self
-            }
-        });
-
-        // Build assignment - require all fields
-        build_assignments.push(quote! {
-            #field_name: self.#field_name.ok_or_else(|| format!("Missing required field: {}", stringify!(#field_name)))?
-        });
-    }
-
-    let expanded = quote! {
-        impl #name {
-            /// Create a new builder for this configuration.
-            pub fn builder() -> #builder_name {
-                #builder_name::new()
-            }
-        }
-
-        /// Builder for #name.
-        #[derive(Default)]
-        pub struct #builder_name {
-            #(#builder_fields),*
-        }
-
-        impl #builder_name {
-            /// Create a new builder.
-            pub fn new() -> Self {
-                Self::default()
-            }
-
-            #(#builder_methods)*
-
-            /// Build the configuration, validating all fields.
-            pub fn build(self) -> Result<#name, String> {
-                Ok(#name {
-                    #(#build_assignments),*
-                })
-            }
-        }
-    };
-
-    TokenStream::from(expanded)
+    config::expand(input)
+        .unwrap_or_else(|e| e.to_compile_error())
+        .into()
 }
 
 /// Derive macro for generating preset constructors.
@@ -181,30 +118,9 @@ pub fn derive_kizzasi_config(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Preset, attributes(preset))]
 pub fn derive_preset(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
-
-    let mut preset_methods = Vec::new();
-
-    // Parse preset attributes
-    for attr in &input.attrs {
-        if attr.path().is_ident("preset") {
-            // Simplified: just generate a basic preset method
-            let method_name = syn::Ident::new("preset", name.span());
-            preset_methods.push(quote! {
-                pub fn #method_name() -> Self {
-                    Self::default()
-                }
-            });
-        }
-    }
-
-    let expanded = quote! {
-        impl #name {
-            #(#preset_methods)*
-        }
-    };
-
-    TokenStream::from(expanded)
+    preset::expand(input)
+        .unwrap_or_else(|e| e.to_compile_error())
+        .into()
 }
 
 /// Derive macro for metrics instrumentation.
@@ -223,21 +139,7 @@ pub fn derive_preset(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Instrumented, attributes(metrics))]
 pub fn derive_instrumented(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
-
-    let expanded = quote! {
-        impl kizzasi::telemetry::Instrumented for #name {
-            fn metrics(&self) -> std::sync::Arc<kizzasi::telemetry::MetricsCollector> {
-                self.collector.clone()
-            }
-        }
-    };
-
-    TokenStream::from(expanded)
-}
-
-#[cfg(test)]
-mod tests {
-    // Note: Testing proc-macros requires integration tests
-    // See tests/ directory for actual test cases
+    instrumented::expand(input)
+        .unwrap_or_else(|e| e.to_compile_error())
+        .into()
 }

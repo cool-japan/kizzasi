@@ -29,16 +29,16 @@ Bare-metal SSM inference engine with O(1) per-step complexity, fixed-point arith
 ```rust
 #![no_std]
 
-use kizzasi_embedded::{EmbeddedSSM, EmbeddedConfig};
+use kizzasi_embedded::ssm::{SsmConfig, SsmState};
 
-// Statically allocated model (no heap required)
-static CONFIG: EmbeddedConfig = EmbeddedConfig {
+// Statically allocated config (no heap required)
+static CONFIG: SsmConfig = SsmConfig {
     input_dim: 8,
     hidden_dim: 16,
     output_dim: 8,
 };
 
-fn inference_step(input: &[f32; 8], state: &mut EmbeddedSSM) -> [f32; 8] {
+fn inference_step(input: &[f32; 8], state: &mut SsmState) -> [f32; 8] {
     state.step(input)
 }
 ```

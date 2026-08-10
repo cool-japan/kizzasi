@@ -69,6 +69,10 @@ pub struct PruningConfig {
     pub num_iterations: usize,
     /// Whether to keep pruned weights for recovery
     pub keep_pruned_weights: bool,
+    /// Size of each attention head (number of columns per head); 0 means auto-detect via sqrt
+    pub head_size: usize,
+    /// Block size for block-wise pruning (NxN blocks); 0 means use default of 4
+    pub block_size: usize,
 }
 
 impl Default for PruningConfig {
@@ -80,6 +84,8 @@ impl Default for PruningConfig {
             global_threshold: false,
             num_iterations: 1,
             keep_pruned_weights: false,
+            head_size: 0,
+            block_size: 0,
         }
     }
 }
@@ -115,6 +121,18 @@ impl PruningConfig {
     /// Keep pruned weights
     pub fn with_keep_weights(mut self) -> Self {
         self.keep_pruned_weights = true;
+        self
+    }
+
+    /// Set attention head size for head-wise pruning
+    pub fn with_head_size(mut self, head_size: usize) -> Self {
+        self.head_size = head_size;
+        self
+    }
+
+    /// Set block size for block-wise pruning
+    pub fn with_block_size(mut self, block_size: usize) -> Self {
+        self.block_size = block_size;
         self
     }
 
@@ -197,12 +215,8 @@ impl StructuredPruner {
             PruningGranularity::Unstructured => self.prune_unstructured(weights)?,
             PruningGranularity::Channel => self.prune_channels(weights)?,
             PruningGranularity::Filter => self.prune_filters(weights)?,
-            _ => {
-                return Err(CoreError::InvalidConfig(format!(
-                    "Granularity {:?} not yet implemented for 2D tensors",
-                    self.config.granularity
-                )))
-            }
+            PruningGranularity::Head => self.prune_head_2d(weights)?,
+            PruningGranularity::Block => self.prune_block_2d(weights)?,
         };
 
         self.masks.insert(name.to_string(), mask.clone());
@@ -238,7 +252,8 @@ impl StructuredPruner {
         }
 
         // Sort by importance (ascending)
-        channel_importance.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        channel_importance
+            .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Determine how many channels to prune
         let num_to_prune = (out_channels as f32 * self.config.target_sparsity) as usize;
@@ -256,6 +271,101 @@ impl StructuredPruner {
     fn prune_filters(&self, weights: &Array2<f32>) -> CoreResult<PruningMask> {
         // For 2D weights, treat as channels
         self.prune_channels(weights)
+    }
+
+    /// Head-wise pruning (prune entire attention heads, i.e., column groups)
+    fn prune_head_2d(&self, weights: &Array2<f32>) -> CoreResult<PruningMask> {
+        let (num_rows, num_cols) = weights.dim();
+        let head_size = if self.config.head_size == 0 {
+            (num_cols as f32).sqrt() as usize
+        } else {
+            self.config.head_size
+        };
+        if head_size == 0 {
+            return Err(CoreError::InvalidConfig(
+                "head_size must be > 0 (or num_cols must be > 0 for auto-detection)".into(),
+            ));
+        }
+        let num_heads = num_cols / head_size;
+
+        // Compute L1 importance per head
+        let mut head_importance: Vec<(usize, f32)> = (0..num_heads)
+            .map(|h| {
+                let col_start = h * head_size;
+                let col_end = col_start + head_size;
+                let importance: f32 = (0..num_rows)
+                    .flat_map(|r| (col_start..col_end).map(move |c| weights[[r, c]].abs()))
+                    .sum();
+                (h, importance)
+            })
+            .collect();
+
+        // Sort ascending (least important first)
+        head_importance.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let num_to_prune = (num_heads as f32 * self.config.target_sparsity) as usize;
+
+        let mut mask = Array2::<f32>::ones(weights.dim());
+        for &(h, _) in head_importance.iter().take(num_to_prune) {
+            let col_start = h * head_size;
+            let col_end = col_start + head_size;
+            for r in 0..num_rows {
+                for c in col_start..col_end {
+                    mask[[r, c]] = 0.0;
+                }
+            }
+        }
+
+        Ok(PruningMask::new(mask))
+    }
+
+    /// Block-wise pruning (prune NxN blocks of weights)
+    fn prune_block_2d(&self, weights: &Array2<f32>) -> CoreResult<PruningMask> {
+        use scirs2_core::ndarray::s;
+
+        let (num_rows, num_cols) = weights.dim();
+        let block_size = if self.config.block_size == 0 {
+            4
+        } else {
+            self.config.block_size
+        };
+
+        let num_row_blocks = num_rows / block_size;
+        let num_col_blocks = num_cols / block_size;
+
+        // Compute Frobenius norm per block
+        let mut block_importance: Vec<(usize, usize, f32)> = (0..num_row_blocks)
+            .flat_map(|br| {
+                let weights_ref = &weights;
+                (0..num_col_blocks).map(move |bc| {
+                    let row_start = br * block_size;
+                    let row_end = row_start + block_size;
+                    let col_start = bc * block_size;
+                    let col_end = col_start + block_size;
+                    let block = weights_ref.slice(s![row_start..row_end, col_start..col_end]);
+                    let frobenius: f32 = block.iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
+                    (br, bc, frobenius)
+                })
+            })
+            .collect();
+
+        // Sort ascending (least important first)
+        block_importance.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let num_blocks = num_row_blocks * num_col_blocks;
+        let num_to_prune = (num_blocks as f32 * self.config.target_sparsity) as usize;
+
+        let mut mask = Array2::<f32>::ones(weights.dim());
+        for &(br, bc, _) in block_importance.iter().take(num_to_prune) {
+            let row_start = br * block_size;
+            let row_end = row_start + block_size;
+            let col_start = bc * block_size;
+            let col_end = col_start + block_size;
+            mask.slice_mut(s![row_start..row_end, col_start..col_end])
+                .fill(0.0);
+        }
+
+        Ok(PruningMask::new(mask))
     }
 
     /// Compute importance scores for weights
@@ -283,7 +393,7 @@ impl StructuredPruner {
     fn compute_threshold(&self, importance: &Array2<f32>) -> CoreResult<f32> {
         // Flatten and sort importance values
         let mut values: Vec<f32> = importance.iter().copied().collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         // Find threshold at target sparsity percentile
         let threshold_idx = (values.len() as f32 * self.config.target_sparsity) as usize;
@@ -414,7 +524,7 @@ impl GradientPruner {
     /// Compute threshold from gradient-based importance
     fn compute_gradient_threshold(&self, importance: &Array2<f32>) -> CoreResult<f32> {
         let mut values: Vec<f32> = importance.iter().copied().collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let threshold_idx = (values.len() as f32 * self.pruner.config.target_sparsity) as usize;
         Ok(values.get(threshold_idx).copied().unwrap_or(0.0))
@@ -577,5 +687,102 @@ mod tests {
 
         // Should achieve approximately 50% sparsity
         assert!(mask.sparsity >= 0.4 && mask.sparsity <= 0.6);
+    }
+
+    #[test]
+    fn test_head_pruning_2d() {
+        // 4x8 matrix — 2 heads of size 4
+        // First 4 cols (head 0): value 0.1 (low importance)
+        // Last 4 cols (head 1): value 1.0 (high importance)
+        let weights = Array2::from_shape_fn((4, 8), |(_i, j)| if j < 4 { 0.1 } else { 1.0 });
+        let config = PruningConfig::new(PruningStrategy::L1Norm, 0.5)
+            .with_granularity(PruningGranularity::Head)
+            .with_head_size(4);
+        let mut pruner = StructuredPruner::new(config).expect("valid config");
+        let mask = pruner.prune("attn", &weights).expect("pruning ok");
+
+        // Head 0 (cols 0..4) should be zeroed
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(
+                    mask.mask[[i, j]],
+                    0.0,
+                    "head 0 col {j} row {i} should be pruned"
+                );
+            }
+            for j in 4..8 {
+                assert_eq!(
+                    mask.mask[[i, j]],
+                    1.0,
+                    "head 1 col {j} row {i} should be kept"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_block_pruning_2d() {
+        // 4x4 matrix with 2x2 blocks (block_size=2 → 4 blocks)
+        // top-left block (rows 0..2, cols 0..2): value 0.01 (lowest)
+        // bottom-right block (rows 2..4, cols 2..4): value 1.0 (highest)
+        // prune 25% → only 1 block pruned (the top-left)
+        let weights = Array2::from_shape_fn((4, 4), |(i, j)| {
+            if i < 2 && j < 2 {
+                0.01
+            } else if i >= 2 && j >= 2 {
+                1.0
+            } else {
+                0.5
+            }
+        });
+        let config = PruningConfig::new(PruningStrategy::L2Norm, 0.25)
+            .with_granularity(PruningGranularity::Block)
+            .with_block_size(2);
+        let mut pruner = StructuredPruner::new(config).expect("valid config");
+        let mask = pruner.prune("block_layer", &weights).expect("pruning ok");
+
+        // top-left 2x2 block should be zeroed
+        for i in 0..2 {
+            for j in 0..2 {
+                assert_eq!(
+                    mask.mask[[i, j]],
+                    0.0,
+                    "top-left block [{i},{j}] should be pruned"
+                );
+            }
+        }
+        // bottom-right block should remain
+        for i in 2..4 {
+            for j in 2..4 {
+                assert_eq!(
+                    mask.mask[[i, j]],
+                    1.0,
+                    "bottom-right block [{i},{j}] should remain"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_head_pruning_sparsity() {
+        // 4 heads of size 2, prune 50% → 2 heads pruned
+        let weights = Array2::from_shape_fn((4, 8), |(_i, j)| {
+            // head importance scales with j/2
+            (j / 2) as f32 * 0.25 + 0.1
+        });
+        let config = PruningConfig::new(PruningStrategy::L1Norm, 0.5)
+            .with_granularity(PruningGranularity::Head)
+            .with_head_size(2);
+        let mut pruner = StructuredPruner::new(config).expect("valid config");
+        let mask = pruner.prune("attn_heads", &weights).expect("pruning ok");
+
+        // Exactly 50% of columns should be zeroed (4 out of 8)
+        let zeroed_cols: usize = (0..8)
+            .filter(|&j| (0..4).all(|i| mask.mask[[i, j]] == 0.0))
+            .count();
+        assert_eq!(
+            zeroed_cols, 4,
+            "expected 4 zeroed columns, got {zeroed_cols}"
+        );
     }
 }

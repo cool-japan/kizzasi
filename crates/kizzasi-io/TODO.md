@@ -245,5 +245,5 @@
   - Source separation (FastICA, NMF, PCA, Temporal decorrelation)
   - Beamforming (Delay-and-Sum, MVDR, Adaptive, DOA)
   - Note: Benchmark framework in place; some benchmarks may need API refinement
-- [ ] Tutorial documentation for advanced features
-- [ ] API reference updates
+- [x] Tutorial documentation for advanced features (see examples/: audio_processing.rs, realtime_filtering.rs, advanced_signal_processing.rs, wavelet_denoising.rs, hilbert_huang_transform.rs, source_separation.rs, beamforming.rs)
+- [x] API reference updates (cargo doc -p kizzasi-io --no-deps emits zero warnings)

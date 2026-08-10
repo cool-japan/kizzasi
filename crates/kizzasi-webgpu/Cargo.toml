@@ -1,0 +1,31 @@
+[package]
+name = "kizzasi-webgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "WebGPU acceleration backend for Kizzasi signal processing"
+keywords = ["webgpu", "gpu", "acceleration", "signal", "wgsl"]
+categories = ["science", "hardware-support", "rendering::graphics-api"]
+
+[features]
+default = []
+webgpu = ["dep:wgpu"]
+
+[dependencies]
+# wgpu cannot use `workspace = true` here because workspace deps cannot be optional.
+# The version is kept in sync with the workspace dep `wgpu = { version = "30" }`.
+wgpu = { version = "30", optional = true }
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+kizzasi-core.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[example]]
+name = "webgpu_kernels_demo"
+required-features = ["webgpu"]

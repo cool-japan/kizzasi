@@ -332,7 +332,57 @@ impl LoraAdapterBuilder {
     }
 }
 
-/// LoRA adapter loader for reading from disk
+/// Wire format for serializing/deserializing a 2-D weight matrix as JSON.
+///
+/// Format on disk:
+/// ```json
+/// {"shape": [rows, cols], "data": [[…row0…], […row1…], …]}
+/// ```
+#[derive(Debug, Serialize, Deserialize)]
+struct MatrixJson {
+    shape: [usize; 2],
+    data: Vec<Vec<f32>>,
+}
+
+impl MatrixJson {
+    /// Convert an `Array2<f32>` into the serialisable wire form.
+    fn from_array(array: &Array2<f32>) -> Self {
+        let rows = array.nrows();
+        let data = (0..rows).map(|r| array.row(r).to_vec()).collect();
+        Self {
+            shape: [rows, array.ncols()],
+            data,
+        }
+    }
+
+    /// Reconstruct an `Array2<f32>` from the wire form, validating shape consistency.
+    fn into_array(self) -> Result<Array2<f32>, String> {
+        let [rows, cols] = self.shape;
+        if self.data.len() != rows {
+            return Err(format!(
+                "shape declares {} rows but data has {} rows",
+                rows,
+                self.data.len()
+            ));
+        }
+        let mut flat = Vec::with_capacity(rows * cols);
+        for (r, row) in self.data.into_iter().enumerate() {
+            if row.len() != cols {
+                return Err(format!(
+                    "shape declares {} cols but row {} has {} elements",
+                    cols,
+                    r,
+                    row.len()
+                ));
+            }
+            flat.extend_from_slice(&row);
+        }
+        Array2::from_shape_vec((rows, cols), flat)
+            .map_err(|e| format!("failed to build Array2 from weight data: {}", e))
+    }
+}
+
+/// LoRA adapter loader for reading from and writing to disk
 pub struct LoraAdapterLoader {
     /// Base path for adapter files
     base_path: PathBuf,
@@ -346,40 +396,139 @@ impl LoraAdapterLoader {
         }
     }
 
-    /// Load an adapter from directory
+    /// Save an adapter to disk.
     ///
-    /// Expected structure:
-    /// - adapter_name/
-    ///   - config.json
-    ///   - lora_a.safetensors (or .npy)
-    ///   - lora_b.safetensors (or .npy)
+    /// Creates `<base_path>/<adapter_name>/` (and any missing parents) then
+    /// writes three files:
+    ///
+    /// - `config.json`  — serialised `LoraConfig`
+    /// - `lora_a.json`  — matrix A: `{"shape": [rank, in_features], "data": [[…]…]}`
+    /// - `lora_b.json`  — matrix B: `{"shape": [out_features, rank], "data": [[…]…]}`
+    pub fn save(
+        &self,
+        adapter_name: impl AsRef<str>,
+        adapter: &LoraAdapter,
+        config: &LoraConfig,
+    ) -> InferenceResult<()> {
+        let adapter_path = self.base_path.join(adapter_name.as_ref());
+        std::fs::create_dir_all(&adapter_path)?;
+
+        // Write config.json
+        let config_json = serde_json::to_string_pretty(config).map_err(|e| {
+            InferenceError::ForwardError(format!("Failed to serialise LoraConfig: {}", e))
+        })?;
+        std::fs::write(adapter_path.join("config.json"), config_json)?;
+
+        // Write lora_a.json
+        let a_json = serde_json::to_string_pretty(&MatrixJson::from_array(&adapter.lora_a))
+            .map_err(|e| {
+                InferenceError::ForwardError(format!("Failed to serialise lora_a: {}", e))
+            })?;
+        std::fs::write(adapter_path.join("lora_a.json"), a_json)?;
+
+        // Write lora_b.json
+        let b_json = serde_json::to_string_pretty(&MatrixJson::from_array(&adapter.lora_b))
+            .map_err(|e| {
+                InferenceError::ForwardError(format!("Failed to serialise lora_b: {}", e))
+            })?;
+        std::fs::write(adapter_path.join("lora_b.json"), b_json)?;
+
+        Ok(())
+    }
+
+    /// Load an adapter from disk.
+    ///
+    /// Expected directory layout under `<base_path>/<adapter_name>/`:
+    ///
+    /// - `config.json`  — `LoraConfig` (optional; defaults used when absent)
+    /// - `lora_a.json`  — matrix A: `{"shape": [rank, in_features], "data": [[…row…], …]}`
+    /// - `lora_b.json`  — matrix B: `{"shape": [out_features, rank], "data": [[…row…], …]}`
+    ///
+    /// Returns `InferenceError::ForwardError` if either weight file is missing,
+    /// unparseable, or contains shape inconsistencies.
     pub fn load(
         &self,
         adapter_name: impl AsRef<str>,
     ) -> InferenceResult<(LoraAdapter, LoraConfig)> {
-        let adapter_path = self.base_path.join(adapter_name.as_ref());
+        let name = adapter_name.as_ref();
+        let adapter_path = self.base_path.join(name);
 
-        // Load config
+        // ── config.json ───────────────────────────────────────────────────────
         let config_path = adapter_path.join("config.json");
         let config: LoraConfig = if config_path.exists() {
             let config_str = std::fs::read_to_string(&config_path).map_err(|e| {
-                InferenceError::ForwardError(format!("Failed to read config: {}", e))
+                InferenceError::ForwardError(format!(
+                    "Failed to read config for adapter '{}': {}",
+                    name, e
+                ))
             })?;
             serde_json::from_str(&config_str).map_err(|e| {
-                InferenceError::ForwardError(format!("Failed to parse config: {}", e))
+                InferenceError::ForwardError(format!(
+                    "Failed to parse config for adapter '{}': {}",
+                    name, e
+                ))
             })?
         } else {
             LoraConfig::default()
         };
 
-        // For now, return a placeholder adapter since we don't have actual file loading
-        // In a real implementation, you'd load from safetensors or numpy files
-        let rank = config.rank;
-        let lora_a = Array2::zeros((rank, 128)); // Placeholder dimensions
-        let lora_b = Array2::zeros((128, rank));
-        let scaling = config.scaling();
+        // ── lora_a.json ───────────────────────────────────────────────────────
+        let a_path = adapter_path.join("lora_a.json");
+        if !a_path.exists() {
+            return Err(InferenceError::ForwardError(format!(
+                "Weight file lora_a.json not found for adapter '{}'",
+                name
+            )));
+        }
+        let a_str = std::fs::read_to_string(&a_path).map_err(|e| {
+            InferenceError::ForwardError(format!(
+                "Failed to read lora_a.json for adapter '{}': {}",
+                name, e
+            ))
+        })?;
+        let a_wire: MatrixJson = serde_json::from_str(&a_str).map_err(|e| {
+            InferenceError::ForwardError(format!(
+                "Failed to parse lora_a.json for adapter '{}': {}",
+                name, e
+            ))
+        })?;
+        let lora_a = a_wire.into_array().map_err(|e| {
+            InferenceError::ForwardError(format!(
+                "Invalid lora_a.json for adapter '{}': {}",
+                name, e
+            ))
+        })?;
 
-        let adapter = LoraAdapter::new(lora_a, lora_b, scaling, adapter_name.as_ref())?;
+        // ── lora_b.json ───────────────────────────────────────────────────────
+        let b_path = adapter_path.join("lora_b.json");
+        if !b_path.exists() {
+            return Err(InferenceError::ForwardError(format!(
+                "Weight file lora_b.json not found for adapter '{}'",
+                name
+            )));
+        }
+        let b_str = std::fs::read_to_string(&b_path).map_err(|e| {
+            InferenceError::ForwardError(format!(
+                "Failed to read lora_b.json for adapter '{}': {}",
+                name, e
+            ))
+        })?;
+        let b_wire: MatrixJson = serde_json::from_str(&b_str).map_err(|e| {
+            InferenceError::ForwardError(format!(
+                "Failed to parse lora_b.json for adapter '{}': {}",
+                name, e
+            ))
+        })?;
+        let lora_b = b_wire.into_array().map_err(|e| {
+            InferenceError::ForwardError(format!(
+                "Invalid lora_b.json for adapter '{}': {}",
+                name, e
+            ))
+        })?;
+
+        // ── assemble ──────────────────────────────────────────────────────────
+        let scaling = config.scaling();
+        let adapter = LoraAdapter::new(lora_a, lora_b, scaling, name)?;
         Ok((adapter, config))
     }
 
@@ -532,5 +681,165 @@ mod tests {
 
         let outputs = adapter.apply_batch(&inputs).unwrap();
         assert_eq!(outputs.nrows(), 3);
+    }
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn make_tmp_dir() -> std::path::PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("kizzasi_lora_test_{}", ts));
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    // ── round-trip tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_lora_save_load_roundtrip() {
+        let tmp = make_tmp_dir();
+
+        // Build an adapter with known non-zero weights: A is (4×8), B is (8×4), rank=4
+        let a_data: Vec<f32> = (0..32).map(|i| i as f32 * 0.01).collect();
+        let b_data: Vec<f32> = (0..32).map(|i| -(i as f32) * 0.02).collect();
+        let lora_a_orig = Array2::from_shape_vec((4, 8), a_data).unwrap();
+        let lora_b_orig = Array2::from_shape_vec((8, 4), b_data).unwrap();
+
+        let config = LoraConfig::new().rank(4).alpha(8.0);
+        let scaling = config.scaling();
+        let adapter_orig =
+            LoraAdapter::new(lora_a_orig.clone(), lora_b_orig.clone(), scaling, "rt_test").unwrap();
+
+        let loader = LoraAdapterLoader::new(&tmp);
+        loader.save("rt_test", &adapter_orig, &config).unwrap();
+
+        let (adapter_loaded, _cfg) = loader.load("rt_test").unwrap();
+
+        assert_eq!(adapter_loaded.rank(), adapter_orig.rank());
+        assert_eq!(adapter_loaded.in_features(), adapter_orig.in_features());
+        assert_eq!(adapter_loaded.out_features(), adapter_orig.out_features());
+
+        // Verify apply() produces identical output on a fixed input
+        let input = Array1::from_vec(vec![1.0, 0.5, -0.5, 0.25, 0.1, -0.1, 0.75, -0.25]);
+        let out_orig = adapter_orig.apply(&input).unwrap();
+        let out_loaded = adapter_loaded.apply(&input).unwrap();
+
+        assert_eq!(out_orig.len(), out_loaded.len());
+        for (a, b) in out_orig.iter().zip(out_loaded.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "apply() output differs: {} vs {}",
+                a,
+                b
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_lora_save_load_matrix_equality() {
+        let tmp = make_tmp_dir();
+
+        let a_data: Vec<f32> = (0..32).map(|i| (i as f32 + 1.0) * 0.05).collect();
+        let b_data: Vec<f32> = (0..32).map(|i| (i as f32 + 1.0) * -0.03).collect();
+        let lora_a_orig = Array2::from_shape_vec((4, 8), a_data).unwrap();
+        let lora_b_orig = Array2::from_shape_vec((8, 4), b_data).unwrap();
+
+        let config = LoraConfig::new().rank(4).alpha(16.0);
+        let scaling = config.scaling();
+        let adapter_orig =
+            LoraAdapter::new(lora_a_orig.clone(), lora_b_orig.clone(), scaling, "me_test").unwrap();
+
+        let loader = LoraAdapterLoader::new(&tmp);
+        loader.save("me_test", &adapter_orig, &config).unwrap();
+        let (adapter_loaded, _cfg) = loader.load("me_test").unwrap();
+
+        // Verify matrix A element-wise via apply() on basis vectors
+        // Each basis vector e_i isolates the i-th column of A (and through B the full product).
+        // A direct element comparison via the public fields (which are pub) is simpler:
+        for r in 0..adapter_orig.lora_a.nrows() {
+            for c in 0..adapter_orig.lora_a.ncols() {
+                let orig = adapter_orig.lora_a[[r, c]];
+                let loaded = adapter_loaded.lora_a[[r, c]];
+                assert!(
+                    (orig - loaded).abs() < 1e-6,
+                    "lora_a[{},{}] differs: {} vs {}",
+                    r,
+                    c,
+                    orig,
+                    loaded
+                );
+            }
+        }
+        for r in 0..adapter_orig.lora_b.nrows() {
+            for c in 0..adapter_orig.lora_b.ncols() {
+                let orig = adapter_orig.lora_b[[r, c]];
+                let loaded = adapter_loaded.lora_b[[r, c]];
+                assert!(
+                    (orig - loaded).abs() < 1e-6,
+                    "lora_b[{},{}] differs: {} vs {}",
+                    r,
+                    c,
+                    orig,
+                    loaded
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_lora_load_missing_adapter_returns_err() {
+        let tmp = make_tmp_dir();
+
+        let loader = LoraAdapterLoader::new(&tmp);
+        let result = loader.load("nonexistent_adapter_99");
+
+        assert!(result.is_err(), "Expected Err for missing adapter, got Ok");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_lora_config_preserved_after_roundtrip() {
+        let tmp = make_tmp_dir();
+
+        let config = LoraConfig::new()
+            .rank(8)
+            .alpha(32.0)
+            .dropout(0.1)
+            .add_target_module("q_proj")
+            .add_target_module("k_proj");
+
+        let lora_a = Array2::from_shape_vec((8, 16), vec![0.01; 128]).unwrap();
+        let lora_b = Array2::from_shape_vec((16, 8), vec![0.02; 128]).unwrap();
+        let scaling = config.scaling();
+        let adapter = LoraAdapter::new(lora_a, lora_b, scaling, "cfg_test").unwrap();
+
+        let loader = LoraAdapterLoader::new(&tmp);
+        loader.save("cfg_test", &adapter, &config).unwrap();
+
+        let (_adapter_loaded, config_loaded) = loader.load("cfg_test").unwrap();
+
+        assert_eq!(config_loaded.rank, 8);
+        assert!(
+            (config_loaded.alpha - 32.0).abs() < 1e-6,
+            "alpha mismatch: {}",
+            config_loaded.alpha
+        );
+        assert!(
+            (config_loaded.dropout - 0.1).abs() < 1e-6,
+            "dropout mismatch: {}",
+            config_loaded.dropout
+        );
+        // target_modules order may vary in the default set; check both custom ones present
+        assert!(config_loaded.target_modules.contains(&"q_proj".to_string()));
+        assert!(config_loaded.target_modules.contains(&"k_proj".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

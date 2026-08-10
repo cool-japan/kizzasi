@@ -230,7 +230,13 @@ impl S4DLayer {
 
         // Output: y = C · h + D · x
         let mut y_scalar = self.d * x_scalar;
-        y_scalar += simd::dot_product(self.c.as_slice().unwrap(), h.as_slice().unwrap());
+        y_scalar += simd::dot_product(
+            self.c
+                .as_slice()
+                .expect("invariant: c is a contiguous Array1"),
+            h.as_slice()
+                .expect("invariant: h is a contiguous local Array1"),
+        );
 
         // Broadcast to output dimension
         let y = Array1::from_elem(self.config.hidden_dim, y_scalar);

@@ -492,7 +492,8 @@ impl PyTorchConverter {
     /// their string representation.
     ///
     /// For HuggingFace Hub models where the checkpoint has not been downloaded
-    /// yet, use [`HfHubClient::download_file`] to fetch `"config.json"` first:
+    /// yet, use `HfHubClient::download_file` (available with the `hf-hub`
+    /// feature, see [`crate::hf_hub`]) to fetch `"config.json"` first:
     ///
     /// ```rust,ignore
     /// use kizzasi_model::hf_hub::{HfHubClient, HfHubConfig};
@@ -719,17 +720,27 @@ impl CheckpointFormat {
 pub mod convert {
     use super::*;
 
-    /// Convert PyTorch CHW format to HWC (for convolutions)
+    /// Convert PyTorch CHW format to HWC (for convolutions).
+    ///
+    /// For a 2-D weight matrix the "channel" axis is axis-0 and the spatial
+    /// axis is axis-1.  Transposing gives the HWC (row-major contiguous) view
+    /// that many inference back-ends expect.  The result is always a
+    /// fresh owned allocation (`.to_owned()` after `.t()`).
     pub fn chw_to_hwc(tensor: &Array2<f32>) -> Array2<f32> {
-        // TODO: Implement actual dimension permutation
-        // This is a placeholder
-        tensor.clone()
+        tensor.t().to_owned()
     }
 
-    /// Convert PyTorch row-major to column-major if needed
-    pub fn transpose_if_needed(tensor: &Array2<f32>, _needs_transpose: bool) -> Array2<f32> {
-        // TODO: Implement actual transpose logic
-        tensor.clone()
+    /// Convert PyTorch row-major to column-major if needed.
+    ///
+    /// When `needs_transpose` is `true` the matrix axes are swapped and the
+    /// result is returned as a contiguous owned allocation.  Otherwise the
+    /// input is cloned unchanged.
+    pub fn transpose_if_needed(tensor: &Array2<f32>, needs_transpose: bool) -> Array2<f32> {
+        if needs_transpose {
+            tensor.t().to_owned()
+        } else {
+            tensor.clone()
+        }
     }
 
     /// Dequantize INT8 weights to FP32

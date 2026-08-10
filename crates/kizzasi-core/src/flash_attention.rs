@@ -122,48 +122,79 @@ impl FlashAttention {
     ///
     /// # Arguments
     ///
-    /// * `q` - Query tensor [batch, seq_len, num_heads, head_dim]
-    /// * `k` - Key tensor [batch, seq_len, num_heads, head_dim]
-    /// * `v` - Value tensor [batch, seq_len, num_heads, head_dim]
+    /// * `q` - Query tensor `[batch, seq_len, d_model]` where `d_model = num_heads * head_dim`
+    /// * `k` - Key tensor `[batch, seq_len, d_model]`
+    /// * `v` - Value tensor `[batch, seq_len, d_model]`
     ///
     /// # Returns
     ///
-    /// Output tensor [batch, seq_len, num_heads, head_dim]
+    /// Output tensor `[batch, seq_len, d_model]`
     pub fn forward(
         &self,
         q: &Array3<f32>,
         k: &Array3<f32>,
         v: &Array3<f32>,
     ) -> CoreResult<Array3<f32>> {
-        let (batch_size, _seq_len_q, d_model) = q.dim();
-        let (_, _seq_len_kv, _) = k.dim();
+        let (batch_size, seq_len, d_model) = q.dim();
+        let num_heads = self.config.num_heads;
+        let head_dim = self.config.head_dim;
 
-        if d_model != self.config.num_heads * self.config.head_dim {
+        if d_model != num_heads * head_dim {
             return Err(CoreError::DimensionMismatch {
-                expected: self.config.num_heads * self.config.head_dim,
+                expected: num_heads * head_dim,
                 got: d_model,
             });
         }
 
-        // Reshape to [batch, seq, heads, head_dim]
-        let q_reshaped = self.reshape_qkv(q)?;
-        let k_reshaped = self.reshape_qkv(k)?;
-        let v_reshaped = self.reshape_qkv(v)?;
+        let mut output = Array3::zeros((batch_size, seq_len, d_model));
 
-        // Process each batch independently
-        // For simplicity, we'll process the first batch
-        // In production, you'd want proper batch processing
-        let output = if batch_size == 1 {
-            self.flash_attention_forward(&q_reshaped, &k_reshaped, &v_reshaped)?
-        } else {
-            // Simplified: just process first batch for now
-            self.flash_attention_forward(&q_reshaped, &k_reshaped, &v_reshaped)?
-        };
+        for b in 0..batch_size {
+            // Slice [seq, d_model] for this batch element
+            let q_2d = q.slice(s![b, .., ..]).to_owned();
+            let k_2d = k.slice(s![b, .., ..]).to_owned();
+            let v_2d = v.slice(s![b, .., ..]).to_owned();
+
+            // Reshape [seq, d_model] -> [seq, num_heads, head_dim]
+            let q_3d = self.slice_to_heads(&q_2d)?;
+            let k_3d = self.slice_to_heads(&k_2d)?;
+            let v_3d = self.slice_to_heads(&v_2d)?;
+
+            // Run tiled Flash-Attention kernel: [seq, num_heads, head_dim] -> [seq, num_heads, head_dim]
+            let out_3d = self.flash_attention_forward(&q_3d, &k_3d, &v_3d)?;
+
+            // Reshape [seq, num_heads, head_dim] -> [seq, d_model]
+            let out_2d = out_3d.into_shape_with_order((seq_len, d_model))?;
+
+            output.slice_mut(s![b, .., ..]).assign(&out_2d);
+        }
 
         Ok(output)
     }
 
+    /// Reshape `[seq, d_model]` into `[seq, num_heads, head_dim]` for multi-head processing.
+    ///
+    /// The reshape is valid because the last axis is stored contiguously in C (row-major) order
+    /// and `d_model = num_heads * head_dim`.
+    fn slice_to_heads(&self, x: &Array2<f32>) -> CoreResult<Array3<f32>> {
+        let (seq, d_model) = x.dim();
+        let num_heads = self.config.num_heads;
+        let head_dim = self.config.head_dim;
+
+        if d_model != num_heads * head_dim {
+            return Err(CoreError::DimensionMismatch {
+                expected: num_heads * head_dim,
+                got: d_model,
+            });
+        }
+
+        Ok(x.clone()
+            .into_shape_with_order((seq, num_heads, head_dim))?)
+    }
+
     /// Core Flash-Attention-2 algorithm with tiling
+    ///
+    /// Accepts `[seq_len, num_heads, head_dim]` tensors and returns the attended output
+    /// with the same shape using the online softmax tiling algorithm.
     fn flash_attention_forward(
         &self,
         q: &Array3<f32>,
@@ -292,24 +323,6 @@ impl FlashAttention {
         Ok(output)
     }
 
-    /// Reshape [batch, seq, d_model] to [batch, seq, heads, head_dim]
-    fn reshape_qkv(&self, x: &Array3<f32>) -> CoreResult<Array3<f32>> {
-        let (_batch, _seq, d_model) = x.dim();
-        let num_heads = self.config.num_heads;
-        let head_dim = self.config.head_dim;
-
-        if d_model != num_heads * head_dim {
-            return Err(CoreError::DimensionMismatch {
-                expected: num_heads * head_dim,
-                got: d_model,
-            });
-        }
-
-        // For simplicity, we'll keep 3D shape [batch, seq, d_model]
-        // In a full implementation, you'd want proper 4D reshaping
-        Ok(x.clone())
-    }
-
     /// Get configuration
     pub fn config(&self) -> &FlashAttentionConfig {
         &self.config
@@ -348,6 +361,7 @@ pub fn flash_attention_fused(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::efficient_attention::FusedAttentionKernel;
 
     #[test]
     fn test_flash_attention_config() {
@@ -500,5 +514,271 @@ mod tests {
         assert!(output.iter().all(|&x| x.is_finite()));
         // Check values are reasonable (not all zeros)
         assert!(output.iter().any(|&x| x.abs() > 1e-6));
+    }
+
+    /// Single-head flash attention should match the FusedAttentionKernel oracle exactly.
+    ///
+    /// With num_heads=1, head_dim=d_model, the flash kernel and the fused oracle perform
+    /// identical per-head softmax(QK^T / sqrt(head_dim))V computation.  Any discrepancy
+    /// larger than 1e-4 would indicate a bug in the reshape or normalization path.
+    #[test]
+    fn test_flash_attention_single_head_matches_oracle() {
+        let num_heads = 1usize;
+        let head_dim = 8usize;
+        let d_model = num_heads * head_dim; // 8
+        let seq_len = 6usize;
+        let batch_size = 1usize;
+
+        // Non-trivial, deterministic inputs
+        let q = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            (i + d) as f32 * 0.1
+        });
+        let k = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            (i * 2 + d) as f32 * 0.07
+        });
+        let v = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            ((i + 1) * (d + 1)) as f32 * 0.05
+        });
+
+        let config = FlashAttentionConfig::new(num_heads, head_dim);
+        let flash_attn = FlashAttention::new(config).unwrap();
+
+        let output = flash_attn.forward(&q, &k, &v).unwrap();
+        assert_eq!(output.dim(), (batch_size, seq_len, d_model));
+
+        // Oracle: FusedAttentionKernel operates on [seq, head_dim]
+        // With num_heads=1, the entire d_model row is a single head
+        let q_2d = q.slice(s![0, .., ..]).to_owned();
+        let k_2d = k.slice(s![0, .., ..]).to_owned();
+        let v_2d = v.slice(s![0, .., ..]).to_owned();
+        let oracle = FusedAttentionKernel::forward(&q_2d, &k_2d, &v_2d, false).unwrap();
+
+        let flash_out = output.slice(s![0, .., ..]).to_owned();
+
+        for i in 0..seq_len {
+            for d in 0..d_model {
+                let got = flash_out[[i, d]];
+                let expected = oracle[[i, d]];
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "single-head: row {} col {}: flash={} oracle={} diff={}",
+                    i,
+                    d,
+                    got,
+                    expected,
+                    (got - expected).abs()
+                );
+            }
+        }
+    }
+
+    /// Multi-head flash attention must agree with the per-head oracle on every element.
+    ///
+    /// This test exercises the multi-head splitting path: Q/K/V are `[batch=1, seq=6, d_model=8]`
+    /// with `num_heads=2, head_dim=4`.  The oracle is run independently on each head slice and
+    /// the results are concatenated.  Before the bug-fix, `reshape_qkv` was a no-op so the
+    /// kernel mis-interpreted axes and produced incorrect output.
+    #[test]
+    fn test_flash_attention_multi_head_matches_oracle() {
+        let num_heads = 2usize;
+        let head_dim = 4usize;
+        let d_model = num_heads * head_dim; // 8
+        let seq_len = 6usize;
+        let batch_size = 1usize;
+
+        // Varied, deterministic inputs that differ across head sub-spaces
+        let q = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            ((i * 3 + d * 7) % 13) as f32 * 0.1 - 0.3
+        });
+        let k = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            ((i * 5 + d * 2) % 11) as f32 * 0.08 - 0.2
+        });
+        let v = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            ((i + d * 4) % 7) as f32 * 0.15
+        });
+
+        let config = FlashAttentionConfig::new(num_heads, head_dim);
+        let flash_attn = FlashAttention::new(config).unwrap();
+
+        let output = flash_attn.forward(&q, &k, &v).unwrap();
+        assert_eq!(output.dim(), (batch_size, seq_len, d_model));
+
+        // Build oracle: process each head independently on [seq, head_dim] slices
+        let q_2d = q.slice(s![0, .., ..]).to_owned();
+        let k_2d = k.slice(s![0, .., ..]).to_owned();
+        let v_2d = v.slice(s![0, .., ..]).to_owned();
+
+        let mut oracle = Array2::<f32>::zeros((seq_len, d_model));
+        for h in 0..num_heads {
+            let h_start = h * head_dim;
+            let h_end = h_start + head_dim;
+
+            // Extract head slice [seq, head_dim]
+            let q_h = q_2d.slice(s![.., h_start..h_end]).to_owned();
+            let k_h = k_2d.slice(s![.., h_start..h_end]).to_owned();
+            let v_h = v_2d.slice(s![.., h_start..h_end]).to_owned();
+
+            let head_out = FusedAttentionKernel::forward(&q_h, &k_h, &v_h, false).unwrap();
+
+            // Write head result back into the corresponding columns of oracle
+            oracle.slice_mut(s![.., h_start..h_end]).assign(&head_out);
+        }
+
+        let flash_out = output.slice(s![0, .., ..]).to_owned();
+
+        for i in 0..seq_len {
+            for d in 0..d_model {
+                let got = flash_out[[i, d]];
+                let expected = oracle[[i, d]];
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "multi-head: row {} col {}: flash={} oracle={} diff={}",
+                    i,
+                    d,
+                    got,
+                    expected,
+                    (got - expected).abs()
+                );
+            }
+        }
+    }
+
+    /// Batch processing must be independent: identical inputs across batch elements produce
+    /// identical outputs, and different inputs produce different outputs.
+    ///
+    /// Before the bug-fix the forward pass only ever processed the data corresponding to
+    /// the first batch element (the `else` branch was a copy of the `batch_size==1` branch),
+    /// so all output batch slices would be equal regardless of input differences.
+    #[test]
+    fn test_flash_attention_batch_independence() {
+        let num_heads = 2usize;
+        let head_dim = 4usize;
+        let d_model = num_heads * head_dim; // 8
+        let seq_len = 5usize;
+        let batch_size = 3usize;
+
+        // batch[0] and batch[2] get the same values; batch[1] gets different values
+        let q = Array3::from_shape_fn((batch_size, seq_len, d_model), |(b, i, d)| {
+            if b == 1 {
+                ((i * 7 + d * 3) % 11) as f32 * 0.2 - 0.5
+            } else {
+                (i + d) as f32 * 0.1
+            }
+        });
+        let k = Array3::from_shape_fn((batch_size, seq_len, d_model), |(b, i, d)| {
+            if b == 1 {
+                ((i * 5 + d * 9) % 13) as f32 * 0.15 - 0.4
+            } else {
+                (i * 2 + d) as f32 * 0.07
+            }
+        });
+        let v = Array3::from_shape_fn((batch_size, seq_len, d_model), |(b, i, d)| {
+            if b == 1 {
+                ((i + d * 6) % 7) as f32 * 0.25
+            } else {
+                ((i + 1) * (d + 1)) as f32 * 0.05
+            }
+        });
+
+        let config = FlashAttentionConfig::new(num_heads, head_dim);
+        let flash_attn = FlashAttention::new(config).unwrap();
+
+        let output = flash_attn.forward(&q, &k, &v).unwrap();
+        assert_eq!(output.dim(), (batch_size, seq_len, d_model));
+
+        // batch[0] and batch[2] had identical inputs — outputs must match
+        for i in 0..seq_len {
+            for d in 0..d_model {
+                let b0 = output[[0, i, d]];
+                let b2 = output[[2, i, d]];
+                assert!(
+                    (b0 - b2).abs() < 1e-6,
+                    "batch independence: batch[0] and batch[2] should match at ({},{}): {} vs {}",
+                    i,
+                    d,
+                    b0,
+                    b2
+                );
+            }
+        }
+
+        // batch[1] had different inputs — its output must differ from batch[0]
+        let mut diff_sum = 0.0f32;
+        for i in 0..seq_len {
+            for d in 0..d_model {
+                diff_sum += (output[[0, i, d]] - output[[1, i, d]]).abs();
+            }
+        }
+        assert!(
+            diff_sum > 1e-4,
+            "batch[0] and batch[1] have different inputs but produced identical outputs (diff_sum={})",
+            diff_sum
+        );
+    }
+
+    /// Causal masking must be applied correctly in the multi-head setting and the result must
+    /// match the per-head FusedAttentionKernel oracle run with `causal=true`.
+    #[test]
+    fn test_flash_attention_causal_multi_head_oracle_agreement() {
+        let num_heads = 2usize;
+        let head_dim = 4usize;
+        let d_model = num_heads * head_dim; // 8
+        let seq_len = 5usize;
+        let batch_size = 1usize;
+
+        // Deterministic, non-trivial inputs
+        let q = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            ((i * 4 + d * 6) % 17) as f32 * 0.09 - 0.25
+        });
+        let k = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            ((i * 9 + d * 2) % 13) as f32 * 0.11 - 0.3
+        });
+        let v = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            ((i * 2 + d * 5) % 11) as f32 * 0.12
+        });
+
+        let config = FlashAttentionConfig::new(num_heads, head_dim).with_causal(true);
+        let flash_attn = FlashAttention::new(config).unwrap();
+
+        let output = flash_attn.forward(&q, &k, &v).unwrap();
+        assert_eq!(output.dim(), (batch_size, seq_len, d_model));
+
+        // Build per-head causal oracle
+        let q_2d = q.slice(s![0, .., ..]).to_owned();
+        let k_2d = k.slice(s![0, .., ..]).to_owned();
+        let v_2d = v.slice(s![0, .., ..]).to_owned();
+
+        let mut oracle = Array2::<f32>::zeros((seq_len, d_model));
+        for h in 0..num_heads {
+            let h_start = h * head_dim;
+            let h_end = h_start + head_dim;
+
+            let q_h = q_2d.slice(s![.., h_start..h_end]).to_owned();
+            let k_h = k_2d.slice(s![.., h_start..h_end]).to_owned();
+            let v_h = v_2d.slice(s![.., h_start..h_end]).to_owned();
+
+            // causal=true for both oracle and flash kernel
+            let head_out = FusedAttentionKernel::forward(&q_h, &k_h, &v_h, true).unwrap();
+
+            oracle.slice_mut(s![.., h_start..h_end]).assign(&head_out);
+        }
+
+        let flash_out = output.slice(s![0, .., ..]).to_owned();
+
+        for i in 0..seq_len {
+            for d in 0..d_model {
+                let got = flash_out[[i, d]];
+                let expected = oracle[[i, d]];
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "causal multi-head: row {} col {}: flash={} oracle={} diff={}",
+                    i,
+                    d,
+                    got,
+                    expected,
+                    (got - expected).abs()
+                );
+            }
+        }
     }
 }

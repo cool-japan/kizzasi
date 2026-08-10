@@ -60,6 +60,7 @@ impl Default for SpeechTokenizerConfig {
 ///
 /// Extracts mel-spectrogram features optimized for speech recognition
 /// and provides phoneme-aligned tokenization for ASR tasks.
+#[derive(Debug)]
 pub struct SpeechTokenizer {
     config: SpeechTokenizerConfig,
     mel_filterbank: Array2<f32>,

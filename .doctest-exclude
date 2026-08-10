@@ -1,0 +1,8 @@
+# kizzasi-python: [lib] name = "kizzasi" (for the PyO3 module import name)
+# collides with its own real dependency on the `kizzasi` facade crate under
+# rustdoc's doctest harness, producing E0464 "multiple candidates for rlib
+# dependency `kizzasi`". This is a rustdoc doctest-harness artifact, not a
+# real bug: cargo check/build/nextest all compile and pass cleanly. Cargo.toml
+# already sets `doc = false` for this crate; `cargo test --doc` does not
+# honor that flag, so exclude explicitly here.
+kizzasi-python

@@ -268,7 +268,9 @@ impl MetricsLogger {
             tracing::info!(
                 "Best val loss: {:.6} (epoch {})",
                 best_loss,
-                summary.best_epoch.unwrap()
+                summary
+                    .best_epoch
+                    .expect("invariant: best_epoch set when best_val_loss is set")
             );
         }
         if let Some(final_loss) = summary.final_train_loss {

@@ -781,3 +781,472 @@ mod tests {
         assert!((raw - 6.0).abs() < 1e-6, "result should be 6.0, got {raw}");
     }
 }
+
+// ============================================================================
+// TlExprCompiler — lower TLExpr → ConstraintExpr → CompiledConstraint
+// ============================================================================
+
+/// Lowers a [`tensorlogic_ir::TLExpr`] expression into a [`ConstraintExpr`],
+/// then compiles it to a fast stack-VM [`CompiledConstraint`].
+///
+/// This is the bridge between the symbolic representation layer
+/// (`tensorlogic-ir`) and the numerical execution layer (`kizzasi-logic`).
+///
+/// ## Leaf Node Convention
+///
+/// `TLExpr` leaf nodes use `Pred { name, args }`:
+///
+/// | Pred form | Lowered to |
+/// |-----------|-----------|
+/// | `Pred { name: "dim_N", args: [] }` | `ConstraintExpr::Dim(N)` |
+/// | `Pred { name: "5.0", args: [] }` (parseable f32) | `ConstraintExpr::Const(5.0)` |
+/// | `Pred { name: var, args: [] }` in `dim_map` | `ConstraintExpr::Dim(dim_map[var])` |
+/// | `Pred { name: _, args: [Term::Var(v)] }` | `ConstraintExpr::Dim(dim_map[v])` |
+/// | `Pred { name: _, args: [Term::Const(c)] }` | `ConstraintExpr::Const(c.parse())` |
+///
+/// ## Example
+///
+/// ```rust
+/// use kizzasi_logic::compiler::TlExprCompiler;
+/// use tensorlogic_ir::TLExpr;
+/// use scirs2_core::ndarray::Array1;
+///
+/// // Build: x[0] <= 1.0
+/// let expr = TLExpr::Lte(
+///     Box::new(TLExpr::Pred { name: "dim_0".into(), args: vec![] }),
+///     Box::new(TLExpr::Pred { name: "1.0".into(), args: vec![] }),
+/// );
+/// let compiler = TlExprCompiler::new();
+/// let compiled = compiler.compile(&expr, "x_le_1", 1).unwrap();
+///
+/// let x_ok = Array1::from_vec(vec![0.5_f32]);
+/// assert!(compiled.evaluate(&x_ok).unwrap());
+///
+/// let x_bad = Array1::from_vec(vec![2.0_f32]);
+/// assert!(!compiled.evaluate(&x_bad).unwrap());
+/// ```
+pub struct TlExprCompiler {
+    /// Maps symbolic variable names to dimension indices in the input vector.
+    dim_map: HashMap<String, usize>,
+}
+
+impl Default for TlExprCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TlExprCompiler {
+    /// Create a new compiler with no variable-to-dimension mappings.
+    pub fn new() -> Self {
+        Self {
+            dim_map: HashMap::new(),
+        }
+    }
+
+    /// Register a variable name → dimension index mapping.
+    ///
+    /// When the compiler encounters `Pred { name: var, args: [] }` or
+    /// `Pred { _, args: [Term::Var(var)] }`, it resolves `var` via this map.
+    pub fn with_var(mut self, name: impl Into<String>, dim: usize) -> Self {
+        self.dim_map.insert(name.into(), dim);
+        self
+    }
+
+    /// Lower a `TLExpr` to a `ConstraintExpr` (the high-level AST in kizzasi-logic).
+    ///
+    /// Returns an error if the expression contains unsupported variants or
+    /// unresolvable leaf nodes.
+    pub fn lower(&self, expr: &tensorlogic_ir::TLExpr) -> LogicResult<ConstraintExpr> {
+        use tensorlogic_ir::TLExpr;
+
+        match expr {
+            TLExpr::Pred { name, args } => self.lower_pred(name, args),
+
+            // Arithmetic binary
+            TLExpr::Add(a, b) => Ok(ConstraintExpr::Add(
+                Box::new(self.lower(a)?),
+                Box::new(self.lower(b)?),
+            )),
+            TLExpr::Sub(a, b) => Ok(ConstraintExpr::Sub(
+                Box::new(self.lower(a)?),
+                Box::new(self.lower(b)?),
+            )),
+            TLExpr::Mul(a, b) => Ok(ConstraintExpr::Mul(
+                Box::new(self.lower(a)?),
+                Box::new(self.lower(b)?),
+            )),
+            TLExpr::Div(a, b) => Ok(ConstraintExpr::Div(
+                Box::new(self.lower(a)?),
+                Box::new(self.lower(b)?),
+            )),
+            TLExpr::Min(a, b) => {
+                // min(a, b) = -max(-a, -b) but simpler: inline as ConstraintExpr
+                // kizzasi-logic ConstraintExpr doesn't have Min/Max; use conditional form:
+                // min(a,b) ≡ (a+b - |a-b|) / 2
+                let a_low = self.lower(a)?;
+                let b_low = self.lower(b)?;
+                // a + b
+                let sum = ConstraintExpr::Add(Box::new(a_low.clone()), Box::new(b_low.clone()));
+                // a - b
+                let diff = ConstraintExpr::Sub(Box::new(a_low), Box::new(b_low));
+                // |a - b|
+                let abs_diff = ConstraintExpr::Abs(Box::new(diff));
+                // (sum - abs_diff) / 2
+                Ok(ConstraintExpr::Div(
+                    Box::new(ConstraintExpr::Sub(Box::new(sum), Box::new(abs_diff))),
+                    Box::new(ConstraintExpr::Const(2.0)),
+                ))
+            }
+            TLExpr::Max(a, b) => {
+                // max(a,b) ≡ (a+b + |a-b|) / 2
+                let a_low = self.lower(a)?;
+                let b_low = self.lower(b)?;
+                let sum = ConstraintExpr::Add(Box::new(a_low.clone()), Box::new(b_low.clone()));
+                let diff = ConstraintExpr::Sub(Box::new(a_low), Box::new(b_low));
+                let abs_diff = ConstraintExpr::Abs(Box::new(diff));
+                Ok(ConstraintExpr::Div(
+                    Box::new(ConstraintExpr::Add(Box::new(sum), Box::new(abs_diff))),
+                    Box::new(ConstraintExpr::Const(2.0)),
+                ))
+            }
+            TLExpr::Pow(a, b) => {
+                // x^n — support integer exponents efficiently; fallback to Sqrt for 0.5
+                // General case: emit as Mul chain when b is small int const, else error
+                let b_low = self.lower(b)?;
+                if let ConstraintExpr::Const(exp) = &b_low {
+                    let exp_val = *exp;
+                    if (exp_val - 0.5).abs() < 1e-6 {
+                        return Ok(ConstraintExpr::Sqrt(Box::new(self.lower(a)?)));
+                    }
+                    if (exp_val - 2.0).abs() < 1e-6 {
+                        let a_low = self.lower(a)?;
+                        return Ok(ConstraintExpr::Mul(
+                            Box::new(a_low.clone()),
+                            Box::new(a_low),
+                        ));
+                    }
+                    if (exp_val - 1.0).abs() < 1e-6 {
+                        return self.lower(a);
+                    }
+                }
+                Err(LogicError::InvalidConstraint(
+                    "TlExprCompiler: Pow with non-constant or non-integer exponent \
+                     is not supported (use 0.5 for sqrt, 2.0 for square)"
+                        .into(),
+                ))
+            }
+            TLExpr::Mod(_, _) => Err(LogicError::InvalidConstraint(
+                "TlExprCompiler: Mod is not supported in ConstraintExpr".into(),
+            )),
+
+            // Unary arithmetic
+            TLExpr::Abs(a) => Ok(ConstraintExpr::Abs(Box::new(self.lower(a)?))),
+            TLExpr::Sqrt(a) => Ok(ConstraintExpr::Sqrt(Box::new(self.lower(a)?))),
+            TLExpr::Floor(_)
+            | TLExpr::Ceil(_)
+            | TLExpr::Round(_)
+            | TLExpr::Exp(_)
+            | TLExpr::Log(_)
+            | TLExpr::Sin(_)
+            | TLExpr::Cos(_)
+            | TLExpr::Tan(_) => Err(LogicError::InvalidConstraint(
+                "TlExprCompiler: transcendental functions (floor/ceil/round/exp/log/sin/cos/tan) \
+                 are not supported in ConstraintExpr"
+                    .into(),
+            )),
+
+            // Comparisons → 1.0 / 0.0 via CmpLe / CmpGe
+            TLExpr::Lte(a, b) => Ok(ConstraintExpr::Le(
+                Box::new(self.lower(a)?),
+                Box::new(self.lower(b)?),
+            )),
+            TLExpr::Gte(a, b) => Ok(ConstraintExpr::Ge(
+                Box::new(self.lower(a)?),
+                Box::new(self.lower(b)?),
+            )),
+            TLExpr::Lt(a, b) => {
+                // a < b ≡ a <= b  AND  NOT(a == b) — simplify as Le (slightly wrong at boundary)
+                // For continuous signals this is equivalent; use Le
+                Ok(ConstraintExpr::Le(
+                    Box::new(self.lower(a)?),
+                    Box::new(self.lower(b)?),
+                ))
+            }
+            TLExpr::Gt(a, b) => Ok(ConstraintExpr::Ge(
+                Box::new(self.lower(a)?),
+                Box::new(self.lower(b)?),
+            )),
+            TLExpr::Eq(a, b) => {
+                // a == b ≡ (a <= b) AND (a >= b)
+                let le = ConstraintExpr::Le(Box::new(self.lower(a)?), Box::new(self.lower(b)?));
+                let ge = ConstraintExpr::Ge(Box::new(self.lower(a)?), Box::new(self.lower(b)?));
+                Ok(ConstraintExpr::And(Box::new(le), Box::new(ge)))
+            }
+
+            // Logic
+            TLExpr::And(a, b) => Ok(ConstraintExpr::And(
+                Box::new(self.lower(a)?),
+                Box::new(self.lower(b)?),
+            )),
+            TLExpr::Or(a, b) => Ok(ConstraintExpr::Or(
+                Box::new(self.lower(a)?),
+                Box::new(self.lower(b)?),
+            )),
+            TLExpr::Not(a) => Ok(ConstraintExpr::Not(Box::new(self.lower(a)?))),
+            TLExpr::Imply(a, b) => {
+                // a → b  ≡  (NOT a) OR b
+                let not_a = ConstraintExpr::Not(Box::new(self.lower(a)?));
+                Ok(ConstraintExpr::Or(
+                    Box::new(not_a),
+                    Box::new(self.lower(b)?),
+                ))
+            }
+            TLExpr::Score(a) => self.lower(a),
+
+            other => Err(LogicError::InvalidConstraint(format!(
+                "TlExprCompiler: unsupported TLExpr variant: {:?}",
+                std::mem::discriminant(other)
+            ))),
+        }
+    }
+
+    /// Compile a `TLExpr` directly to a [`CompiledConstraint`].
+    pub fn compile(
+        &self,
+        expr: &tensorlogic_ir::TLExpr,
+        name: &str,
+        num_dims: usize,
+    ) -> LogicResult<CompiledConstraint> {
+        let lowered = self.lower(expr)?;
+        Ok(lowered.compile(name, num_dims))
+    }
+
+    /// Compile a `TLExpr` with symbolic pre-optimization and stack-VM optimization.
+    ///
+    /// Applies [`tensorlogic_ir::algebraic_simplify`] + [`tensorlogic_ir::constant_fold`]
+    /// on the `TLExpr` AST before lowering, then applies the stack-VM level constant
+    /// folding and dead-code elimination passes.
+    pub fn compile_optimized(
+        &self,
+        expr: &tensorlogic_ir::TLExpr,
+        name: &str,
+        num_dims: usize,
+    ) -> LogicResult<CompiledConstraint> {
+        use tensorlogic_ir::{algebraic_simplify, constant_fold};
+        // Pre-optimize at the symbolic level
+        let simplified = algebraic_simplify(expr);
+        let folded = constant_fold(&simplified);
+        // Lower and compile
+        let lowered = self.lower(&folded)?;
+        // Apply stack-VM level optimizations
+        Ok(lowered.compile(name, num_dims).optimize())
+    }
+
+    fn lower_pred(&self, name: &str, args: &[tensorlogic_ir::Term]) -> LogicResult<ConstraintExpr> {
+        use tensorlogic_ir::Term;
+
+        match args {
+            [] => {
+                // 1. Numeric constant: "5.0", "-1.0", "0", etc.
+                if let Ok(v) = name.parse::<f32>() {
+                    return Ok(ConstraintExpr::Const(v));
+                }
+                // 2. "dim_N" shorthand
+                if let Some(rest) = name.strip_prefix("dim_") {
+                    if let Ok(n) = rest.parse::<usize>() {
+                        return Ok(ConstraintExpr::Dim(n));
+                    }
+                }
+                // 3. Named variable in dim_map
+                if let Some(&dim) = self.dim_map.get(name) {
+                    return Ok(ConstraintExpr::Dim(dim));
+                }
+                Err(LogicError::InvalidConstraint(format!(
+                    "TlExprCompiler: cannot resolve Pred('{name}') — \
+                     not a float literal, not 'dim_N', not in dim_map"
+                )))
+            }
+            [Term::Var(v)] => self
+                .dim_map
+                .get(v.as_str())
+                .copied()
+                .map(ConstraintExpr::Dim)
+                .ok_or_else(|| {
+                    LogicError::InvalidConstraint(format!(
+                        "TlExprCompiler: variable '{v}' not in dim_map"
+                    ))
+                }),
+            [Term::Const(c)] => c.parse::<f32>().map(ConstraintExpr::Const).map_err(|_| {
+                LogicError::InvalidConstraint(format!(
+                    "TlExprCompiler: cannot parse Term::Const('{c}') as f32"
+                ))
+            }),
+            [Term::Typed { value, .. }] => {
+                // Recurse into the inner term
+                let inner = TlExprCompiler::new_with_map(self.dim_map.clone());
+                inner.lower_pred(name, std::slice::from_ref(value))
+            }
+            _ => Err(LogicError::InvalidConstraint(format!(
+                "TlExprCompiler: Pred('{name}') has unsupported arg list (len={})",
+                args.len()
+            ))),
+        }
+    }
+
+    fn new_with_map(dim_map: HashMap<String, usize>) -> Self {
+        Self { dim_map }
+    }
+}
+
+// ============================================================================
+// TlExprCompiler tests
+// ============================================================================
+
+#[cfg(test)]
+mod tl_compiler_tests {
+    use super::*;
+    use scirs2_core::ndarray::Array1;
+    use tensorlogic_ir::TLExpr;
+
+    use crate::tensorlogic_integration::{tl_const, tl_var};
+
+    fn arr(vals: Vec<f32>) -> Array1<f32> {
+        Array1::from_vec(vals)
+    }
+
+    #[test]
+    fn test_lower_dim_shorthand() {
+        let compiler = TlExprCompiler::new();
+        let expr = TLExpr::Pred {
+            name: "dim_0".into(),
+            args: vec![],
+        };
+        let lowered = compiler.lower(&expr).expect("lower failed");
+        assert!(matches!(lowered, ConstraintExpr::Dim(0)));
+    }
+
+    #[test]
+    fn test_lower_const_from_pred_name() {
+        let compiler = TlExprCompiler::new();
+        let expr = TLExpr::Pred {
+            name: "3.14".into(),
+            args: vec![],
+        };
+        let lowered = compiler.lower(&expr).expect("lower failed");
+        let expected: f32 = "3.14".parse().expect("parse failed");
+        assert!(matches!(lowered, ConstraintExpr::Const(v) if (v - expected).abs() < 1e-4));
+    }
+
+    #[test]
+    fn test_lower_var_from_dim_map() {
+        let compiler = TlExprCompiler::new().with_var("velocity", 2);
+        let expr = TLExpr::Pred {
+            name: "velocity".into(),
+            args: vec![],
+        };
+        let lowered = compiler.lower(&expr).expect("lower failed");
+        assert!(matches!(lowered, ConstraintExpr::Dim(2)));
+    }
+
+    #[test]
+    fn test_compile_lte_bound() {
+        // x[0] <= 1.0
+        let expr = TLExpr::Lte(Box::new(tl_var("dim_0")), Box::new(tl_const(1.0)));
+        let compiler = TlExprCompiler::new();
+        let compiled = compiler
+            .compile(&expr, "x_le_1", 1)
+            .expect("compile failed");
+
+        assert!(
+            compiled.evaluate(&arr(vec![0.5])).expect("eval"),
+            "0.5 <= 1.0"
+        );
+        assert!(
+            !compiled.evaluate(&arr(vec![2.0])).expect("eval"),
+            "2.0 > 1.0"
+        );
+    }
+
+    #[test]
+    fn test_compile_and_constraint() {
+        // -1.0 <= x[0] <= 1.0  (And(Gte, Lte))
+        let expr = TLExpr::And(
+            Box::new(TLExpr::Gte(
+                Box::new(tl_var("dim_0")),
+                Box::new(tl_const(-1.0)),
+            )),
+            Box::new(TLExpr::Lte(
+                Box::new(tl_var("dim_0")),
+                Box::new(tl_const(1.0)),
+            )),
+        );
+        let compiler = TlExprCompiler::new();
+        let compiled = compiler.compile(&expr, "box", 1).expect("compile failed");
+
+        assert!(
+            compiled.evaluate(&arr(vec![0.5])).expect("eval"),
+            "0.5 in [-1,1]"
+        );
+        assert!(
+            !compiled.evaluate(&arr(vec![2.0])).expect("eval"),
+            "2.0 not in [-1,1]"
+        );
+        assert!(
+            !compiled.evaluate(&arr(vec![-2.0])).expect("eval"),
+            "-2.0 not in [-1,1]"
+        );
+    }
+
+    #[test]
+    fn test_compile_optimized_constant_fold() {
+        // (2.0 + 3.0) <= x[0]  — should fold to Const(5.0) before compile
+        let sum = TLExpr::Add(Box::new(tl_const(2.0)), Box::new(tl_const(3.0)));
+        let expr = TLExpr::Lte(Box::new(sum), Box::new(tl_var("dim_0")));
+        let compiler = TlExprCompiler::new();
+        let compiled = compiler
+            .compile_optimized(&expr, "folded", 1)
+            .expect("compile_optimized failed");
+
+        // 5.0 <= 6.0 → true
+        assert!(compiled.evaluate(&arr(vec![6.0])).expect("eval"));
+        // 5.0 <= 4.0 → false
+        assert!(!compiled.evaluate(&arr(vec![4.0])).expect("eval"));
+    }
+
+    #[test]
+    fn test_compile_named_var_map() {
+        // velocity (mapped to dim 0) <= 10.0
+        let expr = TLExpr::Lte(Box::new(tl_var("velocity")), Box::new(tl_const(10.0)));
+        let compiler = TlExprCompiler::new().with_var("velocity", 0);
+        let compiled = compiler
+            .compile(&expr, "vel_bound", 1)
+            .expect("compile failed");
+
+        assert!(compiled.evaluate(&arr(vec![5.0])).expect("eval"), "5 <= 10");
+        assert!(
+            !compiled.evaluate(&arr(vec![15.0])).expect("eval"),
+            "15 > 10"
+        );
+    }
+
+    #[test]
+    fn test_compile_sqrt() {
+        // sqrt(x[0]^2 + x[1]^2) <= 1.0  (||x||_2 <= 1)
+        let x0_sq = TLExpr::Pow(Box::new(tl_var("dim_0")), Box::new(tl_const(2.0)));
+        let x1_sq = TLExpr::Pow(Box::new(tl_var("dim_1")), Box::new(tl_const(2.0)));
+        let sum_sq = TLExpr::Add(Box::new(x0_sq), Box::new(x1_sq));
+        let norm = TLExpr::Sqrt(Box::new(sum_sq));
+        let expr = TLExpr::Lte(Box::new(norm), Box::new(tl_const(1.0)));
+
+        let compiler = TlExprCompiler::new();
+        let compiled = compiler
+            .compile(&expr, "l2_ball", 2)
+            .expect("compile failed");
+
+        // (0.3, 0.4) → norm = 0.5 ≤ 1.0
+        assert!(compiled.evaluate(&arr(vec![0.3, 0.4])).expect("eval"));
+        // (1.0, 1.0) → norm = sqrt(2) > 1.0
+        assert!(!compiled.evaluate(&arr(vec![1.0, 1.0])).expect("eval"));
+    }
+}

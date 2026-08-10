@@ -235,8 +235,12 @@ pub fn matvec_avx512(mat: &Array2<f32>, vec: &Array1<f32>, out: &mut Array1<f32>
 
     for (i, out_row) in out.iter_mut().enumerate() {
         let row = mat.row(i);
-        let row_slice = row.as_slice().unwrap();
-        let vec_slice = vec.as_slice().unwrap();
+        let row_slice = row
+            .as_slice()
+            .expect("invariant: row is a contiguous row view of C-layout Array2");
+        let vec_slice = vec
+            .as_slice()
+            .expect("invariant: vec is a contiguous Array1");
         *out_row = dot_product_avx512(row_slice, vec_slice);
     }
 }
@@ -375,11 +379,63 @@ pub mod activations {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f")]
     unsafe fn fast_exp_avx512_impl(x: &[f32], out: &mut [f32]) {
-        // Polynomial approximation of exp(x) using AVX-512
-        // Note: This is a simplified version; production code should use
-        // more accurate approximations or math libraries
-        for i in 0..x.len() {
-            out[i] = x[i].exp(); // Fallback to scalar exp for now
+        use std::arch::x86_64::*;
+
+        let len = x.len();
+        let chunks = len / 16;
+
+        // Cody-Waite range reduction: e^x = 2^n * e^r
+        //   n = round(x * log2(e)),  r = x - n * ln(2),  |r| <= ln(2)/2
+        // log2(e) = 1/ln(2), used to compute n = round(x / ln2)
+        let log2e = _mm512_set1_ps(std::f32::consts::LOG2_E);
+        // ln(2) used for: r = x - n * ln(2)
+        let ln2 = _mm512_set1_ps(std::f32::consts::LN_2);
+
+        // 5th-order Taylor / Horner polynomial coefficients for e^r:
+        // e^r = 1 + r*(1 + r*(1/2 + r*(1/6 + r*(1/24 + r/120))))
+        // Relative error < 0.01% on [-ln2/2, ln2/2]
+        let c5 = _mm512_set1_ps(1.0_f32 / 120.0_f32);
+        let c4 = _mm512_set1_ps(1.0_f32 / 24.0_f32);
+        let c3 = _mm512_set1_ps(1.0_f32 / 6.0_f32);
+        let c2 = _mm512_set1_ps(0.5_f32);
+        let one = _mm512_set1_ps(1.0_f32);
+
+        for chunk in 0..chunks {
+            let base = chunk * 16;
+            let xv = _mm512_loadu_ps(x.as_ptr().add(base));
+
+            // n = round(x * log2(e)): use nearest-integer rounding, suppress FP exceptions
+            // Const generic value: _MM_FROUND_TO_NEAREST_INT (0x00) | _MM_FROUND_NO_EXC (0x08) = 8
+            let n_f = _mm512_roundscale_ps::<8>(_mm512_mul_ps(xv, log2e));
+
+            // r = x - n * ln2  via fnmadd: -(n_f * ln2) + xv
+            let r = _mm512_fnmadd_ps(n_f, ln2, xv);
+
+            // Horner evaluation of e^r (innermost term first):
+            //   p5 = c5
+            //   p4 = c5*r + c4
+            //   p3 = p4*r + c3
+            //   p2 = p3*r + c2
+            //   p1 = p2*r + 1
+            //   p  = p1*r + 1
+            let p = _mm512_fmadd_ps(
+                _mm512_fmadd_ps(
+                    _mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_fmadd_ps(c5, r, c4), r, c3), r, c2),
+                    r,
+                    one,
+                ),
+                r,
+                one,
+            );
+
+            // Reconstruct e^x = p * 2^n  via scalef: result = p * 2^floor(n_f)
+            let result = _mm512_scalef_ps(p, n_f);
+            _mm512_storeu_ps(out.as_mut_ptr().add(base), result);
+        }
+
+        // Scalar tail for elements not covered by full 16-wide chunks
+        for i in (chunks * 16)..len {
+            out[i] = x[i].exp();
         }
     }
 
@@ -464,6 +520,89 @@ mod tests {
 
         for i in 0..8 {
             assert_eq!(out[i], a[i] * 2.0);
+        }
+    }
+
+    #[test]
+    fn test_fast_exp_avx512_correctness() {
+        // Exactly 16 elements — exercises the full 16-wide SIMD path on AVX-512 hardware,
+        // and the scalar fallback (fast_exp_scalar -> x[i].exp()) on other hardware.
+        let x: Vec<f32> = vec![
+            0.0, 1.0, -1.0, 2.0, 0.5, -0.5, 3.0, -3.0, 0.1, -0.1, 0.7, -0.7, 1.5, -1.5, 0.3, -0.3,
+        ];
+        let mut out = vec![0.0_f32; 16];
+        activations::fast_exp_avx512(&x, &mut out);
+        for i in 0..16 {
+            let expected = x[i].exp();
+            assert!(
+                (out[i] - expected).abs() < 1e-3,
+                "index {}: got {}, expected {} (diff {})",
+                i,
+                out[i],
+                expected,
+                (out[i] - expected).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_fast_exp_avx512_non_multiple_of_16() {
+        // Length 7: exercises the scalar-tail path unconditionally (no full chunks).
+        let x: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0];
+        let mut out = vec![0.0_f32; 7];
+        activations::fast_exp_avx512(&x, &mut out);
+        for i in 0..7 {
+            let expected = x[i].exp();
+            assert!(
+                out[i].is_finite(),
+                "index {}: result {} is not finite",
+                i,
+                out[i]
+            );
+            assert!(
+                (out[i] - expected).abs() < 1e-3,
+                "index {}: got {}, expected {} (diff {})",
+                i,
+                out[i],
+                expected,
+                (out[i] - expected).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_fast_exp_avx512_large_range() {
+        // Covers underflow-to-zero, normal, and near-overflow regions.
+        let x: Vec<f32> = vec![-80.0, -40.0, -10.0, 0.0, 5.0, 10.0, 20.0];
+        let mut out = vec![0.0_f32; 7];
+        activations::fast_exp_avx512(&x, &mut out);
+        for i in 0..7 {
+            let expected = x[i].exp();
+            assert!(
+                out[i].is_finite(),
+                "index {}: result {} is not finite",
+                i,
+                out[i]
+            );
+            // For non-negligible expected values use relative error; otherwise absolute.
+            if expected.abs() > 1e-30 {
+                let rel_err = (out[i] - expected).abs() / expected.abs();
+                assert!(
+                    rel_err < 0.01,
+                    "index {}: relative error {} >= 0.01 (got {}, expected {})",
+                    i,
+                    rel_err,
+                    out[i],
+                    expected
+                );
+            } else {
+                // Very small values (deep underflow): accept any finite result.
+                assert!(
+                    out[i].is_finite(),
+                    "index {}: non-finite result in underflow region",
+                    i
+                );
+            }
         }
     }
 }

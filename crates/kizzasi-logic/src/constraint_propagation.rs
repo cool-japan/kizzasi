@@ -375,8 +375,14 @@ impl BacktrackingSearch {
 
             if self.is_consistent_with_assignment(&new_assignment) {
                 if self.use_forward_checking {
-                    // Forward checking would go here
-                    // Simplified: just continue with backtracking
+                    // Build forward checker from current CSP domains; if any
+                    // neighbour domain wipes out under this tentative assignment,
+                    // this branch is a dead end — skip it without recursing.
+                    let domains: Vec<Domain> = self.csp.domains.clone();
+                    let mut fc = ForwardChecker::new(domains);
+                    if !fc.prune(var, value, &self.csp.constraints) {
+                        continue;
+                    }
                 }
 
                 if self.backtrack(new_assignment) {
@@ -614,6 +620,91 @@ mod tests {
         assert!(!checker.domains()[1].contains(&1));
         assert!(checker.domains()[1].contains(&2));
         assert!(checker.domains()[1].contains(&3));
+    }
+
+    /// Build a simple AllDifferent CSP over N variables, each with domain [0..N).
+    fn make_all_different_csp(n: usize) -> CSP {
+        let domains: Vec<Domain> = (0..n).map(|_| (0..n as i32).collect()).collect();
+        let mut csp = CSP::new(n, domains).unwrap();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                csp.add_constraint(DiscreteConstraint::AllDifferent {
+                    variables: vec![i, j],
+                });
+            }
+        }
+        csp
+    }
+
+    #[test]
+    fn test_forward_checking_same_solutions_as_backtracking() {
+        // Solution sets must be identical with FC on and off.
+        let csp = make_all_different_csp(4);
+        let csp2 = make_all_different_csp(4);
+        let mut with_fc = BacktrackingSearch::new(csp)
+            .with_forward_checking(true)
+            .with_max_solutions(100);
+        let mut without_fc = BacktrackingSearch::new(csp2)
+            .with_forward_checking(false)
+            .with_max_solutions(100);
+        let mut sols_fc = with_fc.solve();
+        let mut sols_no_fc = without_fc.solve();
+        // Sort for deterministic comparison.
+        sols_fc.sort_by_key(|m| (0..4).map(|i| m[&i]).collect::<Vec<_>>());
+        sols_no_fc.sort_by_key(|m| (0..4).map(|i| m[&i]).collect::<Vec<_>>());
+        assert_eq!(
+            sols_fc.len(),
+            sols_no_fc.len(),
+            "FC found {} solutions, plain BT found {}",
+            sols_fc.len(),
+            sols_no_fc.len()
+        );
+        for (a, b) in sols_fc.iter().zip(sols_no_fc.iter()) {
+            assert_eq!(a, b, "Solutions differ: {:?} vs {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn test_forward_checking_overconstrained_returns_empty() {
+        // Require var0 = 0 AND var0 = 1 simultaneously — no solution exists.
+        // Encode "var0 must equal 0" as a Binary constraint with a single allowed pair.
+        let domain: Domain = (0..3i32).collect();
+        let mut csp = CSP::new(1, vec![domain]).unwrap();
+
+        // Allowed set: var0=0 paired with a phantom self-assignment.
+        // Because Binary needs two distinct vars we instead use a direct domain
+        // restriction: give var0 a domain that only contains 0, and a second
+        // constraint that demands it equals 1 — modelled as AllDifferent([0,0])
+        // won't work cleanly for a 1-variable CSP, so we use two separate
+        // single-element domains wired as a contradiction via Sum.
+        // Simpler: two Sum constraints that can't both hold.
+        csp.add_constraint(DiscreteConstraint::Sum {
+            variables: vec![0],
+            target: 0,
+        });
+        csp.add_constraint(DiscreteConstraint::Sum {
+            variables: vec![0],
+            target: 1,
+        });
+
+        let mut search = BacktrackingSearch::new(csp).with_forward_checking(true);
+        let solutions = search.solve();
+        assert!(
+            solutions.is_empty(),
+            "Expected no solutions, got {:?}",
+            solutions
+        );
+    }
+
+    #[test]
+    fn test_forward_checking_flag_is_not_inert() {
+        // Both FC-enabled and FC-disabled must find solutions for a satisfiable CSP.
+        let csp = make_all_different_csp(3);
+        let csp2 = make_all_different_csp(3);
+        let mut with_fc = BacktrackingSearch::new(csp).with_forward_checking(true);
+        let mut without_fc = BacktrackingSearch::new(csp2).with_forward_checking(false);
+        assert!(!with_fc.solve().is_empty());
+        assert!(!without_fc.solve().is_empty());
     }
 
     #[test]

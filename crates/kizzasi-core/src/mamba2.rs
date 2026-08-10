@@ -479,7 +479,7 @@ impl Mamba2Layer {
         let (b, c) = self.compute_bc(&x_act)?;
 
         // 7. Get A matrix (convert from log-space)
-        let a = self.a_log.mapv(|v| (-v.exp()).abs()); // Ensure negative for stability
+        let a = self.a_log.mapv(|v| -v.exp()); // A = -exp(a_log) < 0 (stable)
 
         // 8. Discretize SSM
         let (a_bar, b_bar) = self.discretize(&dt, &a, &b)?;
@@ -699,5 +699,22 @@ mod tests {
 
         assert!((mean.abs()) < 1e-5, "Mean should be close to 0");
         assert!((std - 1.0).abs() < 1e-4, "Std should be close to 1");
+    }
+
+    #[test]
+    fn test_mamba2_layer_stability_bounded_output() {
+        // Verify that forward outputs stay bounded over many steps.
+        // Pre-fix: a_bar > 1 → state diverges → output → inf after ~200 steps.
+        // Post-fix: a_bar < 1 → contractive → output stays finite and bounded.
+        let config = Mamba2Config::new(64, 16);
+        let mut layer = Mamba2Layer::new(config).expect("layer creation");
+        let input = scirs2_core::ndarray::Array1::from_elem(64, 0.5_f32);
+        for _ in 0..200 {
+            // Do NOT reset inside the loop — accumulated state is the divergence driver.
+            let out = layer.forward(&input).expect("forward failed");
+            for v in out.iter() {
+                assert!(v.is_finite() && v.abs() < 1e3, "output diverged: {v}");
+            }
+        }
     }
 }

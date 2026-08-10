@@ -156,14 +156,18 @@ impl WaveletTokenizer {
         current
     }
 
-    /// Quantize coefficients
-    fn quantize_coeffs(&self, coeffs: &[Vec<f32>]) -> Vec<Vec<i32>> {
-        let levels = (1 << self.config.bits) as f32;
-        let max_val = coeffs
+    /// Compute the global max absolute value across all wavelet bands.
+    fn coeffs_max_val(coeffs: &[Vec<f32>]) -> f32 {
+        coeffs
             .iter()
             .flat_map(|c| c.iter())
             .map(|&x| x.abs())
-            .fold(0.0_f32, f32::max);
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// Quantize coefficients using a caller-supplied max_val for normalization.
+    fn quantize_coeffs_with_max(&self, coeffs: &[Vec<f32>], max_val: f32) -> Vec<Vec<i32>> {
+        let levels = (1 << self.config.bits) as f32;
 
         if max_val == 0.0 {
             return coeffs.iter().map(|c| vec![0; c.len()]).collect();
@@ -201,22 +205,27 @@ impl WaveletTokenizer {
 impl SignalTokenizer for WaveletTokenizer {
     fn encode(&self, signal: &Array1<f32>) -> TokenizerResult<Array1<f32>> {
         let coeffs = self.decompose(signal);
-        let quantized = self.quantize_coeffs(&coeffs);
+        let max_val = Self::coeffs_max_val(&coeffs);
+        let quantized = self.quantize_coeffs_with_max(&coeffs, max_val);
 
-        // Flatten into 1D array
-        let tokens: Vec<f32> = quantized
-            .iter()
-            .flat_map(|band| band.iter().map(|&q| q as f32))
-            .collect();
+        // Prepend max_val as token[0] so decode can recover the correct scale.
+        let mut tokens = vec![max_val];
+        tokens.extend(
+            quantized
+                .iter()
+                .flat_map(|band| band.iter().map(|&q| q as f32)),
+        );
 
         Ok(Array1::from_vec(tokens))
     }
 
     fn decode(&self, tokens: &Array1<f32>) -> TokenizerResult<Array1<f32>> {
-        // Reconstruct coefficient structure
-        // This is a simplified version - in practice, we'd need to store band sizes
-        let max_val = 1.0; // Simplified - should be stored with coefficients
-        let quantized: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        if tokens.is_empty() {
+            return Ok(Array1::zeros(0));
+        }
+        // token[0] is the max_val header written by encode.
+        let max_val = tokens[0];
+        let quantized: Vec<i32> = tokens.iter().skip(1).map(|&t| t as i32).collect();
 
         // Estimate band sizes (simplified - assumes power-of-2 signal length)
         let mut band_sizes = Vec::new();
@@ -472,8 +481,9 @@ impl DCTTokenizer {
         signal
     }
 
-    /// Quantize DCT coefficients (zig-zag scan and quantization)
-    fn quantize(&self, coeffs: &[f32]) -> Vec<i32> {
+    /// Quantize DCT coefficients, returning both the quantized integers and the
+    /// max-absolute-value used for normalization so the caller can store it as a header.
+    fn quantize(&self, coeffs: &[f32]) -> (Vec<i32>, f32) {
         let levels = (1 << self.config.bits) as f32;
         let max_val = coeffs
             .iter()
@@ -482,10 +492,10 @@ impl DCTTokenizer {
             .fold(0.0_f32, f32::max);
 
         if max_val == 0.0 {
-            return vec![0; self.config.num_coeffs];
+            return (vec![0; self.config.num_coeffs], 0.0);
         }
 
-        coeffs
+        let quantized = coeffs
             .iter()
             .take(self.config.num_coeffs)
             .map(|&x| {
@@ -493,7 +503,9 @@ impl DCTTokenizer {
                 let quantized = (normalized * (levels / 2.0)).round();
                 quantized.clamp(-(levels / 2.0), levels / 2.0 - 1.0) as i32
             })
-            .collect()
+            .collect();
+
+        (quantized, max_val)
     }
 
     /// Dequantize coefficients
@@ -514,20 +526,26 @@ impl SignalTokenizer for DCTTokenizer {
                 .as_slice()
                 .expect("Signal must have contiguous layout"),
         );
-        let quantized = self.quantize(&coeffs);
+        let (quantized, max_val) = self.quantize(&coeffs);
 
-        let tokens: Vec<f32> = quantized.iter().map(|&q| q as f32).collect();
+        // Prepend max_val as token[0] so decode can recover the correct scale.
+        let mut tokens = vec![max_val];
+        tokens.extend(quantized.iter().map(|&q| q as f32));
         Ok(Array1::from_vec(tokens))
     }
 
     fn decode(&self, tokens: &Array1<f32>) -> TokenizerResult<Array1<f32>> {
-        let max_val = 1.0; // Simplified - should be stored
-        let quantized: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        if tokens.is_empty() {
+            return Ok(Array1::zeros(0));
+        }
+        // token[0] is the max_val header written by encode.
+        let max_val = tokens[0];
+        let quantized: Vec<i32> = tokens.iter().skip(1).map(|&t| t as i32).collect();
         let coeffs = self.dequantize(&quantized, max_val);
 
-        // Pad with zeros if needed
+        // Pad with zeros if needed to reach num_coeffs
         let mut full_coeffs = coeffs;
-        while full_coeffs.len() < tokens.len() {
+        while full_coeffs.len() < self.config.num_coeffs {
             full_coeffs.push(0.0);
         }
 
@@ -536,7 +554,8 @@ impl SignalTokenizer for DCTTokenizer {
     }
 
     fn embed_dim(&self) -> usize {
-        self.config.num_coeffs
+        // +1 for the max_val header prepended in encode.
+        self.config.num_coeffs + 1
     }
 
     fn vocab_size(&self) -> usize {
@@ -927,7 +946,8 @@ mod tests {
 
         let signal = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         let tokens = tokenizer.encode(&signal).unwrap();
-        assert_eq!(tokens.len(), 8);
+        // token[0] is the max_val header; tokens[1..] are the 8 quantized coefficients.
+        assert_eq!(tokens.len(), 9);
 
         let reconstructed = tokenizer.decode(&tokens).unwrap();
         assert_eq!(reconstructed.len(), 8);
@@ -944,7 +964,8 @@ mod tests {
         // Smooth signal should compress well
         let signal = Array1::from_vec(vec![1.0, 1.1, 1.2, 1.1, 1.0, 0.9, 0.8, 0.9]);
         let tokens = tokenizer.encode(&signal).unwrap();
-        assert_eq!(tokens.len(), 4); // Compressed to 4 coeffs
+        // token[0] is the max_val header; tokens[1..] are the 4 quantized coefficients.
+        assert_eq!(tokens.len(), 5);
     }
 
     #[test]

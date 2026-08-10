@@ -332,10 +332,6 @@ impl ModelFactory {
     }
 
     /// Create RWKV-v7 model from config and weights
-    ///
-    /// Note: RWKV-v7 does not yet expose `load_weights_json`; weights are
-    /// accepted for API consistency and will be injected once the method is
-    /// available on `Rwkv7`.
     #[instrument(skip(weights))]
     pub fn create_rwkv7(
         config: Rwkv7Config,
@@ -346,10 +342,17 @@ impl ModelFactory {
             config.hidden_dim, config.num_layers
         );
 
-        let model = Rwkv7::new(config)?;
+        let mut model = Rwkv7::new(config)?;
 
         if !weights.is_empty() {
-            warn!("RWKV-v7 weight injection not yet implemented; weights ignored");
+            let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
+            let tmp_path = Self::write_weights_temp(&f32_weights, "rwkv7")?;
+            let load_result = model.load_weights_json(&tmp_path);
+            let _ = std::fs::remove_file(&tmp_path);
+            load_result?;
+            debug!("RWKV-v7 model weights injected successfully");
+        } else {
+            warn!("RWKV-v7 model created without weights (empty weights map)");
         }
 
         debug!("RWKV-v7 model created successfully");
@@ -385,9 +388,6 @@ impl ModelFactory {
     }
 
     /// Create S5 model from config and weights
-    ///
-    /// Note: S5 does not yet expose `load_weights_json`; weights are accepted
-    /// for API consistency and will be injected once the method is available.
     #[instrument(skip(weights))]
     pub fn create_s5(
         config: S5Config,
@@ -398,10 +398,17 @@ impl ModelFactory {
             config.hidden_dim, config.state_dim, config.num_layers
         );
 
-        let model = S5::new(config)?;
+        let mut model = S5::new(config)?;
 
         if !weights.is_empty() {
-            warn!("S5 weight injection not yet implemented; weights ignored");
+            let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
+            let tmp_path = Self::write_weights_temp(&f32_weights, "s5")?;
+            let load_result = model.load_weights_json(&tmp_path);
+            let _ = std::fs::remove_file(&tmp_path);
+            load_result?;
+            debug!("S5 model weights injected successfully");
+        } else {
+            warn!("S5 model created without weights (empty weights map)");
         }
 
         debug!("S5 model created successfully");

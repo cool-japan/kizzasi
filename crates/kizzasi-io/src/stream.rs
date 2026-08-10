@@ -605,11 +605,11 @@ mod tests {
 
         assert!(stream.is_active());
 
-        let buf1 = stream.read().unwrap();
+        let buf1 = stream.read().expect("MemoryStream::read should succeed");
         assert_eq!(buf1[0], 1.0);
         assert_eq!(buf1[3], 4.0);
 
-        let buf2 = stream.read().unwrap();
+        let buf2 = stream.read().expect("MemoryStream::read should succeed");
         assert_eq!(buf2[0], 5.0);
 
         assert!(!stream.is_active());

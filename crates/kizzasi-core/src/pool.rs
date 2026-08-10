@@ -157,17 +157,23 @@ impl<'a> PooledArray<'a> {
 
     /// Get a reference to the underlying array
     pub fn as_array(&self) -> &Array1<f32> {
-        self.array.as_ref().unwrap()
+        self.array
+            .as_ref()
+            .expect("invariant: array present until Drop or take()")
     }
 
     /// Get a mutable reference to the underlying array
     pub fn as_array_mut(&mut self) -> &mut Array1<f32> {
-        self.array.as_mut().unwrap()
+        self.array
+            .as_mut()
+            .expect("invariant: array present until Drop or take()")
     }
 
     /// Take ownership of the array, preventing automatic return
     pub fn take(mut self) -> Array1<f32> {
-        self.array.take().unwrap()
+        self.array
+            .take()
+            .expect("invariant: array present until Drop or take()")
     }
 }
 

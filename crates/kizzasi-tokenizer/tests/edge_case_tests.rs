@@ -266,6 +266,102 @@ fn test_invalid_configs() {
     assert!(config.validate().is_err());
 }
 
+/// LinearQuantizer with empty input should return empty output or a clear error.
+#[test]
+fn test_linear_quantizer_empty_input() {
+    let quantizer = LinearQuantizer::new(-1.0, 1.0, 8).expect("Creation failed");
+    let signal = Array1::<f32>::zeros(0);
+    match quantizer.encode(&signal) {
+        Ok(encoded) => {
+            assert!(
+                encoded.is_empty(),
+                "empty input should yield empty encoding"
+            );
+        }
+        Err(_) => { /* graceful error on empty input is also fine */ }
+    }
+}
+
+/// μ-law with NaN input — should either propagate NaN or error, not panic.
+#[test]
+fn test_mulaw_nan_input() {
+    let codec = MuLawCodec::new(8);
+    let signal = Array1::from_vec(vec![f32::NAN, 0.0, 1.0]);
+    // Must not panic. Either encodes (NaN propagation) or errors.
+    let _ = codec.encode(&signal);
+}
+
+/// μ-law with ±Infinity — must not panic.
+#[test]
+fn test_mulaw_infinity_input() {
+    let codec = MuLawCodec::new(8);
+    let signal = Array1::from_vec(vec![f32::INFINITY, f32::NEG_INFINITY, 0.5]);
+    let _ = codec.encode(&signal);
+}
+
+/// Linear quantizer with NaN input — must not panic.
+#[test]
+fn test_linear_quantizer_nan_input() {
+    let quantizer = LinearQuantizer::new(-1.0, 1.0, 8).expect("Creation failed");
+    let signal = Array1::from_vec(vec![0.0, f32::NAN, 1.0, f32::NAN]);
+    let _ = quantizer.encode(&signal);
+}
+
+/// LinearQuantizer range boundary: value exactly at min and max.
+#[test]
+fn test_linear_quantizer_exact_boundaries() {
+    let quantizer = LinearQuantizer::new(-1.0, 1.0, 4).expect("Creation failed");
+    let signal = Array1::from_vec(vec![-1.0, 1.0]);
+    let encoded = quantizer.encode(&signal).expect("Encoding failed");
+    let decoded = quantizer.decode(&encoded).expect("Decoding failed");
+    assert_eq!(decoded.len(), 2);
+    for &v in decoded.iter() {
+        assert!(
+            (-1.0f32..=1.0).contains(&v),
+            "decoded value {v} out of range"
+        );
+    }
+}
+
+/// Very small (subnormal) values should not cause issues.
+#[test]
+fn test_linear_quantizer_subnormal_values() {
+    let quantizer = LinearQuantizer::new(-1.0, 1.0, 8).expect("Creation failed");
+    let signal = Array1::from_vec(vec![f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 0.0]);
+    let encoded = quantizer.encode(&signal).expect("Encoding failed");
+    let decoded = quantizer.decode(&encoded).expect("Decoding failed");
+    assert_eq!(decoded.len(), 3);
+}
+
+/// Streaming tokenizer: chunk boundary at exact frame size.
+#[test]
+fn test_streaming_exact_frame_boundary() {
+    let quantizer = LinearQuantizer::new(-1.0, 1.0, 8).expect("Creation failed");
+    // StreamingTokenizer::new(tokenizer, chunk_size, overlap) -> Result
+    let streamer =
+        StreamingTokenizer::new(quantizer, 4, 0).expect("StreamingTokenizer creation failed");
+    // Feed exactly 4 samples (one complete frame).
+    let chunk = Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4]);
+    let output = streamer
+        .encode_streaming(&chunk)
+        .expect("Streaming encode failed");
+    // Should produce at least one chunk of output.
+    assert!(
+        !output.is_empty(),
+        "exact-frame chunk should produce output"
+    );
+}
+
+/// AdaptiveQuantizer with max_bits = min_bits (fixed rate).
+#[test]
+fn test_adaptive_quantizer_fixed_rate() {
+    let quantizer = AdaptiveQuantizer::new(8, 8, 0.5, -1.0, 1.0).expect("Creation failed");
+    let signal = Array1::linspace(-1.0, 1.0, 32);
+    let encoded = quantizer.encode(&signal).expect("Encoding failed");
+    let decoded = quantizer.decode(&encoded).expect("Decoding failed");
+    assert_eq!(decoded.len(), signal.len());
+}
+
 /// Test very long signal processing
 #[test]
 fn test_very_long_signal() {

@@ -149,6 +149,27 @@ impl LinearConstraint {
     pub fn rhs(&self) -> f32 {
         self.rhs
     }
+
+    /// Shift the right-hand side by `delta`.
+    ///
+    /// Positive delta loosens an `a·x <= b` constraint (raises b),
+    /// while negative delta tightens it (lowers b). The semantics
+    /// are symmetric for `>=` and equality constraints.
+    pub fn shift_rhs(&mut self, delta: f32) {
+        self.rhs += delta;
+    }
+
+    /// Add a scaled version of `direction` to the coefficient vector.
+    ///
+    /// Used by perceptron-style updates: `a ← a + scale * x` where `x`
+    /// is the mis-classified sample.  The `direction` slice is silently
+    /// truncated or zero-padded to match the current coefficient length.
+    pub fn update_coefficients_towards(&mut self, direction: &[f32], scale: f32) {
+        for (i, ai) in self.coefficients.iter_mut().enumerate() {
+            let di = direction.get(i).copied().unwrap_or(0.0);
+            *ai += scale * di;
+        }
+    }
 }
 
 /// A set of linear constraints

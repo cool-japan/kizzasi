@@ -64,6 +64,10 @@ pub fn matvec(m: &Array2<f32>, x: &Array1<f32>, y: &mut Array1<f32>) {
     let cols = m.ncols();
     debug_assert_eq!(cols, x.len());
     debug_assert_eq!(rows, y.len());
+    // SIMD inner kernel: emit a TRACE-level span so it is compiled out in
+    // release builds with the default tracing filter, keeping the hot path
+    // overhead-free for callers that don't opt into trace logging.
+    let _span = tracing::trace_span!("simd::matvec", rows = rows, cols = cols).entered();
 
     // Process 4 rows at a time if possible
     let row_chunks = rows / 4;
@@ -264,6 +268,10 @@ pub fn ssm_state_update(a_bar: &[f32], h: &mut [f32], b_bar: &[f32], x: &[f32]) 
     debug_assert_eq!(a_bar.len(), b_bar.len());
 
     let len = h.len();
+    // TRACE-level span: this kernel runs once per recurrence step in the
+    // inference loop and would generate huge volumes at DEBUG. Use TRACE
+    // so it's compiled out by default.
+    let _span = tracing::trace_span!("simd::ssm_state_update", len = len).entered();
     let chunks = len / SIMD_WIDTH;
     let remainder = len % SIMD_WIDTH;
 
@@ -295,6 +303,10 @@ pub fn layer_norm(x: &mut [f32], eps: f32) {
     if n == 0 {
         return;
     }
+    // TRACE-level: called once per token/layer in the inference loop, so we
+    // emit at the cheapest tracing level. The eps value is included since
+    // it's a single f32 and useful for diagnosing numerical issues.
+    let _span = tracing::trace_span!("simd::layer_norm", len = n, eps = eps).entered();
 
     // Compute mean and variance in single pass (Welford's algorithm)
     let mut mean = 0.0f32;
@@ -339,6 +351,9 @@ pub fn softmax(x: &mut [f32]) {
     if n == 0 {
         return;
     }
+    // TRACE-level: invoked per attention head per query position. Avoid
+    // anything more verbose than the input length.
+    let _span = tracing::trace_span!("simd::softmax", len = n).entered();
 
     // Find max for numerical stability
     let mut max_val = x[0];
@@ -380,6 +395,8 @@ pub fn online_softmax(x: &mut [f32]) {
     if n == 0 {
         return;
     }
+    // TRACE-level: streaming softmax kernel, called often in attention paths.
+    let _span = tracing::trace_span!("simd::online_softmax", len = n).entered();
 
     // First pass: compute running max and denominator
     let mut max_val = x[0];
@@ -417,6 +434,10 @@ pub fn fused_softmax_attend(scores: &mut [f32], values: &[f32], output: &mut [f3
     if n == 0 || values.len() != n || output.len() != n {
         return;
     }
+    // TRACE-level: fused softmax+attend kernel, called per query position in
+    // attention. Records the score vector length only (the values themselves
+    // are too large to format cheaply).
+    let _span = tracing::trace_span!("simd::fused_softmax_attend", len = n).entered();
 
     // Online softmax computation
     let mut max_val = scores[0];

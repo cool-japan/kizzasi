@@ -297,19 +297,34 @@ impl WelfordVariance {
 // Stable SSM Discretization
 // ============================================================================
 
-/// Stable matrix exponential using Padé approximation with scaling
+/// Stable matrix exponential using Padé\[13,13\] approximation with scaling and squaring.
 ///
 /// Uses scaling and squaring: exp(A) = (exp(A/2^s))^(2^s)
+///
+/// The approximant is:
+/// - `U = sum_{k odd}  b[k] * A^k`
+/// - `V = sum_{k even} b[k] * A^k`
+/// - `exp(A) ≈ (V - U)^{-1} * (V + U)`
+///
+/// Coefficients from Higham 2005 Table 10.4, normalized so `b[0]=1`.
 pub fn matrix_exp_pade(a: &Array2<f32>, order: usize) -> Array2<f32> {
     let n = a.shape()[0];
     assert_eq!(a.shape()[1], n, "Matrix must be square");
 
-    // Compute norm for scaling
-    let norm: f32 = a.iter().map(|x| x.abs()).sum::<f32>();
+    // 1-norm (max absolute column sum) for scaling heuristic
+    let norm: f32 = {
+        let mut col_sums = vec![0.0f32; n];
+        for i in 0..n {
+            for j in 0..n {
+                col_sums[j] += a[[i, j]].abs();
+            }
+        }
+        col_sums.into_iter().fold(0.0f32, f32::max)
+    };
 
-    // Determine scaling factor
-    let s = if norm > 0.0 {
-        (norm.log2() as i32).max(0) as u32
+    // Determine scaling factor: scale so that ||A/2^s|| <= 1
+    let s = if norm > 1.0 {
+        (norm.log2().ceil() as i32).max(0) as u32
     } else {
         0
     };
@@ -318,86 +333,168 @@ pub fn matrix_exp_pade(a: &Array2<f32>, order: usize) -> Array2<f32> {
     let scale = 2.0f32.powi(-(s as i32));
     let a_scaled = a.mapv(|x| x * scale);
 
-    // Compute Padé approximant
-    let mut u: Array2<f32> = Array2::eye(n);
+    // Get Padé[13,13] coefficients (normalized so b[0]=1)
+    let b = pade_coefficients(order);
+    let p = b.len() - 1; // polynomial degree = 13
+
+    // Accumulate even-degree terms in V and odd-degree terms in U
+    // V = b[0]*I + b[2]*A^2 + b[4]*A^4 + ...
+    // U = b[1]*A + b[3]*A^3 + b[5]*A^5 + ...
     let mut v: Array2<f32> = Array2::eye(n);
+    v.mapv_inplace(|x| x * b[0]);
+    let mut u: Array2<f32> = Array2::zeros((n, n));
 
-    // Padé coefficients for given order
-    let (c_u, c_v) = pade_coefficients(order);
-
-    let mut a_power = Array2::eye(n);
-    for k in 1..=order {
-        a_power = a_power.dot(&a_scaled);
+    // Build powers A^1, A^2, ..., A^p iteratively
+    let mut a_power = a_scaled.clone(); // A^1
+    for (k, &coeff) in b.iter().enumerate().skip(1) {
         if k % 2 == 1 {
-            u = &u + &a_power.mapv(|x| x * c_u[k]);
+            // odd power -> U
+            u = &u + &a_power.mapv(|x| x * coeff);
         } else {
-            v = &v + &a_power.mapv(|x| x * c_v[k]);
+            // even power -> V
+            v = &v + &a_power.mapv(|x| x * coeff);
+        }
+        if k < p {
+            a_power = a_power.dot(&a_scaled);
         }
     }
 
-    // exp(A) ≈ (V - U)^(-1) * (V + U)
-    // For simplicity, use approximation: exp(A) ≈ (I + A/2) * (I - A/2)^(-1)
-    // which is the first-order Padé
-    let result = solve_linear(&(&v - &u), &(&v + &u));
+    // exp(A) ≈ (V - U)^{-1} * (V + U)
+    let v_minus_u = &v - &u;
+    let v_plus_u = &v + &u;
+    let result = solve_linear(&v_minus_u, &v_plus_u);
 
-    // Square back
+    // Square back s times: exp(A) = exp(A/2^s)^(2^s)
     let mut exp_a = result;
     for _ in 0..s {
-        exp_a = exp_a.dot(&exp_a);
+        let tmp = exp_a.clone();
+        exp_a = exp_a.dot(&tmp);
     }
 
     exp_a
 }
 
-/// Get Padé coefficients for given order
-fn pade_coefficients(order: usize) -> (Vec<f32>, Vec<f32>) {
-    // Simplified coefficients for orders 1-6
-    let order = order.min(6);
-    let mut c_u = vec![0.0f32; order + 1];
-    let mut c_v = vec![0.0f32; order + 1];
-
-    // c_v[0] = 1, c_v[2] = 1/2, c_v[4] = 1/24, ...
-    // c_u[1] = 1/2, c_u[3] = 1/12, ...
-    c_v[0] = 1.0;
-    if order >= 1 {
-        c_u[1] = 0.5;
-    }
-    if order >= 2 {
-        c_v[2] = 1.0 / 12.0;
-    }
-    if order >= 3 {
-        c_u[3] = 1.0 / 120.0;
-    }
-    if order >= 4 {
-        c_v[4] = 1.0 / 30240.0;
-    }
-    if order >= 5 {
-        c_u[5] = 1.0 / 1209600.0;
-    }
-    if order >= 6 {
-        c_v[6] = 1.0 / 17297280.0;
-    }
-
-    (c_u, c_v)
+/// Padé[13,13] scalar coefficients from Higham (2005) Table 10.4.
+///
+/// Returns the 14 coefficients `b[0..=13]` normalized so that `b[0] = 1`.
+/// The same table serves both numerator (U, odd indices) and denominator (V, even indices).
+/// The `_order` parameter is accepted for API compatibility but always uses degree 13.
+fn pade_coefficients(_order: usize) -> Vec<f32> {
+    // Higham 2005, Table 10.4 — exact rational values cast to f64 then f32.
+    // The polynomial is: sum_{k=0}^{13} b[k] * A^k
+    // Numerator U uses odd-k terms; denominator V uses even-k terms.
+    // Raw (un-normalized) values:
+    const RAW: [f64; 14] = [
+        64_764_752_532_480_000.0, // b[0]
+        32_382_376_266_240_000.0, // b[1]
+        7_771_770_303_897_600.0,  // b[2]
+        1_187_353_796_428_800.0,  // b[3]
+        129_060_195_264_000.0,    // b[4]
+        10_559_470_521_600.0,     // b[5]
+        670_442_572_800.0,        // b[6]
+        33_522_128_640.0,         // b[7]
+        1_323_241_920.0,          // b[8]
+        40_840_800.0,             // b[9]
+        960_960.0,                // b[10]
+        16_380.0,                 // b[11]
+        182.0,                    // b[12]
+        1.0,                      // b[13]
+    ];
+    let scale = 1.0 / RAW[0];
+    RAW.iter().map(|&x| (x * scale) as f32).collect()
 }
 
-/// Simple linear solve (I + A)^(-1) B using Neumann series approximation
+/// Solve the linear system `A X = B` using LU decomposition with partial pivoting.
+///
+/// Implements the Doolittle algorithm with row pivoting.  Near-zero pivots are
+/// regularised by adding `1e-8` to the diagonal — this is safe because the
+/// caller always inverts `V - U`, which is invertible by Padé construction.
+///
+/// Returns `X` such that `A X ≈ B`.
 fn solve_linear(a: &Array2<f32>, b: &Array2<f32>) -> Array2<f32> {
     let n = a.shape()[0];
+    let m = b.shape()[1];
 
-    // For well-conditioned matrices, use Neumann series
-    // (I - A)^(-1) ≈ I + A + A^2 + ...
-    // Here we have (A)^(-1) B, which we approximate with a few iterations
+    // -----------------------------------------------------------------------
+    // LU decomposition with partial (row) pivoting
+    // -----------------------------------------------------------------------
+    // Work on a mutable copy; combine L and U in-place (Doolittle).
+    let mut lu = a.clone();
+    let mut piv = vec![0usize; n]; // pivot row indices
 
-    // Simple iterative refinement
-    let mut x = b.clone();
-    let identity = Array2::eye(n);
+    for col in 0..n {
+        // Find pivot row: argmax |lu[row, col]| for row >= col
+        let mut max_abs = lu[[col, col]].abs();
+        let mut max_row = col;
+        for row in (col + 1)..n {
+            let v = lu[[row, col]].abs();
+            if v > max_abs {
+                max_abs = v;
+                max_row = row;
+            }
+        }
+        piv[col] = max_row;
 
-    // Gauss-Seidel-like iteration
-    for _ in 0..10 {
-        let residual = b - &a.dot(&x);
-        let correction = residual.mapv(|v| v * 0.5);
-        x = &x + &identity.dot(&correction);
+        // Swap rows col and max_row in lu
+        if max_row != col {
+            for j in 0..n {
+                let tmp = lu[[col, j]];
+                lu[[col, j]] = lu[[max_row, j]];
+                lu[[max_row, j]] = tmp;
+            }
+        }
+
+        // Regularise near-zero pivot to avoid division by zero
+        if lu[[col, col]].abs() < 1e-12 {
+            lu[[col, col]] = if lu[[col, col]] >= 0.0 { 1e-8 } else { -1e-8 };
+        }
+
+        // Eliminate below
+        let pivot_val = lu[[col, col]];
+        for row in (col + 1)..n {
+            lu[[row, col]] /= pivot_val;
+            let multiplier = lu[[row, col]];
+            for j in (col + 1)..n {
+                let sub = multiplier * lu[[col, j]];
+                lu[[row, j]] -= sub;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Solve for each column of B separately
+    // -----------------------------------------------------------------------
+    let mut x = Array2::<f32>::zeros((n, m));
+
+    for col in 0..m {
+        // Apply row permutations to this RHS column
+        let mut rhs: Vec<f32> = (0..n).map(|i| b[[i, col]]).collect();
+        for (i, &pivot_row) in piv.iter().enumerate() {
+            rhs.swap(i, pivot_row);
+        }
+
+        // Forward substitution: solve L y = rhs  (L has unit diagonal)
+        let mut y = rhs;
+        for i in 0..n {
+            for j in 0..i {
+                let sub = lu[[i, j]] * y[j];
+                y[i] -= sub;
+            }
+        }
+
+        // Back substitution: solve U x_col = y
+        let mut x_col = y;
+        for i in (0..n).rev() {
+            for j in (i + 1)..n {
+                let sub = lu[[i, j]] * x_col[j];
+                x_col[i] -= sub;
+            }
+            x_col[i] /= lu[[i, i]];
+        }
+
+        for i in 0..n {
+            x[[i, col]] = x_col[i];
+        }
     }
 
     x
@@ -406,24 +503,53 @@ fn solve_linear(a: &Array2<f32>, b: &Array2<f32>) -> Array2<f32> {
 /// Zero-Order Hold (ZOH) discretization for SSM
 ///
 /// Given continuous A, B matrices and step size dt:
-/// A_d = exp(A * dt)
-/// B_d = A^(-1) * (A_d - I) * B (approximated for stability)
+/// - `A_d = exp(A * dt)`
+/// - `B_d = A^{-1} * (A_d - I) * B`  (exact ZOH, solved via LU)
+///
+/// For near-zero `||A * dt||`, falls back to the zeroth-order series `B_d ≈ dt * B`
+/// to avoid numerical issues in the linear solve.
 pub fn zoh_discretize(a: &Array2<f32>, b: &Array2<f32>, dt: f32) -> (Array2<f32>, Array2<f32>) {
     let n = a.shape()[0];
 
     // Scale A by dt
     let a_dt = a.mapv(|x| x * dt);
 
-    // Compute exp(A * dt) using Taylor series
-    let a_d = taylor_exp(&a_dt, 8);
+    // Compute exp(A * dt) using the corrected Padé[13,13] approximant
+    let a_d = matrix_exp_pade(&a_dt, 13);
 
-    // B_d approximation using first-order ZOH:
-    // B_d ≈ dt * (I + A*dt/2 + (A*dt)^2/6) * B
-    // For small dt, this is ≈ dt * B
-    let identity: Array2<f32> = Array2::eye(n);
-    let half_a_dt = a_dt.mapv(|x| x * 0.5);
-    let approx_factor = &identity + &half_a_dt;
-    let b_d = approx_factor.dot(b).mapv(|x| x * dt);
+    // Compute B_d = A^{-1} * (A_d - I) * B via solve_linear(A*dt, (A_d - I) * B)
+    // This is equivalent to solving (A*dt) * B_d = (A_d - I) * B and then
+    // multiplying by 1/dt on both sides — but we directly use:
+    //   B_d = A^{-1} * (A_d - I) * B  =>  A * B_d = (A_d - I) * B
+    //   => (A*dt) * B_d = (A_d - I) * B * dt / dt   -- no, keep it clean:
+    //   solve_linear(A*dt, (A_d - I) * B) gives (A*dt)^{-1} * (A_d - I) * B
+    //   which equals A^{-1}/dt * (A_d - I) * B.
+    // The correct ZOH formula is B_d = A^{-1}*(A_d - I)*B, so:
+    //   B_d = dt * solve_linear(A*dt, (A_d - I) * B)
+
+    // 1-norm of A*dt as a proxy for whether A is near-zero
+    let norm_a_dt: f32 = {
+        let mut col_sums = vec![0.0f32; n];
+        for i in 0..n {
+            for j in 0..n {
+                col_sums[j] += a_dt[[i, j]].abs();
+            }
+        }
+        col_sums.into_iter().fold(0.0f32, f32::max)
+    };
+
+    let b_d = if norm_a_dt < 1e-9 {
+        // Degenerate case: A ≈ 0, exact limit gives B_d = dt * B
+        b.mapv(|x| x * dt)
+    } else {
+        // Exact ZOH: B_d = A^{-1} * (A_d - I) * B
+        // Equivalently:  A * B_d = (A_d - I) * B
+        //             (A*dt) * B_d = dt * (A_d - I) * B
+        // So:  B_d = solve_linear(A*dt, dt*(A_d-I)*B)
+        let a_d_minus_i = &a_d - &Array2::<f32>::eye(n);
+        let rhs = a_d_minus_i.dot(b).mapv(|x| x * dt);
+        solve_linear(&a_dt, &rhs)
+    };
 
     (a_d, b_d)
 }
@@ -445,10 +571,10 @@ pub enum DiscretizationMethod {
 
 /// Zero-Order Hold (ZOH) discretization for **diagonal** A.
 ///
-/// For each element i:
-/// - a_bar[i] = exp(dt · a[i])
-/// - b_bar[i, :] = (exp(dt · a[i]) - 1) / a[i] · b[i, :]
-///   (= dt · b[i, :] when a[i] ≈ 0)
+/// For each element `i`:
+/// - `a_bar[i] = exp(dt · a[i])`
+/// - `b_bar[i, :] = (exp(dt · a[i]) - 1) / a[i] · b[i, :]`
+///   (= `dt · b[i, :]` when `a[i] ≈ 0`)
 ///
 /// This is the exact closed-form ZOH for a diagonal continuous-time system.
 pub fn zoh_discretize_diagonal(
@@ -478,9 +604,9 @@ pub fn zoh_discretize_diagonal(
 
 /// Bilinear (Tustin) discretization for **diagonal** A.
 ///
-/// For each element i:
-/// - a_bar[i] = (1 + dt·a[i]/2) / (1 - dt·a[i]/2)
-/// - b_bar[i, :] = dt/2 · (1 + a_bar[i]) · b[i, :]
+/// For each element `i`:
+/// - `a_bar[i] = (1 + dt·a[i]/2) / (1 - dt·a[i]/2)`
+/// - `b_bar[i, :] = dt/2 · (1 + a_bar[i]) · b[i, :]`
 ///
 /// Preserves stability: |a_bar| < 1 for all Re(a) < 0 and dt > 0.
 pub fn bilinear_discretize(
@@ -504,11 +630,11 @@ pub fn bilinear_discretize(
 
 /// Forward Euler discretization for **diagonal** A.
 ///
-/// For each element i:
-/// - a_bar[i] = 1 + dt·a[i]
+/// For each element `i`:
+/// - `a_bar[i] = 1 + dt·a[i]`
 /// - b_bar = dt·b
 ///
-/// NOTE: Unstable when dt·|a[i]| > 2. Use ZOH or Bilinear for large dt.
+/// NOTE: Unstable when `dt·|a[i]| > 2`. Use ZOH or Bilinear for large dt.
 pub fn forward_euler_discretize(
     a: &Array1<f32>,
     b: &Array2<f32>,
@@ -533,7 +659,8 @@ pub fn discretize(
     }
 }
 
-/// Taylor series expansion for matrix exponential
+/// Taylor series expansion for matrix exponential (used in tests)
+#[cfg(test)]
 fn taylor_exp(a: &Array2<f32>, terms: usize) -> Array2<f32> {
     let n = a.shape()[0];
     let mut result = Array2::eye(n);
@@ -762,29 +889,45 @@ mod tests {
 
     #[test]
     fn test_zoh_discretize() {
-        // Simple diagonal system
+        // Simple diagonal system: A = diag(-1, -2), B = I, dt = 0.1
         let a = Array2::from_diag(&Array1::from_vec(vec![-1.0, -2.0]));
         let b: Array2<f32> = Array2::eye(2);
-        let dt = 0.1;
+        let dt = 0.1f32;
 
         let (a_d, b_d) = zoh_discretize(&a, &b, dt);
 
-        // A_d should be close to exp(A*dt) = diag(exp(-0.1), exp(-0.2))
-        // Using Taylor series approximation, we get different values
-        // Taylor: I + A*dt + (A*dt)^2/2 + ... ≈ 1 - 0.1 + 0.005 = 0.905 for first entry
+        // Exact ZOH: A_d = diag(exp(-0.1), exp(-0.2))
+        let exp_neg01 = (-0.1f32).exp();
+        let exp_neg02 = (-0.2f32).exp();
         assert!(
-            (a_d[[0, 0]] - 0.905).abs() < 0.1,
-            "a_d[0,0] = {}",
-            a_d[[0, 0]]
+            (a_d[[0, 0]] - exp_neg01).abs() < 1e-4,
+            "a_d[0,0] = {}, expected {}",
+            a_d[[0, 0]],
+            exp_neg01
         );
         assert!(
-            (a_d[[1, 1]] - 0.82).abs() < 0.1,
-            "a_d[1,1] = {}",
-            a_d[[1, 1]]
+            (a_d[[1, 1]] - exp_neg02).abs() < 1e-4,
+            "a_d[1,1] = {}, expected {}",
+            a_d[[1, 1]],
+            exp_neg02
         );
 
-        // B_d should be non-zero
-        assert!(b_d[[0, 0]].abs() > 0.0, "b_d[0,0] = {}", b_d[[0, 0]]);
+        // Exact ZOH for diagonal: B_d[i,i] = (exp(a[i]*dt) - 1) / a[i]
+        // B_d[0,0] = (exp(-0.1) - 1) / (-1) = 1 - exp(-0.1)
+        let b_d_00_exact = (1.0 - exp_neg01) / 1.0; // divide by |a[0]| with correct sign
+        let b_d_11_exact = (1.0 - exp_neg02) / 2.0;
+        assert!(
+            (b_d[[0, 0]] - b_d_00_exact).abs() < 1e-4,
+            "b_d[0,0] = {}, expected {}",
+            b_d[[0, 0]],
+            b_d_00_exact
+        );
+        assert!(
+            (b_d[[1, 1]] - b_d_11_exact).abs() < 1e-4,
+            "b_d[1,1] = {}, expected {}",
+            b_d[[1, 1]],
+            b_d_11_exact
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -865,5 +1008,190 @@ mod tests {
                 "ZOH-diagonal a_bar[{i}]={ab} expected {expected}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // matrix_exp_pade correctness tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matrix_exp_identity() {
+        // exp(zero matrix) = I
+        let n = 3usize;
+        let a: Array2<f32> = Array2::zeros((n, n));
+        let result = matrix_exp_pade(&a, 13);
+        for i in 0..n {
+            for j in 0..n {
+                let expected = if i == j { 1.0f32 } else { 0.0f32 };
+                assert!(
+                    (result[[i, j]] - expected).abs() < 1e-6,
+                    "exp(0)[{i},{j}] = {}, expected {expected}",
+                    result[[i, j]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_matrix_exp_diagonal() {
+        // exp(diag(-1,-2)) ≈ diag(e^{-1}, e^{-2})
+        let a = Array2::from_diag(&Array1::from_vec(vec![-1.0f32, -2.0f32]));
+        let result = matrix_exp_pade(&a, 13);
+        let e1 = (-1.0f32).exp();
+        let e2 = (-2.0f32).exp();
+        assert!(
+            (result[[0, 0]] - e1).abs() < 1e-5,
+            "exp(diag)[0,0] = {}, expected {e1}",
+            result[[0, 0]]
+        );
+        assert!(
+            (result[[1, 1]] - e2).abs() < 1e-5,
+            "exp(diag)[1,1] = {}, expected {e2}",
+            result[[1, 1]]
+        );
+        // Off-diagonal should be ~0
+        assert!(result[[0, 1]].abs() < 1e-6);
+        assert!(result[[1, 0]].abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_matrix_exp_nilpotent() {
+        // exp([[0,1],[0,0]]) = [[1,1],[0,1]]
+        let a = Array2::from_shape_vec((2, 2), vec![0.0f32, 1.0, 0.0, 0.0]).unwrap();
+        let result = matrix_exp_pade(&a, 13);
+        let expected = [[1.0f32, 1.0], [0.0, 1.0]];
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (result[[i, j]] - expected[i][j]).abs() < 1e-6,
+                    "nilpotent exp[{i},{j}] = {}, expected {}",
+                    result[[i, j]],
+                    expected[i][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_matrix_exp_skew_symmetric() {
+        // exp([[0,-0.5],[0.5,0]]) = rotation by 0.5 rad
+        // = [[cos(0.5), -sin(0.5)], [sin(0.5), cos(0.5)]]
+        let theta = 0.5f32;
+        let a = Array2::from_shape_vec((2, 2), vec![0.0, -theta, theta, 0.0]).unwrap();
+        let result = matrix_exp_pade(&a, 13);
+        let c = theta.cos();
+        let s = theta.sin();
+        assert!(
+            (result[[0, 0]] - c).abs() < 1e-5,
+            "rotation[0,0]={}, expected {c}",
+            result[[0, 0]]
+        );
+        assert!(
+            (result[[0, 1]] - (-s)).abs() < 1e-5,
+            "rotation[0,1]={}, expected {}",
+            result[[0, 1]],
+            -s
+        );
+        assert!(
+            (result[[1, 0]] - s).abs() < 1e-5,
+            "rotation[1,0]={}, expected {s}",
+            result[[1, 0]]
+        );
+        assert!(
+            (result[[1, 1]] - c).abs() < 1e-5,
+            "rotation[1,1]={}, expected {c}",
+            result[[1, 1]]
+        );
+    }
+
+    #[test]
+    fn test_matrix_exp_agrees_with_taylor() {
+        // For small-norm A, Padé should agree closely with Taylor series
+        let a = Array2::from_shape_vec((2, 2), vec![0.005f32, -0.003, 0.002, -0.007]).unwrap();
+        let pade_result = matrix_exp_pade(&a, 13);
+        let taylor_result = taylor_exp(&a, 16);
+        for i in 0..2 {
+            for j in 0..2 {
+                let diff = (pade_result[[i, j]] - taylor_result[[i, j]]).abs();
+                assert!(
+                    diff < 1e-4,
+                    "Padé vs Taylor [{i},{j}]: diff={diff}, pade={}, taylor={}",
+                    pade_result[[i, j]],
+                    taylor_result[[i, j]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_matrix_exp_scaling_squaring() {
+        // exp(5*I) = e^5 * I  (tests the scaling-and-squaring path)
+        let n = 2usize;
+        let a: Array2<f32> = Array2::<f32>::eye(n).mapv(|x| x * 5.0f32);
+        let result = matrix_exp_pade(&a, 13);
+        let e5 = 5.0f32.exp(); // e^5 ≈ 148.41
+        for i in 0..n {
+            for j in 0..n {
+                let expected = if i == j { e5 } else { 0.0f32 };
+                assert!(
+                    (result[[i, j]] - expected).abs() < e5 * 1e-4,
+                    "exp(5I)[{i},{j}] = {}, expected {expected}",
+                    result[[i, j]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_solve_linear_2x2() {
+        // Solve [[2,1],[5,7]] X = [[11,4],[13,1]], known solution X = [[3,1],[5,2]]
+        // Check: [[2,1],[5,7]] . [[3,1],[5,2]] = [[11,4],[50,19]] -- let's verify exact solution
+        // Actually: [2*3+1*5, 2*1+1*2] = [11, 4] ✓
+        //           [5*3+7*5, 5*1+7*2] = [50, 19] -- that doesn't match b[1] = [13, 1]
+        // Use a well-conditioned example with known solution:
+        // A = [[2,1],[1,3]], b = [[5,7],[10,14]] => x = [[1,1],[3,5]]
+        // Check: [2*1+1*3, 2*1+1*5] = [5, 7] ✓; [1*1+3*3, 1*1+3*5] = [10, 16] -- nope
+        // Use the original given example: [[2,1],[5,7]] X = [[11],[13]]
+        let a = Array2::from_shape_vec((2, 2), vec![2.0f32, 1.0, 5.0, 7.0]).unwrap();
+        // Solution to A x = [11,13]^T:  det(A) = 14-5 = 9
+        //   x1 = (11*7 - 1*13)/9 = (77-13)/9 = 64/9
+        //   x2 = (2*13 - 5*11)/9 = (26-55)/9 = -29/9
+        let b_vec = Array2::from_shape_vec((2, 1), vec![11.0f32, 13.0]).unwrap();
+        let x = solve_linear(&a, &b_vec);
+        let residual = a.dot(&x);
+        assert!(
+            (residual[[0, 0]] - 11.0).abs() < 1e-4,
+            "residual[0] = {}",
+            residual[[0, 0]]
+        );
+        assert!(
+            (residual[[1, 0]] - 13.0).abs() < 1e-4,
+            "residual[1] = {}",
+            residual[[1, 0]]
+        );
+    }
+
+    #[test]
+    fn test_zoh_discretize_updated() {
+        // Scalar system A=[-1], B=[1], dt=0.1
+        // Exact ZOH: A_d = exp(-0.1), B_d = 1 - exp(-0.1)
+        let a = Array2::from_shape_vec((1, 1), vec![-1.0f32]).unwrap();
+        let b = Array2::from_shape_vec((1, 1), vec![1.0f32]).unwrap();
+        let dt = 0.1f32;
+
+        let (a_d, b_d) = zoh_discretize(&a, &b, dt);
+
+        let exp_neg01 = (-dt).exp();
+        assert!(
+            (a_d[[0, 0]] - exp_neg01).abs() < 1e-5,
+            "A_d = {}, expected exp(-0.1) = {exp_neg01}",
+            a_d[[0, 0]]
+        );
+        let b_d_exact = 1.0 - exp_neg01;
+        assert!(
+            (b_d[[0, 0]] - b_d_exact).abs() < 1e-5,
+            "B_d = {}, expected 1-exp(-0.1) = {b_d_exact}",
+            b_d[[0, 0]]
+        );
     }
 }

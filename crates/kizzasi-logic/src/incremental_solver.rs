@@ -120,12 +120,16 @@ impl IncrementalSolver {
 
         let id = self.get_next_id();
 
-        // Check if new constraint is violated
+        // Check if new constraint is violated, using the constraint's declared dimension
         let solution_slice: Vec<f32> = self.state.solution.iter().copied().collect();
+        let dim = constraint
+            .dimension()
+            .unwrap_or(0)
+            .min(solution_slice.len().saturating_sub(1));
         let violation = if solution_slice.is_empty() {
             0.0
         } else {
-            constraint.violation(solution_slice[0])
+            constraint.violation(solution_slice[dim])
         };
 
         // Add to active constraints
@@ -186,12 +190,16 @@ impl IncrementalSolver {
             .active_constraints
             .insert(id, new_constraint.clone());
 
-        // Recompute violation
+        // Recompute violation using the constraint's declared dimension
         let solution_slice: Vec<f32> = self.state.solution.iter().copied().collect();
+        let dim = new_constraint
+            .dimension()
+            .unwrap_or(0)
+            .min(solution_slice.len().saturating_sub(1));
         let new_violation = if solution_slice.is_empty() {
             0.0
         } else {
-            new_constraint.violation(solution_slice[0])
+            new_constraint.violation(solution_slice[dim])
         };
 
         self.state.violations.insert(id, new_violation);
@@ -215,27 +223,30 @@ impl IncrementalSolver {
 
             for (id, constraint) in &self.state.active_constraints {
                 let solution_slice: Vec<f32> = self.state.solution.iter().copied().collect();
+
+                // Determine which dimension this constraint governs
+                let dim = constraint
+                    .dimension()
+                    .unwrap_or(0)
+                    .min(solution_slice.len().saturating_sub(1));
+
                 let violation = if solution_slice.is_empty() {
                     0.0
                 } else {
-                    constraint.violation(solution_slice[0])
+                    constraint.violation(solution_slice[dim])
                 };
 
                 if violation > 1e-6 {
                     any_violation = true;
 
-                    // Numerical gradient
+                    // Numerical gradient: only dimension `dim` can have a nonzero component
+                    // for a constraint that governs a single dimension.
                     let eps = 1e-5;
-                    for i in 0..self.state.solution.len() {
+                    if !solution_slice.is_empty() {
                         let mut perturbed = solution_slice.clone();
-                        perturbed[i] += eps;
-                        let viol_plus = if perturbed.is_empty() {
-                            0.0
-                        } else {
-                            constraint.violation(perturbed[0])
-                        };
-
-                        gradient[i] += (viol_plus - violation) / eps;
+                        perturbed[dim] += eps;
+                        let viol_plus = constraint.violation(perturbed[dim]);
+                        gradient[dim] += (viol_plus - violation) / eps;
                     }
 
                     // Update violation tracking
@@ -263,10 +274,16 @@ impl IncrementalSolver {
 
         for (id, constraint) in &self.state.active_constraints {
             let solution_slice: Vec<f32> = self.state.solution.iter().copied().collect();
+
+            // Evaluate the violation at the dimension this constraint governs
+            let dim = constraint
+                .dimension()
+                .unwrap_or(0)
+                .min(solution_slice.len().saturating_sub(1));
             let violation = if solution_slice.is_empty() {
                 0.0
             } else {
-                constraint.violation(solution_slice[0])
+                constraint.violation(solution_slice[dim])
             };
 
             self.state.violations.insert(*id, violation);
@@ -559,5 +576,126 @@ mod tests {
 
         solver.clear_history();
         assert!(solver.history.is_empty());
+    }
+
+    /// Test that repair correctly moves the component at the tagged dimension toward feasibility,
+    /// while leaving other dimensions unchanged. This test would FAIL before the gradient fix
+    /// because the buggy code always read dimension 0 and perturbed dimension 0, so dimension 1
+    /// (the constrained one) would never move.
+    #[test]
+    fn test_repair_moves_tagged_dimension() {
+        // 2-D solution: dim 0 = 0.5 (fine), dim 1 = 3.0 (violates x <= 1.0 on dim 1)
+        let initial = Array1::from_vec(vec![0.5_f32, 3.0_f32]);
+        let mut solver = IncrementalSolver::new(initial);
+
+        let constraint = ConstraintBuilder::new()
+            .name("upper_dim1")
+            .less_than(1.0)
+            .dimension(1)
+            .build()
+            .expect("constraint build must succeed");
+
+        solver
+            .add_constraint(constraint)
+            .expect("add_constraint must succeed");
+
+        // After add_constraint triggers repair, dimension 1 must have moved toward <= 1.0.
+        // The gradient is nonzero only on dim 1, so the descent step reduces solution[1].
+        assert!(
+            solver.solution()[1] < 2.9,
+            "dimension 1 should have moved toward feasibility; got {}",
+            solver.solution()[1]
+        );
+
+        // Dimension 0 must be untouched: the constraint does not govern it, so the gradient
+        // component for dim 0 is zero and the descent step leaves it at 0.5.
+        let dim0 = solver.solution()[0];
+        assert!(
+            (dim0 - 0.5_f32).abs() < 1e-4,
+            "dimension 0 should remain ~0.5; got {}",
+            dim0
+        );
+    }
+
+    /// Regression test: 1-D solution with no dimension tag must still converge (dimension 0
+    /// is used as the default).
+    #[test]
+    fn test_repair_dimension_zero_regression() {
+        let initial = Array1::from_vec(vec![3.0_f32]);
+        let mut solver = IncrementalSolver::new(initial);
+
+        let constraint = ConstraintBuilder::new()
+            .name("upper_dim0")
+            .less_than(1.0)
+            .build()
+            .expect("constraint build must succeed");
+
+        solver
+            .add_constraint(constraint)
+            .expect("add_constraint must succeed");
+
+        // Repair should have reduced solution[0] below its original value of 3.0.
+        assert!(
+            solver.solution()[0] < 3.0,
+            "dimension 0 should have decreased from 3.0; got {}",
+            solver.solution()[0]
+        );
+    }
+
+    /// Test that recompute_violations correctly reads the declared dimension when computing
+    /// total_violation. Before the fix, it always read dimension 0, so a constraint on dim 1
+    /// would compute violation(solution[0]) = 0.0 even when solution[1] violates the bound.
+    #[test]
+    fn test_recompute_violations_correct_dimension() {
+        // 2-D solution: dim 0 = 0.0 (satisfies x <= 1.0), dim 1 = 3.0 (violates x <= 1.0)
+        let initial = Array1::from_vec(vec![0.0_f32, 3.0_f32]);
+        let mut solver = IncrementalSolver::new(initial);
+
+        // Add constraint tagged to dimension 1, but temporarily bypass repair by using a
+        // bound that is satisfied at the moment of addition — we verify recompute_violations
+        // separately by calling modify_constraint to introduce the violation.
+        // Strategy: add a satisfying constraint, then modify it to be violated.
+        let satisfied_constraint = ConstraintBuilder::new()
+            .name("upper_dim1_sat")
+            .less_than(10.0) // 3.0 < 10.0, so no violation initially
+            .dimension(1)
+            .build()
+            .expect("constraint build must succeed");
+
+        let id = solver
+            .add_constraint(satisfied_constraint)
+            .expect("add_constraint must succeed");
+
+        // Initial state: constraint satisfied, total_violation must be zero.
+        assert!(
+            solver.state().total_violation < 1e-6,
+            "initial total_violation should be 0; got {}",
+            solver.state().total_violation
+        );
+
+        // Now replace the constraint with one that is violated at dimension 1 (3.0 > 1.0).
+        // modify_constraint calls recompute_violations internally.
+        let violated_constraint = ConstraintBuilder::new()
+            .name("upper_dim1_viol")
+            .less_than(1.0) // 3.0 > 1.0 → violation = 2.0
+            .dimension(1)
+            .build()
+            .expect("constraint build must succeed");
+
+        solver
+            .modify_constraint(id, violated_constraint)
+            .expect("modify_constraint must succeed");
+
+        // After modify_constraint (which triggers repair and recompute_violations), the
+        // violation tracking for dimension 1 must reflect the actual violation on dim 1.
+        // Even if repair converges, the initial detection must have been > 0 for repair to run.
+        // We verify that total_violation was non-zero before repair by checking that repair ran
+        // (solution[1] changed). If recompute read dim 0 it would see 0.0, skip repair,
+        // and solution[1] would stay at 3.0.
+        assert!(
+            solver.solution()[1] < 2.9,
+            "recompute_violations must read dim 1; solution[1] should have moved, got {}",
+            solver.solution()[1]
+        );
     }
 }

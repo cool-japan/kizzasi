@@ -16,7 +16,6 @@ pub struct OnlineConstraintLearner {
     /// Current constraint estimate
     constraint: LinearConstraint,
     /// Learning rate for parameter updates
-    #[allow(dead_code)]
     learning_rate: f32,
     /// Historical data buffer
     data_buffer: VecDeque<(Array1<f32>, bool)>, // (sample, is_feasible)
@@ -73,6 +72,7 @@ impl OnlineConstraintLearner {
         let violation = self.constraint.violation(sample_slice);
 
         // Update using perceptron-like rule
+        // Positive update_scale → loosen (raise b); negative → tighten (lower b)
         let update_scale = if is_feasible {
             // Sample should be feasible but is violated: loosen constraint
             self.learning_rate * violation
@@ -81,9 +81,11 @@ impl OnlineConstraintLearner {
             -self.learning_rate
         };
 
-        // Create updated constraint (simplified - in practice would update coefficients)
-        // This is a placeholder for demonstration
-        let _ = update_scale; // TODO: implement actual coefficient updates
+        self.constraint.shift_rhs(update_scale);
+        self.constraint.update_coefficients_towards(
+            sample_slice,
+            update_scale.signum() * self.learning_rate * 0.1,
+        );
 
         Ok(())
     }
@@ -301,22 +303,58 @@ impl ActiveConstraintBoundaryLearner {
         }
     }
 
-    /// Refine constraint based on labeled boundary samples
+    /// Refine the linear constraint boundary using a multi-pass margin-based
+    /// perceptron update over all labeled boundary samples.
+    ///
+    /// For each training epoch the learning rate is annealed as
+    /// `lr = base_lr / (1 + epoch)`.  On every mis-classified sample:
+    ///
+    /// - **Feasible but predicted violated** → loosen the boundary by shifting
+    ///   the RHS upward and nudging the coefficient vector away from the sample.
+    /// - **Infeasible but predicted satisfied** → tighten the boundary by
+    ///   shifting the RHS downward and nudging the coefficient vector towards
+    ///   the sample.
+    ///
+    /// At least two labeled samples are required; fewer data points return
+    /// immediately without modifying the constraint.
     pub fn refine(&mut self) -> LogicResult<()> {
-        // Use labeled boundary samples to refine constraint
-        // This is a simplified version - in practice would use SVM or similar
         let labeled: Vec<_> = self
             .boundary_samples
             .iter()
-            .filter_map(|(s, l)| l.map(|label| (s, label)))
+            .filter_map(|(s, l)| l.map(|label| (s.clone(), label)))
             .collect();
 
         if labeled.len() < 2 {
-            return Ok(()); // Not enough data
+            return Ok(());
         }
 
-        // Placeholder for actual refinement logic
-        // Would typically use margin-based learning or similar
+        let max_epochs = 5_usize;
+        let base_lr = 0.1_f32;
+
+        for epoch in 0..max_epochs {
+            let lr = base_lr / (1.0 + epoch as f32);
+            for (sample, is_feasible) in &labeled {
+                let sample_slice = sample.as_slice().unwrap_or(&[]);
+                let predicted_feasible = self.constraint.check(sample_slice);
+                if predicted_feasible == *is_feasible {
+                    continue; // Correctly classified — no update needed
+                }
+                // Mis-classified: nudge the boundary
+                let violation = self.constraint.violation(sample_slice);
+                let margin = violation.max(lr); // At least lr to guarantee movement
+                if *is_feasible {
+                    // Sample should be feasible but constraint says violated → loosen boundary
+                    self.constraint.shift_rhs(margin * lr);
+                    self.constraint
+                        .update_coefficients_towards(sample_slice, -lr * 0.1);
+                } else {
+                    // Sample should be infeasible but constraint says satisfied → tighten boundary
+                    self.constraint.shift_rhs(-margin * lr);
+                    self.constraint
+                        .update_coefficients_towards(sample_slice, lr * 0.1);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -347,7 +385,6 @@ pub struct FeedbackConstraintTuner {
     /// Feedback history (violation amount, user satisfaction)
     feedback_history: Vec<(f32, f32)>, // (violation, satisfaction in [0, 1])
     /// Adaptation rate
-    #[allow(dead_code)]
     adaptation_rate: f32,
     /// Target satisfaction level
     target_satisfaction: f32,
@@ -390,13 +427,13 @@ impl FeedbackConstraintTuner {
             / self.feedback_history.len() as f32;
 
         // If satisfaction is below target, adjust constraint
+        // Positive gap: satisfaction below target → loosen constraint (raise b)
+        // Negative gap: satisfaction above target → tighten constraint (lower b)
         let satisfaction_gap = self.target_satisfaction - avg_satisfaction;
 
         if satisfaction_gap.abs() > 0.1 {
-            // Significant gap - adjust constraint tightness
-            // Positive gap means we need to be less strict
-            // This is a placeholder for actual tuning logic
-            let _ = satisfaction_gap; // TODO: implement actual tuning
+            self.constraint
+                .shift_rhs(satisfaction_gap * self.adaptation_rate);
         }
 
         Ok(())
@@ -619,6 +656,111 @@ mod tests {
 
         assert!(system.confidence() > 0.0);
 
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Track 1 tests: OnlineConstraintLearner::refine_constraint
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_online_learner_refine_loosens_constraint() -> LogicResult<()> {
+        // Constraint: x[0] ≤ 3.0.
+        // Feed a sample at x=4.0 labeled feasible.  The constraint predicts
+        // violated (4.0 > 3.0), but the label says feasible → mismatch →
+        // update_scale is positive → shift_rhs raises b above 3.0.
+        let constraint = LinearConstraint::less_eq(vec![1.0], 3.0);
+        let mut learner = OnlineConstraintLearner::new(constraint, 0.1, 10);
+        let rhs_before = learner.get_constraint().rhs();
+        learner.observe(Array1::from(vec![4.0_f32]), true)?;
+        assert!(
+            learner.get_constraint().rhs() > rhs_before,
+            "feasible-but-violated sample should loosen constraint: {} → {}",
+            rhs_before,
+            learner.get_constraint().rhs()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_online_learner_refine_tightens_constraint() -> LogicResult<()> {
+        // Constraint: x[0] ≤ 3.0.
+        // Feed a sample at x=1.0 labeled infeasible.  The constraint predicts
+        // satisfied (1.0 ≤ 3.0), but the label says infeasible → mismatch →
+        // update_scale is negative → shift_rhs lowers b below 3.0.
+        let constraint = LinearConstraint::less_eq(vec![1.0], 3.0);
+        let mut learner = OnlineConstraintLearner::new(constraint, 0.1, 10);
+        let rhs_before = learner.get_constraint().rhs();
+        learner.observe(Array1::from(vec![1.0_f32]), false)?;
+        assert!(
+            learner.get_constraint().rhs() < rhs_before,
+            "infeasible-but-satisfied sample should tighten constraint: {} → {}",
+            rhs_before,
+            learner.get_constraint().rhs()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_online_learner_refine_no_update_when_correct() -> LogicResult<()> {
+        // Constraint: x[0] ≤ 3.0.
+        // Feed a sample at x=1.0 labeled feasible.  The constraint predicts
+        // satisfied (1.0 ≤ 3.0) and label agrees → no update → rhs stays 3.0.
+        let constraint = LinearConstraint::less_eq(vec![1.0], 3.0);
+        let mut learner = OnlineConstraintLearner::new(constraint, 0.1, 10);
+        let rhs_before = learner.get_constraint().rhs();
+        learner.observe(Array1::from(vec![1.0_f32]), true)?;
+        assert_eq!(learner.update_count(), 1);
+        assert!(
+            (learner.get_constraint().rhs() - rhs_before).abs() < f32::EPSILON,
+            "correctly-classified sample must not change rhs: {} → {}",
+            rhs_before,
+            learner.get_constraint().rhs()
+        );
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Track 1 tests: FeedbackConstraintTuner::tune
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_feedback_tuner_loosens_when_satisfaction_below_target() -> LogicResult<()> {
+        // target=0.9, adaptation_rate=0.5, initial rhs=5.0.
+        // Feed 5 feedbacks with satisfaction=0.0 → avg=0.0 → gap=0.9 > 0.1 →
+        // shift_rhs(0.9 * 0.5 = 0.45) → rhs becomes 5.45.
+        let constraint = LinearConstraint::less_eq(vec![1.0], 5.0);
+        let mut tuner = FeedbackConstraintTuner::new(constraint, 0.5, 0.9);
+        let rhs_before = tuner.get_constraint().rhs();
+        for _ in 0..5 {
+            tuner.add_feedback(&Array1::from(vec![2.0_f32]), 0.0)?;
+        }
+        assert!(
+            tuner.get_constraint().rhs() > rhs_before,
+            "satisfaction below target should loosen constraint: {} → {}",
+            rhs_before,
+            tuner.get_constraint().rhs()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_feedback_tuner_no_change_below_threshold() -> LogicResult<()> {
+        // target=0.9, adaptation_rate=0.5, initial rhs=5.0.
+        // Feed 5 feedbacks with satisfaction=0.85 → avg=0.85 → gap=0.05 < 0.1 →
+        // no shift → rhs stays exactly 5.0.
+        let constraint = LinearConstraint::less_eq(vec![1.0], 5.0);
+        let mut tuner = FeedbackConstraintTuner::new(constraint, 0.5, 0.9);
+        let rhs_before = tuner.get_constraint().rhs();
+        for _ in 0..5 {
+            tuner.add_feedback(&Array1::from(vec![2.0_f32]), 0.85)?;
+        }
+        assert!(
+            (tuner.get_constraint().rhs() - rhs_before).abs() < f32::EPSILON,
+            "gap below threshold must not change rhs: {} → {}",
+            rhs_before,
+            tuner.get_constraint().rhs()
+        );
         Ok(())
     }
 }

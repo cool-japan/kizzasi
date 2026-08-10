@@ -67,4 +67,8 @@ pub enum InferenceError {
 
     #[error("Lock error: {0}")]
     LockError(String),
+
+    /// Operation timed out waiting for a response.
+    #[error("Timeout: {0}")]
+    Timeout(String),
 }

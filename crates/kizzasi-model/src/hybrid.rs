@@ -36,7 +36,7 @@
 use crate::error::{ModelError, ModelResult};
 use crate::{AutoregressiveModel, ModelType};
 use kizzasi_core::{silu, softmax, CoreResult, HiddenState, SignalPredictor};
-use scirs2_core::ndarray::{Array1, Array2};
+use scirs2_core::ndarray::{s, Array1, Array2};
 use scirs2_core::random::{rng, RngExt};
 use std::collections::VecDeque;
 
@@ -235,8 +235,7 @@ impl MambaBlock {
     }
 }
 
-/// Simplified attention layer for hybrid model
-#[allow(dead_code)]
+/// Multi-head attention layer for hybrid model
 struct AttentionBlock {
     hidden_dim: usize,
     num_heads: usize,
@@ -287,45 +286,68 @@ impl AttentionBlock {
     }
 
     fn forward(&mut self, x: &Array1<f32>) -> Array1<f32> {
-        // Compute Q, K, V
-        let q = x.dot(&self.q_proj);
-        let k = x.dot(&self.k_proj);
-        let v = x.dot(&self.v_proj);
+        // Project input to Q, K, V: each is [hidden_dim]
+        let q_full = x.dot(&self.q_proj);
+        let k_full = x.dot(&self.k_proj);
+        let v_full = x.dot(&self.v_proj);
 
-        // Add to cache
-        self.k_cache.push_back(k.clone());
-        self.v_cache.push_back(v.clone());
+        // Add new K, V to cache (store full vectors; slice into heads at attention time)
+        self.k_cache.push_back(k_full);
+        self.v_cache.push_back(v_full);
 
-        // Trim cache
+        // Trim cache to max_cache_len
         while self.k_cache.len() > self.max_cache_len {
             self.k_cache.pop_front();
             self.v_cache.pop_front();
         }
 
-        // Compute attention (simplified single-head version)
         let cache_len = self.k_cache.len();
-        let mut attention_out = Array1::zeros(self.hidden_dim);
+        let scale = (self.head_dim as f32).sqrt();
 
-        if cache_len > 0 {
-            // Compute attention scores
-            let mut scores = Vec::with_capacity(cache_len);
-            for k_cached in &self.k_cache {
-                let score = q.dot(k_cached) / (self.head_dim as f32).sqrt();
-                scores.push(score);
+        // Concatenated multi-head output accumulator [hidden_dim]
+        let mut attn_concat = Array1::zeros(self.hidden_dim);
+
+        // Process each head independently
+        for h in 0..self.num_heads {
+            let h_start = h * self.head_dim;
+            let h_end = h_start + self.head_dim;
+
+            // Q slice for this head
+            let q_h = q_full.slice(s![h_start..h_end]).to_owned();
+
+            if cache_len == 0 {
+                // No context yet: head output remains zero
+                continue;
             }
 
-            // Softmax
-            let scores_array = Array1::from_vec(scores);
-            let attn_weights = softmax(&scores_array);
+            // Compute scaled dot-product attention scores for this head over the K cache
+            let scores: Vec<f32> = self
+                .k_cache
+                .iter()
+                .map(|k_cached| {
+                    let k_h = k_cached.slice(s![h_start..h_end]);
+                    q_h.dot(&k_h) / scale
+                })
+                .collect();
 
-            // Weighted sum of values
+            let scores_arr = Array1::from_vec(scores);
+            let attn_weights = softmax(&scores_arr);
+
+            // Weighted sum of V slices for this head
+            let mut head_out = Array1::zeros(self.head_dim);
             for (weight, v_cached) in attn_weights.iter().zip(self.v_cache.iter()) {
-                attention_out = attention_out + v_cached * *weight;
+                let v_h = v_cached.slice(s![h_start..h_end]);
+                head_out = head_out + &v_h.to_owned() * *weight;
+            }
+
+            // Place head output into the correct slice of attn_concat
+            for (j, &val) in head_out.iter().enumerate() {
+                attn_concat[h_start + j] = val;
             }
         }
 
         // Output projection
-        attention_out.dot(&self.o_proj)
+        attn_concat.dot(&self.o_proj)
     }
 
     fn reset(&mut self) {
@@ -566,5 +588,72 @@ mod tests {
         let mut config = HybridConfig::alternating(32, 64, 4, 4);
         config.layer_pattern.push(LayerType::Mamba); // Mismatch with num_layers
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_attention_block_output_finite() {
+        // hidden_dim=8, num_heads=2, head_dim=4, max_seq_len=16
+        let mut block = AttentionBlock::new(8, 2, 16);
+        let input = Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        let output = block.forward(&input);
+        assert_eq!(output.len(), 8, "output length must equal hidden_dim");
+        assert!(
+            output.iter().all(|v| v.is_finite()),
+            "all output values must be finite"
+        );
+    }
+
+    #[test]
+    fn test_attention_block_multi_step() {
+        // KV cache grows over 3 steps; attention over increasing context must stay finite
+        let mut block = AttentionBlock::new(8, 2, 16);
+        for step in 0..3 {
+            let val = (step + 1) as f32 * 0.1;
+            let input = Array1::from_vec(vec![val; 8]);
+            let output = block.forward(&input);
+            assert_eq!(
+                output.len(),
+                8,
+                "step {step}: output length must equal hidden_dim"
+            );
+            assert!(
+                output.iter().all(|v| v.is_finite()),
+                "step {step}: output must be fully finite"
+            );
+        }
+    }
+
+    #[test]
+    fn test_attention_block_uses_all_heads() {
+        // num_heads=4, head_dim=4, hidden_dim=16
+        // After a forward pass the output must be non-zero and correctly shaped.
+        // A stub that collapses to a single scalar score would produce different
+        // (and likely degenerate) values compared to per-head computation.
+        let mut block = AttentionBlock::new(16, 4, 32);
+        let input = Array1::from_shape_fn(16, |i| (i as f32 + 1.0) * 0.05);
+        let output = block.forward(&input);
+        assert_eq!(output.len(), 16, "output length must equal hidden_dim");
+        assert!(
+            output.iter().all(|v| v.is_finite()),
+            "all values must be finite"
+        );
+        // At least some output values must be non-zero (projection of non-zero attn out)
+        let any_nonzero = output.iter().any(|&v| v.abs() > 1e-9);
+        assert!(any_nonzero, "output must not be identically zero");
+    }
+
+    #[test]
+    fn test_hybrid_model_step() {
+        // Build a minimal HybridModel and verify step() produces finite output of the
+        // correct dimension (input_dim).
+        let config = HybridConfig::alternating(16, 32, 4, 4);
+        let mut model = HybridModel::new(config).expect("HybridModel::new must succeed");
+        let input = Array1::from_shape_fn(16, |i| (i as f32) * 0.1 - 0.75);
+        let output = model.step(&input).expect("step must succeed");
+        assert_eq!(output.len(), 16, "output length must equal input_dim");
+        assert!(
+            output.iter().all(|v| v.is_finite()),
+            "all output values must be finite"
+        );
     }
 }

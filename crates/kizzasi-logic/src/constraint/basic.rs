@@ -225,6 +225,11 @@ impl Constraint {
     pub fn weight(&self) -> f32 {
         self.weight
     }
+
+    /// Get the bound type defining this constraint's feasibility region.
+    pub fn bound(&self) -> &BoundType {
+        &self.bound
+    }
 }
 
 /// Rate-of-change constraint type

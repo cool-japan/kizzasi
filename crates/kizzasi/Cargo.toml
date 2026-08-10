@@ -58,10 +58,12 @@ toml = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 
 [dev-dependencies]
-kizzasi-model.workspace = true
-kizzasi-tokenizer.workspace = true
+kizzasi-model = { path = "../kizzasi-model" }
+kizzasi-tokenizer = { path = "../kizzasi-tokenizer" }
+kizzasi-inference = { path = "../kizzasi-inference", features = ["streaming"] }
 proptest.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
+futures.workspace = true
 criterion.workspace = true
 
 [[bench]]

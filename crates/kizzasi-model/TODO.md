@@ -237,7 +237,13 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 ## Research & Experimentation
 
 ### Novel Architectures
-- [ ] TensorLogic integration
+- [x] TensorLogic integration (completed 2026-04-27)
+  - **Goal:** Thin bridge module `crates/kizzasi-model/src/tensorlogic_bridge.rs` providing `constraint_from_tl_expr(name, expr, num_dims) -> LogicResult<CompiledConstraint>` and `compile_constraints(&[(name, TLExpr)]) -> Vec<CompiledConstraint>`.
+  - **Design:** New `tensorlogic_bridge.rs` (~120 LoC) using `kizzasi_logic::TlExprCompiler` and `kizzasi_logic::CompiledConstraint`. No new dependencies (kizzasi-model already depends on kizzasi-logic). Rustdoc doc-test. `pub use` from `lib.rs`. No changes to training, inference, or registry code.
+  - **Files:** new `crates/kizzasi-model/src/tensorlogic_bridge.rs`; edit `crates/kizzasi-model/src/lib.rs`; this TODO.md line 240.
+  - **Prerequisites:** kizzasi-logic Items 1–4 verified green.
+  - **Tests:** `test_constraint_from_tl_expr_box`, `test_compile_constraints_multi`, inline doc-test.
+  - **Risk:** tight coupling to `TlExprCompiler` API; if kizzasi-logic Item 4 deviates, this bridge needs a follow-up edit.
 - [x] Continuous-time models
 - [x] Multi-scale temporal modeling
 - [x] Cross-modal fusion

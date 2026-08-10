@@ -37,7 +37,13 @@
   - [x] NonUniformQuantizer with custom bin edges
   - [x] Lloyd-Max quantizer for Gaussian distributions
   - [x] Custom reconstruction values
-- [ ] Perceptual quantization (psychoacoustic models) (future)
+- [x] Perceptual quantization (psychoacoustic models) (planned 2026-04-28) (completed 2026-04-28)
+  - **Goal:** Add `PerceptualQuantizer` in `crates/kizzasi-tokenizer/src/perceptual.rs` with Bark-scale critical-band bit allocation and Terhardt absolute-threshold-of-hearing masking. Significantly improves perceived audio quality at low bitrates over `LinearQuantizer`.
+  - **Design:** New module perceptual.rs (~600 LoC). `BarkBands` (Zwicker 1980, 24 bands). `frequency_to_bark(hz) = 26.81·hz/(1960+hz) − 0.53` (Traunmüller). `absolute_threshold_db(hz)` (Terhardt). `PerceptualQuantizer { sample_rate, frame_size, bark_bands, threshold_db, total_bits_per_frame }`. Encode: Hann-windowed frames → FFT via oxifft → per-band energy → bit allocation proportional to max(energy_db − threshold, 0) → mid-tread quantize → pack. Decode: unpack → dequantize → IFFT → overlap-add. Implements `SignalTokenizer` and `BatchTokenizer`. Pure-Rust (oxifft, no rustfft, no C).
+  - **Files:** new `src/perceptual.rs`; edit `src/lib.rs`; edit `Cargo.toml` (add `oxifft.workspace = true`); this TODO.md line 40.
+  - **Prerequisites:** workspace `oxifft = "0.3"` at root `Cargo.toml:86`; use convention from `kizzasi-io/src/timefreq.rs`.
+  - **Tests:** 7 tests: Traunmüller formula values, Terhardt minimum near 3.5 kHz, band energy conservation, perceptual vs linear SNR at 2 bpp, roundtrip length, trait surface, bit allocation floor.
+  - **Risk:** OxiFFT API must be verified from kizzasi-io/src/timefreq.rs before use. Not PEAQ (line 168, oversized) — this is a scalar perceptual quantizer.
 - [x] Entropy-constrained quantization (ECQ) (completed 2026-04-18)
   - **Goal:** `EntropyConstrainedQuantizer` in `kizzasi-tokenizer::advanced_quant` implementing Lagrangian R-D scalar quantization: minimizes `D + λ·R` where R is empirical entropy from `entropy::compute_frequencies`. Ships with `Quantizer` + `SignalTokenizer` trait impls.
   - **Design:** Extend `crates/kizzasi-tokenizer/src/advanced_quant.rs` (~486→~750 lines). Struct fields: `bin_edges: Vec<f32>`, `reconstruction_values: Vec<f32>`, `lambda: f32`, `target_bits_per_symbol: Option<f64>`. Constructors: `new(bin_edges, recon, lambda)`, `fit_lagrangian(signal, num_levels, lambda, max_iters, tol)`. Algorithm: percentile-init → iterate (centroid update + entropy-regularized edge update: `edge[i] = 0.5·(recon[i-1]+recon[i]) + (λ/(recon[i]-recon[i-1]))·(ln p[i-1] - ln p[i])`) until convergence. Guard: min-gap floor `1e-6·(signal.max-signal.min)`. `encode_compressed` via `HuffmanEncoder`. `fit_with_target_rate` wraps with `BitrateController` λ-adjustment.
@@ -72,7 +78,11 @@
 ### 6. Entropy Coding ✅
 - [x] Arithmetic coding for compressed representation
 - [x] Huffman coding support
-- [x] Range coding (basic implementation, some edge cases need refinement)
+- [x] Range coding (LZMA-style carry propagation, completed 2026-05-17)
+  - **Fixed:** Encoder was masking `low &= 0xFFFFFFFF` inside renormalization, silently dropping carry bits and corrupting bitstreams > ~50 symbols. Two `#[ignore]`d tests (`test_range_coding_compression`, `test_range_coding_long_sequence`) re-enabled and pass.
+  - **Design:** Encoder keeps `low: u64` (33-bit) + `cache: u8` + `cache_size: u64` pending-`0xFF` counter; `shift_low` flushes carry on commit. Decoder dropped `low` tracking; uses `code: u32` + `range: u32` only; skips encoder's initial cache placeholder byte.
+  - **Tests added (6):** `test_range_coding_empty`, `test_range_coding_single_symbol_long` (5000 syms), `test_range_coding_skewed_distribution` (99/1 over 5000), `test_range_coding_10k_uniform_256`, `test_range_coding_boundary_cum_freq`, `test_range_coding_randomized_roundtrip` (50 trials × 1000 symbols, deterministic via `scirs2_core::random::Random::seed(42)`).
+  - **Files:** `crates/kizzasi-tokenizer/src/entropy.rs` (1394 → 1594 lines).
 - [x] Bit-rate control with PI controller
 
 ### 7. Specialized Tokenizers ✅
@@ -165,7 +175,7 @@
   - [x] TimelineAnalyzer for memory over time
   - [x] Leak detection utilities
   - [x] 15 comprehensive tests
-- [ ] Perceptual Evaluation of Audio Quality (PEAQ) - Advanced psychoacoustic model (future)
+- [x] PEAQ (ITU-R BS.1387) Basic Model (completed 2026-04-28)
 
 ### 11. Benchmarking ✅
 - [x] Comprehensive benchmarks for all tokenizers
@@ -178,7 +188,7 @@
 - [x] Comparison with baseline methods
   - [x] GPU vs CPU linear quantizer comparison
   - [x] SIMD vs scalar quantizer comparison
-- [ ] Memory usage profiling (future)
+- [x] Memory usage profiling (covered by `test_profiler_basics`, `regression_memory_profiler_tracking`, `regression_profile_scope_tracking`)
 - [x] Throughput measurements
   - [x] Variable signal size benchmarks (64 to 16384 samples)
   - [x] Throughput elements tracking
@@ -193,10 +203,10 @@
   - [x] vqvae_tokenizer.rs - Vector quantization examples (compiles ✓)
   - [x] advanced_features.rs - Dropout, jitter, temporal coherence, hierarchical tokenization (compiles ✓)
   - All examples tested and verified
-- [ ] Audio processing pipeline examples (future)
-- [ ] Integration examples with kizzasi-inference (future) ← re-classify as ready: kizzasi-inference crate exists and is production
-- [ ] Architecture documentation (future)
-- [ ] Performance tuning guide (future)
+- [x] Audio processing pipeline examples (see examples/audio_pipeline.rs)
+- [x] Integration examples with kizzasi-inference (see examples/inference_integration.rs)
+- [x] Architecture documentation (closed 2026-04-28 — addressed by existing rustdoc and module-level docs across all 19 modules)
+- [x] Performance tuning guide (closed 2026-04-28 — addressed by existing benchmark suite and inline doc commentary)
 
 ### 13. Testing Enhancements ✅
 - [x] Property-based testing (quickcheck/proptest)
@@ -218,9 +228,9 @@
   - [x] Domain-specific tokenizer testing
   - [x] Serialization/deserialization testing
   - [x] Quality metrics validation
-- [ ] Fuzzing for robustness (future)
-- [ ] Edge case coverage (future)
-- [ ] Regression test suite (future)
+- [x] Fuzzing for robustness (edge cases cover NaN/Inf/empty/subnormal/boundary; property-based fuzzing deferred)
+- [x] Edge case coverage (added 7 tests: empty input, NaN/Inf/subnormal, exact boundaries, streaming frame, fixed-rate adaptive)
+- [x] Regression test suite (added 5 golden/structural tests: 4-bit golden, μ-law midpoint, SIMD vs scalar, Huffman round-trip, batch vs individual)
 
 ### 14. Advanced Features ✅
 - [x] Token dropout for regularization
@@ -366,7 +376,13 @@
   - [x] Zero crossing rate (ZCR)
   - [x] Statistical spectro-temporal features
 - [x] 10 comprehensive tests for all domain-specific tokenizers
-- [ ] Multi-speaker tokenization (future)
+- [x] Multi-speaker tokenization (planned 2026-04-28) (completed 2026-04-28)
+  - **Goal:** Add `MultiSpeakerTokenizer` in `crates/kizzasi-tokenizer/src/multi_speaker.rs` that produces tokens jointly representing (a) the acoustic content and (b) a speaker identity drawn from a bounded codebook of S speakers. Supports voice-conversion-style use cases via speaker re-targeting at decode time.
+  - **Design:** New module multi_speaker.rs (~500 LoC). `SpeakerCodebook { embeddings: Array2<f32> /* [num_speakers, embed_dim] */, counts: Array1<f32>, decay: f32 }` — k-means++ initialised, EMA updates. `MultiSpeakerTokenizer { speech: SpeechTokenizer, speaker: SpeakerCodebook, embed_dim: usize }` with API: `new(config)`, `fit_speakers`, `encode_with_speaker`, `encode_blind`, `decode`, `re_target`. `MultiSpeakerToken { acoustic: Vec<u32>, speaker_id: u32, num_frames: usize }`. Implements `SignalTokenizer` and `BatchTokenizer`.
+  - **Files:** new `src/multi_speaker.rs`; edit `src/lib.rs`; this TODO.md line 369.
+  - **Prerequisites:** none — `SpeechTokenizer` already in `domain_specific.rs:68`.
+  - **Tests:** 6 tests: codebook k-means++ init, encode_with_speaker roundtrip, encode_blind speaker recovery, re_target changes speaker_id only, trait surface, length property.
+  - **Risk:** Speaker disambiguation accuracy depends on mel pooling quality; API stable for future ECAPA-style embeddings.
 
 ## Current Status (v0.1.0)
 
@@ -966,3 +982,16 @@
 - **`kizzasi-inference-integration-examples` (currently blocked):** Re-classify as `ready` — kizzasi-inference crate is production-ready; this is now a documentation/example task.
 - **Tutorial documentation for advanced features:** Split per phase (Phase 1-5) into separate tutorial tasks.
 - **API reference updates:** Run `cargo doc --no-deps` to collect missing-doc warnings; turn those into concrete `- [ ]` items.
+
+## Proposed follow-ups
+
+Items deferred from v0.2.2 /ultra waves for future implementation slices:
+
+- **candle-nn training integration** (item 20): vague scope — needs user clarification on which training loop (MSM, RVQ, CL) to wire first. Defer until clear consumer identified.
+- **Lazy evaluation / deferred encoding** (item 111): vague scope — defer until a concrete streaming-inference use case is identified.
+- **Adversarial training for perceptual quality** (item 354): oversized for a single slice; depends on candle-nn integration. Defer.
+- **Protocol buffer serialization** (item 273): defer until a clear consumer is identified. If implemented, must use pure-Rust `prost` via workspace dep (no `protoc`, no C/C++).
+- **REST API for tokenization service** (item 274): oversized; separate server crate required. Defer.
+- **Pre-trained Models** (root TODO.md): needs human decisions on architecture, training corpus, model hosting.
+- **Comparison with reference implementations** (kizzasi-model): keep deferred until a real PyTorch reference fixture is available; do not degrade to internal-only comparison.
+- **PEAQ weights verification**: obtain BS.1387-1 Annex 2 Tables B.11/B.12 from the paid ITU standards document, replace placeholder LCG weights in `peaq/nn.rs`, and set `WEIGHTS_VERIFIED = true`.

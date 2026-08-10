@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kizzasi"
-version = "0.2.0"
+version = "0.2.2"
 description = "Autoregressive General-Purpose Signal Predictor (AGSP) — Python bindings for Kizzasi"
 authors = [
     {name = "COOLJAPAN OU (Team Kitasan)", email = "contact@cooljapan.tech"}

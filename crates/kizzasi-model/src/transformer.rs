@@ -30,6 +30,7 @@
 use crate::error::{ModelError, ModelResult};
 use crate::{AutoregressiveModel, ModelType};
 use kizzasi_core::{gelu, softmax, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor};
+use safetensors::tensor::{Dtype, TensorView};
 use scirs2_core::ndarray::{Array1, Array2};
 use scirs2_core::random::{rng, RngExt};
 use std::collections::VecDeque;
@@ -710,10 +711,85 @@ impl Transformer {
         Ok(())
     }
 
-    /// Save weights to a SafeTensors model file (legacy stub — use `save_weights_json` instead).
-    #[allow(unused_variables)]
+    /// Save all model weights to a SafeTensors file at `path`.
+    ///
+    /// Each named tensor is serialised as a row-major `F32` tensor. The file
+    /// can be reloaded with any SafeTensors-compatible loader.
     pub fn save_weights(&self, path: &str) -> ModelResult<()> {
-        self.save_weights_json(path)
+        let hidden = self.config.hidden_dim;
+        let input_dim = self.config.input_dim;
+        let ff_dim = self.config.ff_dim;
+
+        // Collect (name, raw-bytes, shape) for every tensor.
+        let mut entries: Vec<(String, Vec<u8>, Vec<usize>)> = Vec::new();
+
+        let to_bytes =
+            |arr: &Array2<f32>| -> Vec<u8> { arr.iter().flat_map(|f| f.to_le_bytes()).collect() };
+
+        entries.push((
+            "input_proj".to_owned(),
+            to_bytes(&self.input_proj),
+            vec![input_dim, hidden],
+        ));
+        entries.push((
+            "output_proj".to_owned(),
+            to_bytes(&self.output_proj),
+            vec![hidden, input_dim],
+        ));
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let attn = &layer.attention;
+            let ff = &layer.feed_forward;
+
+            entries.push((
+                format!("layers.{i}.attention.q_proj"),
+                to_bytes(&attn.q_proj),
+                vec![hidden, hidden],
+            ));
+            entries.push((
+                format!("layers.{i}.attention.k_proj"),
+                to_bytes(&attn.k_proj),
+                vec![hidden, hidden],
+            ));
+            entries.push((
+                format!("layers.{i}.attention.v_proj"),
+                to_bytes(&attn.v_proj),
+                vec![hidden, hidden],
+            ));
+            entries.push((
+                format!("layers.{i}.attention.o_proj"),
+                to_bytes(&attn.o_proj),
+                vec![hidden, hidden],
+            ));
+            entries.push((
+                format!("layers.{i}.feed_forward.fc1"),
+                to_bytes(&ff.fc1),
+                vec![hidden, ff_dim],
+            ));
+            entries.push((
+                format!("layers.{i}.feed_forward.fc2"),
+                to_bytes(&ff.fc2),
+                vec![ff_dim, hidden],
+            ));
+        }
+
+        // Build TensorViews that borrow from `entries`.
+        let views: Vec<(String, TensorView<'_>)> = entries
+            .iter()
+            .map(|(name, bytes, shape)| {
+                TensorView::new(Dtype::F32, shape.clone(), bytes)
+                    .map(|view| (name.clone(), view))
+                    .map_err(|e| {
+                        ModelError::load_error(
+                            "save_weights",
+                            format!("failed to create TensorView for '{name}': {e}"),
+                        )
+                    })
+            })
+            .collect::<ModelResult<Vec<_>>>()?;
+
+        safetensors::tensor::serialize_to_file(views, None, std::path::Path::new(path))
+            .map_err(|e| ModelError::load_error("save_weights", e.to_string()))
     }
 }
 
@@ -766,23 +842,37 @@ impl AutoregressiveModel for Transformer {
     }
 
     fn get_states(&self) -> Vec<HiddenState> {
-        // Return KV cache state for each layer
+        // Pack both K and V caches into a single Array2 per layer.
+        // Layout: rows [0, cache_len) hold K entries;
+        //         rows [cache_len, 2*cache_len) hold V entries.
+        // An empty cache (cache_len == 0) is encoded as a 1-row sentinel with
+        // step_count == 0 (update() is NOT called), so set_states can distinguish
+        // "fresh model" from "one step of history".
         self.layers
             .iter()
             .map(|layer| {
                 let cache_len = layer.attention.key_cache.len();
-                let mut combined = Array2::zeros((cache_len.max(1), self.config.hidden_dim));
-
-                // Store key cache (value cache could be stored similarly)
-                for (i, k) in layer.attention.key_cache.iter().enumerate() {
-                    for j in 0..k.len().min(self.config.hidden_dim) {
-                        combined[[i, j]] = k[j];
+                if cache_len == 0 {
+                    // Sentinel: HiddenState with step_count == 0; one zero-row is the
+                    // minimum that HiddenState::new accepts without needing .max(1).
+                    HiddenState::new(1, self.config.hidden_dim)
+                } else {
+                    let total_rows = cache_len * 2;
+                    let mut combined = Array2::zeros((total_rows, self.config.hidden_dim));
+                    for (i, k) in layer.attention.key_cache.iter().enumerate() {
+                        for j in 0..k.len().min(self.config.hidden_dim) {
+                            combined[[i, j]] = k[j];
+                        }
                     }
+                    for (i, v) in layer.attention.value_cache.iter().enumerate() {
+                        for j in 0..v.len().min(self.config.hidden_dim) {
+                            combined[[cache_len + i, j]] = v[j];
+                        }
+                    }
+                    let mut hs = HiddenState::new(total_rows, self.config.hidden_dim);
+                    hs.update(combined);
+                    hs
                 }
-
-                let mut hs = HiddenState::new(combined.shape()[0], combined.shape()[1]);
-                hs.update(combined);
-                hs
             })
             .collect()
     }
@@ -797,16 +887,41 @@ impl AutoregressiveModel for Transformer {
         }
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let combined = states[layer_idx].state();
-
-            // Restore key cache (simplified - in practice would restore both K and V)
             layer.attention.key_cache.clear();
-            for i in 0..combined.shape()[0] {
+            layer.attention.value_cache.clear();
+
+            // step_count == 0 means the sentinel for an empty cache; nothing to restore.
+            if states[layer_idx].step_count() == 0 {
+                continue;
+            }
+
+            let combined = states[layer_idx].state();
+            let nrows = combined.nrows();
+
+            if !nrows.is_multiple_of(2) {
+                return Err(ModelError::load_error(
+                    "Transformer set_states",
+                    format!(
+                        "layer {layer_idx}: KV cache state has odd row count {nrows}; \
+                         expected an even number (K rows concatenated with V rows)"
+                    ),
+                ));
+            }
+
+            let cache_len = nrows / 2;
+            for i in 0..cache_len {
                 let mut k = Array1::zeros(self.config.hidden_dim);
-                for j in 0..self.config.hidden_dim.min(combined.shape()[1]) {
+                for j in 0..self.config.hidden_dim.min(combined.ncols()) {
                     k[j] = combined[[i, j]];
                 }
                 layer.attention.key_cache.push_back(k);
+            }
+            for i in 0..cache_len {
+                let mut v = Array1::zeros(self.config.hidden_dim);
+                for j in 0..self.config.hidden_dim.min(combined.ncols()) {
+                    v[j] = combined[[cache_len + i, j]];
+                }
+                layer.attention.value_cache.push_back(v);
             }
         }
 
@@ -917,5 +1032,26 @@ mod tests {
         assert_eq!(reloaded.len(), 14, "unexpected number of weight keys");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_save_weights_roundtrip_safetensors() {
+        let config = TransformerConfig {
+            input_dim: 4,
+            hidden_dim: 8,
+            num_layers: 1,
+            num_heads: 2,
+            ff_dim: 16,
+            ..Default::default()
+        };
+        let model = Transformer::new(config).expect("model creation failed");
+        let tmp = std::env::temp_dir().join("test_transformer_save_weights.safetensors");
+        model
+            .save_weights(tmp.to_str().expect("path to str"))
+            .expect("save_weights failed");
+        let data = std::fs::read(&tmp).expect("read file");
+        let tensors = safetensors::SafeTensors::deserialize(&data).expect("deserialize");
+        assert!(!tensors.names().is_empty(), "no tensors written");
+        std::fs::remove_file(&tmp).ok();
     }
 }

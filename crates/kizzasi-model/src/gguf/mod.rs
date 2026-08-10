@@ -10,153 +10,39 @@
 //! - Tensor count and metadata KV count (u64 for v2+, u32 for v1)
 //! - Metadata key-value pairs (typed)
 //! - Tensor info array (name, shape, quant type, offset into data section)
-//! - Data section (32-byte aligned after header)
+//! - Data section (aligned after header; alignment from `general.alignment` metadata, default 32)
 //!
 //! # Quantization Types
 //!
 //! Supports F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q6_K, Q2_K, Q3_K, Q4_K,
 //! Q5_K, and Q8_K dequantization. IQ* types return an unsupported error.
+//!
+//! # Submodules
+//!
+//! - `dequant` (crate-internal) — block-wise dequantization routines for each supported quant type.
 
+use crate::binary_io::{
+    align_offset, read_bool, read_f32_le, read_f64_le, read_i16_le, read_i32_le, read_i64_le,
+    read_i8, read_string_v1, read_string_v2, read_u16_le, read_u32_le, read_u64_le, read_u8,
+};
 use crate::error::{ModelError, ModelResult};
 use scirs2_core::ndarray::Array2;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Return type of [`parse_gguf_buffer`]: `(version, metadata, tensors, data_offset)`.
+/// Default GGUF data-section alignment in bytes (GGUF spec default when
+/// `general.alignment` is absent).
+const GGUF_DEFAULT_ALIGNMENT: usize = 32;
+
+pub(crate) mod dequant;
+
+/// Return type of [`parse_gguf_buffer`]: `(version, metadata, tensors, data_section_start)`.
 type GgufBufferParsed = (
     u32,
     HashMap<String, GgufMetaValue>,
     Vec<GgufTensorInfo>,
     u64,
 );
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Binary parsing primitives
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn read_u8(buf: &[u8], pos: &mut usize) -> ModelResult<u8> {
-    if *pos >= buf.len() {
-        return Err(ModelError::simple_load_error(format!(
-            "Buffer underflow reading u8 at position {}",
-            pos
-        )));
-    }
-    let v = buf[*pos];
-    *pos += 1;
-    Ok(v)
-}
-
-fn read_u16_le(buf: &[u8], pos: &mut usize) -> ModelResult<u16> {
-    let end = *pos + 2;
-    if end > buf.len() {
-        return Err(ModelError::simple_load_error(format!(
-            "Buffer underflow reading u16 at position {}",
-            pos
-        )));
-    }
-    let v = u16::from_le_bytes([buf[*pos], buf[*pos + 1]]);
-    *pos = end;
-    Ok(v)
-}
-
-fn read_u32_le(buf: &[u8], pos: &mut usize) -> ModelResult<u32> {
-    let end = *pos + 4;
-    if end > buf.len() {
-        return Err(ModelError::simple_load_error(format!(
-            "Buffer underflow reading u32 at position {}",
-            pos
-        )));
-    }
-    let v = u32::from_le_bytes([buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]]);
-    *pos = end;
-    Ok(v)
-}
-
-fn read_u64_le(buf: &[u8], pos: &mut usize) -> ModelResult<u64> {
-    let end = *pos + 8;
-    if end > buf.len() {
-        return Err(ModelError::simple_load_error(format!(
-            "Buffer underflow reading u64 at position {}",
-            pos
-        )));
-    }
-    let v = u64::from_le_bytes([
-        buf[*pos],
-        buf[*pos + 1],
-        buf[*pos + 2],
-        buf[*pos + 3],
-        buf[*pos + 4],
-        buf[*pos + 5],
-        buf[*pos + 6],
-        buf[*pos + 7],
-    ]);
-    *pos = end;
-    Ok(v)
-}
-
-fn read_i8(buf: &[u8], pos: &mut usize) -> ModelResult<i8> {
-    read_u8(buf, pos).map(|v| v as i8)
-}
-
-fn read_i16_le(buf: &[u8], pos: &mut usize) -> ModelResult<i16> {
-    read_u16_le(buf, pos).map(|v| v as i16)
-}
-
-fn read_i32_le(buf: &[u8], pos: &mut usize) -> ModelResult<i32> {
-    read_u32_le(buf, pos).map(|v| v as i32)
-}
-
-fn read_i64_le(buf: &[u8], pos: &mut usize) -> ModelResult<i64> {
-    read_u64_le(buf, pos).map(|v| v as i64)
-}
-
-fn read_f32_le(buf: &[u8], pos: &mut usize) -> ModelResult<f32> {
-    read_u32_le(buf, pos).map(f32::from_bits)
-}
-
-fn read_f64_le(buf: &[u8], pos: &mut usize) -> ModelResult<f64> {
-    read_u64_le(buf, pos).map(f64::from_bits)
-}
-
-fn read_bool(buf: &[u8], pos: &mut usize) -> ModelResult<bool> {
-    read_u8(buf, pos).map(|v| v != 0)
-}
-
-/// Read a GGUF string using v2+ encoding (u64 length prefix).
-fn read_string_v2(buf: &[u8], pos: &mut usize) -> ModelResult<String> {
-    let len = read_u64_le(buf, pos)? as usize;
-    let end = *pos + len;
-    if end > buf.len() {
-        return Err(ModelError::simple_load_error(format!(
-            "Buffer underflow reading string of length {} at position {}",
-            len, pos
-        )));
-    }
-    let s = std::str::from_utf8(&buf[*pos..end]).map_err(|e| {
-        ModelError::simple_load_error(format!("Invalid UTF-8 in GGUF string: {}", e))
-    })?;
-    let owned = s.to_owned();
-    *pos = end;
-    Ok(owned)
-}
-
-/// Read a GGUF string using v1 encoding (u32 length prefix).
-fn read_string_v1(buf: &[u8], pos: &mut usize) -> ModelResult<String> {
-    let len = read_u32_le(buf, pos)? as usize;
-    let end = *pos + len;
-    if end > buf.len() {
-        return Err(ModelError::simple_load_error(format!(
-            "Buffer underflow reading v1 string of length {} at position {}",
-            len, pos
-        )));
-    }
-    let s = std::str::from_utf8(&buf[*pos..end]).map_err(|e| {
-        ModelError::simple_load_error(format!("Invalid UTF-8 in GGUF v1 string: {}", e))
-    })?;
-    let owned = s.to_owned();
-    *pos = end;
-    Ok(owned)
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -221,6 +107,23 @@ pub enum GgufMetaValue {
     Int64(i64),
     Float64(f64),
     Array(Vec<GgufMetaValue>),
+}
+
+impl GgufMetaValue {
+    /// Interpret this value as an unsigned integer if it holds a non-negative integer.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            GgufMetaValue::Uint8(v) => Some(*v as u64),
+            GgufMetaValue::Uint16(v) => Some(*v as u64),
+            GgufMetaValue::Uint32(v) => Some(*v as u64),
+            GgufMetaValue::Uint64(v) => Some(*v),
+            GgufMetaValue::Int8(v) if *v >= 0 => Some(*v as u64),
+            GgufMetaValue::Int16(v) if *v >= 0 => Some(*v as u64),
+            GgufMetaValue::Int32(v) if *v >= 0 => Some(*v as u64),
+            GgufMetaValue::Int64(v) if *v >= 0 => Some(*v as u64),
+            _ => None,
+        }
+    }
 }
 
 /// Quantization type for a GGUF tensor.
@@ -347,8 +250,6 @@ pub struct GgufFile {
     pub metadata: HashMap<String, GgufMetaValue>,
     /// Ordered list of tensor descriptors.
     pub tensors: Vec<GgufTensorInfo>,
-    /// Byte offset in the file where the data section begins.
-    data_offset: u64,
     /// Path to the source file (used when reading tensor data).
     file_path: PathBuf,
 }
@@ -422,7 +323,7 @@ fn read_meta_value(
 }
 
 /// Parse the header and tensor info sections of the buffer.
-/// Returns `(version, metadata, tensors, data_offset)`.
+/// Returns `(version, metadata, tensors, data_section_start)`.
 fn parse_gguf_buffer(buf: &[u8], file_path: &Path) -> ModelResult<GgufBufferParsed> {
     // Magic
     if buf.len() < 4 {
@@ -470,15 +371,45 @@ fn parse_gguf_buffer(buf: &[u8], file_path: &Path) -> ModelResult<GgufBufferPars
         metadata.insert(key, value);
     }
 
-    // Tensor info
-    let mut tensors = Vec::with_capacity(tensor_count);
+    // Resolve data-section alignment from metadata (spec allows override via general.alignment).
+    let alignment = match metadata.get("general.alignment") {
+        Some(v) => {
+            let a = v.as_u64().ok_or_else(|| {
+                ModelError::simple_load_error(format!(
+                    "general.alignment has non-integer type in {:?}",
+                    file_path
+                ))
+            })?;
+            if a == 0 || !a.is_power_of_two() {
+                return Err(ModelError::simple_load_error(format!(
+                    "Invalid general.alignment {} in {:?} (must be a non-zero power of two)",
+                    a, file_path
+                )));
+            }
+            usize::try_from(a).map_err(|_| {
+                ModelError::simple_load_error(format!(
+                    "general.alignment {} in {:?} exceeds platform usize",
+                    a, file_path
+                ))
+            })?
+        }
+        None => GGUF_DEFAULT_ALIGNMENT,
+    };
+
+    // Tensor info — phase 1: collect raw descriptors (offset is data-section-relative).
+    struct RawTensorDesc {
+        name: String,
+        shape: Vec<u64>,
+        quant_type: GgufQuantType,
+        offset: u64,
+    }
+    let mut raw_tensors = Vec::with_capacity(tensor_count);
     for _ in 0..tensor_count {
         let name = if version >= 2 {
             read_string_v2(buf, &mut pos)?
         } else {
             read_string_v1(buf, &mut pos)?
         };
-
         let n_dims = read_u32_le(buf, &mut pos)? as usize;
         let mut shape = Vec::with_capacity(n_dims);
         for _ in 0..n_dims {
@@ -488,30 +419,34 @@ fn parse_gguf_buffer(buf: &[u8], file_path: &Path) -> ModelResult<GgufBufferPars
                 shape.push(read_u32_le(buf, &mut pos)? as u64);
             }
         }
-
         let quant_raw = read_u32_le(buf, &mut pos)?;
         let quant_type = GgufQuantType::from_u32(quant_raw)?;
         let offset = read_u64_le(buf, &mut pos)?;
-
-        // data_offset will be patched after we know the data section start
-        tensors.push(GgufTensorInfo {
+        raw_tensors.push(RawTensorDesc {
             name,
             shape,
             quant_type,
             offset,
-            data_offset: 0, // placeholder; patched below
         });
     }
 
-    // Data section begins at the next 32-byte aligned boundary after the header.
-    let aligned_offset = (pos as u64 + 31) & !31u64;
+    // Data section begins at the next `alignment`-aligned boundary after the tensor-info block.
+    align_offset(&mut pos, alignment);
+    let data_section_start = pos as u64;
 
-    // Patch data_offset for each tensor to be the absolute file offset.
-    for t in &mut tensors {
-        t.data_offset = aligned_offset + t.offset;
-    }
+    // Phase 2: build GgufTensorInfo with the absolute data_offset computed directly.
+    let tensors: Vec<GgufTensorInfo> = raw_tensors
+        .into_iter()
+        .map(|r| GgufTensorInfo {
+            name: r.name,
+            shape: r.shape,
+            quant_type: r.quant_type,
+            offset: r.offset,
+            data_offset: data_section_start + r.offset,
+        })
+        .collect();
 
-    Ok((version, metadata, tensors, aligned_offset))
+    Ok((version, metadata, tensors, data_section_start))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -527,12 +462,11 @@ impl GgufFile {
         let buf = std::fs::read(path).map_err(|e| {
             ModelError::simple_load_error(format!("Failed to read GGUF file {:?}: {}", path, e))
         })?;
-        let (version, metadata, tensors, data_offset) = parse_gguf_buffer(&buf, path)?;
+        let (version, metadata, tensors, _) = parse_gguf_buffer(&buf, path)?;
         Ok(Self {
             version,
             metadata,
             tensors,
-            data_offset,
             file_path: path.to_path_buf(),
         })
     }
@@ -557,7 +491,7 @@ impl GgufFile {
         let n_elements = info.n_elements() as usize;
 
         // Read the raw bytes for this tensor from the file.
-        let byte_offset = self.data_offset + info.offset;
+        let byte_offset = info.data_offset;
         let byte_len = tensor_byte_size(info)?;
 
         let file_buf = std::fs::read(&self.file_path).map_err(|e| {
@@ -605,7 +539,7 @@ impl GgufFile {
         let mut result = HashMap::with_capacity(self.tensors.len());
         for info in &self.tensors {
             let n_elements = info.n_elements() as usize;
-            let byte_offset = (self.data_offset + info.offset) as usize;
+            let byte_offset = info.data_offset as usize;
             let byte_len = tensor_byte_size(info)?;
             let end = byte_offset + byte_len;
 
@@ -858,351 +792,6 @@ fn tensor_byte_size(info: &GgufTensorInfo) -> ModelResult<usize> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Dequantization
-// ──────────────────────────────────────────────────────────────────────────────
-
-pub(crate) mod dequant {
-    use super::GgufQuantType;
-    use crate::error::{ModelError, ModelResult};
-    use crate::gguf_dequant as kquant;
-
-    /// Dequantize `data` bytes to `n_elements` f32 values according to `quant_type`.
-    pub fn dequantize(
-        data: &[u8],
-        quant_type: &GgufQuantType,
-        n_elements: usize,
-    ) -> ModelResult<Vec<f32>> {
-        match quant_type {
-            GgufQuantType::F32 => dequant_f32(data, n_elements),
-            GgufQuantType::F16 => dequant_f16(data, n_elements),
-            GgufQuantType::BF16 => dequant_bf16(data, n_elements),
-            GgufQuantType::Q4_0 => dequant_q4_0(data, n_elements),
-            GgufQuantType::Q4_1 => dequant_q4_1(data, n_elements),
-            GgufQuantType::Q5_0 => dequant_q5_0(data, n_elements),
-            GgufQuantType::Q5_1 => dequant_q5_1(data, n_elements),
-            GgufQuantType::Q8_0 => dequant_q8_0(data, n_elements),
-            GgufQuantType::Q6K => dequant_q6_k(data, n_elements),
-            GgufQuantType::Q2K => kquant::dequant_q2_k(data, n_elements),
-            GgufQuantType::Q3K => kquant::dequant_q3_k(data, n_elements),
-            GgufQuantType::Q4K => kquant::dequant_q4_k(data, n_elements),
-            GgufQuantType::Q5K => kquant::dequant_q5_k(data, n_elements),
-            GgufQuantType::Q8K => kquant::dequant_q8_k(data, n_elements),
-            qt => Err(ModelError::simple_load_error(format!(
-                "Unsupported quant type for dequantization: {:?}",
-                qt
-            ))),
-        }
-    }
-
-    fn dequant_f32(data: &[u8], n: usize) -> ModelResult<Vec<f32>> {
-        if data.len() < n * 4 {
-            return Err(ModelError::simple_load_error(format!(
-                "F32 tensor needs {} bytes, got {}",
-                n * 4,
-                data.len()
-            )));
-        }
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let base = i * 4;
-            let v =
-                f32::from_le_bytes([data[base], data[base + 1], data[base + 2], data[base + 3]]);
-            out.push(v);
-        }
-        Ok(out)
-    }
-
-    pub(super) fn dequant_f16(data: &[u8], n: usize) -> ModelResult<Vec<f32>> {
-        if data.len() < n * 2 {
-            return Err(ModelError::simple_load_error(format!(
-                "F16 tensor needs {} bytes, got {}",
-                n * 2,
-                data.len()
-            )));
-        }
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let base = i * 2;
-            let bits = u16::from_le_bytes([data[base], data[base + 1]]);
-            out.push(half::f16::from_bits(bits).to_f32());
-        }
-        Ok(out)
-    }
-
-    pub(super) fn dequant_bf16(data: &[u8], n: usize) -> ModelResult<Vec<f32>> {
-        if data.len() < n * 2 {
-            return Err(ModelError::simple_load_error(format!(
-                "BF16 tensor needs {} bytes, got {}",
-                n * 2,
-                data.len()
-            )));
-        }
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let base = i * 2;
-            let bits = u16::from_le_bytes([data[base], data[base + 1]]);
-            // BF16 → f32: sign+exp+7 mantissa bits occupy the upper 16 bits of f32
-            out.push(f32::from_bits((bits as u32) << 16));
-        }
-        Ok(out)
-    }
-
-    /// Q4_0 block: 2 bytes delta (f16) + 16 bytes quantized nibbles → 32 f32
-    ///
-    /// Each nibble `q` represents `(q - 8) * delta`.
-    pub(super) fn dequant_q4_0(data: &[u8], n: usize) -> ModelResult<Vec<f32>> {
-        const BLOCK_ELEMS: usize = 32;
-        const BLOCK_BYTES: usize = 18; // 2 delta + 16 nibbles
-        if !n.is_multiple_of(BLOCK_ELEMS) {
-            return Err(ModelError::simple_load_error(format!(
-                "Q4_0: n_elements {} not divisible by {}",
-                n, BLOCK_ELEMS
-            )));
-        }
-        let n_blocks = n / BLOCK_ELEMS;
-        if data.len() < n_blocks * BLOCK_BYTES {
-            return Err(ModelError::simple_load_error("Q4_0 data buffer too small"));
-        }
-        let mut out = Vec::with_capacity(n);
-        for b in 0..n_blocks {
-            let base = b * BLOCK_BYTES;
-            let delta_bits = u16::from_le_bytes([data[base], data[base + 1]]);
-            let delta = half::f16::from_bits(delta_bits).to_f32();
-            for byte_idx in 0..16usize {
-                let byte = data[base + 2 + byte_idx];
-                let lo = (byte & 0x0F) as i32 - 8;
-                let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-                out.push(lo as f32 * delta);
-                out.push(hi as f32 * delta);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Q4_1 block: 2 bytes delta (f16) + 2 bytes min (f16) + 16 bytes nibbles → 32 f32
-    ///
-    /// Each nibble `q` represents `q * delta + min`.
-    pub(super) fn dequant_q4_1(data: &[u8], n: usize) -> ModelResult<Vec<f32>> {
-        const BLOCK_ELEMS: usize = 32;
-        const BLOCK_BYTES: usize = 20;
-        if !n.is_multiple_of(BLOCK_ELEMS) {
-            return Err(ModelError::simple_load_error(format!(
-                "Q4_1: n_elements {} not divisible by {}",
-                n, BLOCK_ELEMS
-            )));
-        }
-        let n_blocks = n / BLOCK_ELEMS;
-        if data.len() < n_blocks * BLOCK_BYTES {
-            return Err(ModelError::simple_load_error("Q4_1 data buffer too small"));
-        }
-        let mut out = Vec::with_capacity(n);
-        for b in 0..n_blocks {
-            let base = b * BLOCK_BYTES;
-            let delta_bits = u16::from_le_bytes([data[base], data[base + 1]]);
-            let delta = half::f16::from_bits(delta_bits).to_f32();
-            let min_bits = u16::from_le_bytes([data[base + 2], data[base + 3]]);
-            let min = half::f16::from_bits(min_bits).to_f32();
-            for byte_idx in 0..16usize {
-                let byte = data[base + 4 + byte_idx];
-                let lo = (byte & 0x0F) as f32;
-                let hi = ((byte >> 4) & 0x0F) as f32;
-                out.push(lo * delta + min);
-                out.push(hi * delta + min);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Q5_0 block: 2 bytes delta (f16) + 4 bytes high bits (u32) + 16 bytes low nibbles → 32 f32
-    ///
-    /// Each 5-bit value `q` (range 0–31, then subtract 16) scaled by delta.
-    pub(super) fn dequant_q5_0(data: &[u8], n: usize) -> ModelResult<Vec<f32>> {
-        const BLOCK_ELEMS: usize = 32;
-        const BLOCK_BYTES: usize = 22;
-        if !n.is_multiple_of(BLOCK_ELEMS) {
-            return Err(ModelError::simple_load_error(format!(
-                "Q5_0: n_elements {} not divisible by {}",
-                n, BLOCK_ELEMS
-            )));
-        }
-        let n_blocks = n / BLOCK_ELEMS;
-        if data.len() < n_blocks * BLOCK_BYTES {
-            return Err(ModelError::simple_load_error("Q5_0 data buffer too small"));
-        }
-        let mut out = Vec::with_capacity(n);
-        for b in 0..n_blocks {
-            let base = b * BLOCK_BYTES;
-            let delta_bits = u16::from_le_bytes([data[base], data[base + 1]]);
-            let delta = half::f16::from_bits(delta_bits).to_f32();
-            // High bits: bit i of qh → 5th bit of element i
-            let qh = u32::from_le_bytes([
-                data[base + 2],
-                data[base + 3],
-                data[base + 4],
-                data[base + 5],
-            ]);
-            for byte_idx in 0..16usize {
-                let byte = data[base + 6 + byte_idx];
-                let lo4 = (byte & 0x0F) as u32;
-                let hi4 = ((byte >> 4) & 0x0F) as u32;
-                let elem_lo = byte_idx * 2;
-                let elem_hi = byte_idx * 2 + 1;
-                let hi_lo = (qh >> elem_lo) & 1;
-                let hi_hi = (qh >> elem_hi) & 1;
-                let q_lo = (lo4 | (hi_lo << 4)) as i32 - 16;
-                let q_hi = (hi4 | (hi_hi << 4)) as i32 - 16;
-                out.push(q_lo as f32 * delta);
-                out.push(q_hi as f32 * delta);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Q5_1 block: 2 bytes delta (f16) + 2 bytes min (f16) + 4 bytes high bits + 16 bytes → 32 f32
-    pub(super) fn dequant_q5_1(data: &[u8], n: usize) -> ModelResult<Vec<f32>> {
-        const BLOCK_ELEMS: usize = 32;
-        const BLOCK_BYTES: usize = 24;
-        if !n.is_multiple_of(BLOCK_ELEMS) {
-            return Err(ModelError::simple_load_error(format!(
-                "Q5_1: n_elements {} not divisible by {}",
-                n, BLOCK_ELEMS
-            )));
-        }
-        let n_blocks = n / BLOCK_ELEMS;
-        if data.len() < n_blocks * BLOCK_BYTES {
-            return Err(ModelError::simple_load_error("Q5_1 data buffer too small"));
-        }
-        let mut out = Vec::with_capacity(n);
-        for b in 0..n_blocks {
-            let base = b * BLOCK_BYTES;
-            let delta_bits = u16::from_le_bytes([data[base], data[base + 1]]);
-            let delta = half::f16::from_bits(delta_bits).to_f32();
-            let min_bits = u16::from_le_bytes([data[base + 2], data[base + 3]]);
-            let min = half::f16::from_bits(min_bits).to_f32();
-            let qh = u32::from_le_bytes([
-                data[base + 4],
-                data[base + 5],
-                data[base + 6],
-                data[base + 7],
-            ]);
-            for byte_idx in 0..16usize {
-                let byte = data[base + 8 + byte_idx];
-                let lo4 = (byte & 0x0F) as u32;
-                let hi4 = ((byte >> 4) & 0x0F) as u32;
-                let elem_lo = byte_idx * 2;
-                let elem_hi = byte_idx * 2 + 1;
-                let hi_lo = (qh >> elem_lo) & 1;
-                let hi_hi = (qh >> elem_hi) & 1;
-                let q_lo = (lo4 | (hi_lo << 4)) as f32;
-                let q_hi = (hi4 | (hi_hi << 4)) as f32;
-                out.push(q_lo * delta + min);
-                out.push(q_hi * delta + min);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Q8_0 block: 2 bytes delta (f16) + 32 bytes i8 values → 32 f32
-    ///
-    /// Each i8 value `q` is scaled: `q * delta`.
-    pub(super) fn dequant_q8_0(data: &[u8], n: usize) -> ModelResult<Vec<f32>> {
-        const BLOCK_ELEMS: usize = 32;
-        const BLOCK_BYTES: usize = 34;
-        if !n.is_multiple_of(BLOCK_ELEMS) {
-            return Err(ModelError::simple_load_error(format!(
-                "Q8_0: n_elements {} not divisible by {}",
-                n, BLOCK_ELEMS
-            )));
-        }
-        let n_blocks = n / BLOCK_ELEMS;
-        if data.len() < n_blocks * BLOCK_BYTES {
-            return Err(ModelError::simple_load_error("Q8_0 data buffer too small"));
-        }
-        let mut out = Vec::with_capacity(n);
-        for b in 0..n_blocks {
-            let base = b * BLOCK_BYTES;
-            let delta_bits = u16::from_le_bytes([data[base], data[base + 1]]);
-            let delta = half::f16::from_bits(delta_bits).to_f32();
-            for i in 0..BLOCK_ELEMS {
-                let q = data[base + 2 + i] as i8;
-                out.push(q as f32 * delta);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Q6_K block: 210 bytes → 256 f32 elements.
-    ///
-    /// Block layout:
-    /// - 128 bytes: low 4 bits of each 6-bit value, packed as nibbles (ql)
-    /// - 64 bytes:  high 2 bits for groups of 4, packed 4-per-byte (qh)
-    /// - 16 bytes:  sub-block scales (i8, one per 16 elements)
-    /// - 2 bytes:   block scale delta (f16)
-    pub(super) fn dequant_q6_k(data: &[u8], n: usize) -> ModelResult<Vec<f32>> {
-        const BLOCK_ELEMS: usize = 256;
-        const BLOCK_BYTES: usize = 210;
-        if !n.is_multiple_of(BLOCK_ELEMS) {
-            return Err(ModelError::simple_load_error(format!(
-                "Q6K: n_elements {} not divisible by {}",
-                n, BLOCK_ELEMS
-            )));
-        }
-        let n_blocks = n / BLOCK_ELEMS;
-        if data.len() < n_blocks * BLOCK_BYTES {
-            return Err(ModelError::simple_load_error("Q6K data buffer too small"));
-        }
-        let mut out = Vec::with_capacity(n);
-        for b in 0..n_blocks {
-            let base = b * BLOCK_BYTES;
-            // ql: 128 bytes (low 4 bits, packed nibbles)
-            let ql = &data[base..base + 128];
-            // qh: 64 bytes (high 2 bits, 4 per byte)
-            let qh = &data[base + 128..base + 192];
-            // scales: 16 i8 values
-            let scales_raw = &data[base + 192..base + 208];
-            // delta: f16
-            let delta_bits = u16::from_le_bytes([data[base + 208], data[base + 209]]);
-            let delta = half::f16::from_bits(delta_bits).to_f32();
-
-            // Reconstruct 256 6-bit values
-            // ql[i] holds nibbles for element i and i+128 (lower 4 bits, upper 4 bits)
-            // qh[i] holds high bits for 4 consecutive pairs
-            for i in 0..128usize {
-                // high bits byte index and bit positions
-                let qh_byte = qh[i / 2];
-                let shift_lo = (i % 2) * 4; // bits [shift_lo+1 : shift_lo] for even element
-                let shift_hi = (i % 2) * 4 + 2; // bits [shift_hi+1 : shift_hi] for odd element (128+i)
-
-                let q_lo_low4 = ql[i] & 0x0F;
-                let q_hi_low4 = (ql[i] >> 4) & 0x0F;
-
-                let q_lo_high2 = (qh_byte >> shift_lo) & 0x03;
-                let q_hi_high2 = (qh_byte >> shift_hi) & 0x03;
-
-                let q_lo = ((q_lo_high2 << 4) | q_lo_low4) as i32 - 32;
-                let q_hi = ((q_hi_high2 << 4) | q_hi_low4) as i32 - 32;
-
-                // Scale: one i8 per 16 elements → 16 sub-blocks of 16 elements each
-                let scale_idx_lo = (i * 2) / 16; // element i*2 / 16
-                let scale_idx_hi = (i * 2 + 1) / 16;
-
-                if scale_idx_lo >= 16 || scale_idx_hi >= 16 {
-                    return Err(ModelError::simple_load_error(
-                        "Q6K scale index out of range",
-                    ));
-                }
-                let scale_lo = scales_raw[scale_idx_lo] as i8 as f32;
-                let scale_hi = scales_raw[scale_idx_hi] as i8 as f32;
-
-                out.push(delta * scale_lo * q_lo as f32);
-                out.push(delta * scale_hi * q_hi as f32);
-            }
-        }
-        Ok(out)
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1240,13 +829,18 @@ mod tests {
         buf.extend_from_slice(bytes);
     }
 
-    /// Pad `buf` to 32-byte alignment.
-    fn pad_to_32(buf: &mut Vec<u8>) {
-        let rem = buf.len() % 32;
+    /// Pad `buf` to the given alignment.
+    fn pad_to(buf: &mut Vec<u8>, align: usize) {
+        let rem = buf.len() % align;
         if rem != 0 {
-            let pad = 32 - rem;
+            let pad = align - rem;
             buf.extend(std::iter::repeat_n(0u8, pad));
         }
+    }
+
+    /// Pad `buf` to 32-byte alignment.
+    fn pad_to_32(buf: &mut Vec<u8>) {
+        pad_to(buf, 32);
     }
 
     // ── Test 1 ────────────────────────────────────────────────────────────────
@@ -1592,5 +1186,122 @@ mod tests {
         assert_eq!(flat_b, vals_b);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_alignment_metadata_as_u64() {
+        assert_eq!(GgufMetaValue::Uint8(7).as_u64(), Some(7));
+        assert_eq!(GgufMetaValue::Uint16(1000).as_u64(), Some(1000));
+        assert_eq!(GgufMetaValue::Uint32(32).as_u64(), Some(32));
+        assert_eq!(GgufMetaValue::Uint64(u64::MAX).as_u64(), Some(u64::MAX));
+        assert_eq!(GgufMetaValue::Int32(64).as_u64(), Some(64));
+        assert_eq!(GgufMetaValue::Int32(-1).as_u64(), None);
+        assert_eq!(GgufMetaValue::Float32(1.0).as_u64(), None);
+        assert_eq!(GgufMetaValue::String("x".into()).as_u64(), None);
+    }
+
+    #[test]
+    fn test_custom_alignment_64() {
+        // Build a minimal GGUF v2 fixture with general.alignment = 64 and two F32 tensors.
+        let tmp = std::env::temp_dir().join("kizzasi_test_align64.gguf");
+        let n_elements = 4usize;
+        let tensor_bytes = (n_elements * 4) as u64; // F32
+
+        let mut buf = Vec::new();
+        // Magic + version
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&2u32.to_le_bytes()); // version 2
+
+        // tensor_count=2, kv_count=1
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+
+        // KV: general.alignment = 64 (Uint32)
+        let key = b"general.alignment";
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&4u32.to_le_bytes()); // GgufValueType::Uint32
+        buf.extend_from_slice(&64u32.to_le_bytes());
+
+        // Tensor 0: "weight_a", shape=[4], F32, offset=0
+        let name_a = b"weight_a";
+        buf.extend_from_slice(&(name_a.len() as u64).to_le_bytes());
+        buf.extend_from_slice(name_a);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+        buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
+        buf.extend_from_slice(&0u32.to_le_bytes()); // GgufQuantType::F32
+        buf.extend_from_slice(&0u64.to_le_bytes()); // offset=0
+
+        // Tensor 1: "weight_b", shape=[4], F32, offset=tensor_bytes
+        let name_b = b"weight_b";
+        buf.extend_from_slice(&(name_b.len() as u64).to_le_bytes());
+        buf.extend_from_slice(name_b);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&4u64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&tensor_bytes.to_le_bytes());
+
+        // Pad to 64-byte alignment
+        pad_to(&mut buf, 64);
+        let data_start = buf.len();
+
+        // Tensor 0 data: [1.0, 2.0, 3.0, 4.0]
+        for v in [1.0f32, 2.0, 3.0, 4.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        // Tensor 1 data: [5.0, 6.0, 7.0, 8.0]
+        for v in [5.0f32, 6.0, 7.0, 8.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        std::fs::write(&tmp, &buf).unwrap();
+        let f = GgufFile::open(&tmp).unwrap();
+
+        // The data section start must be 64-aligned; tensor_a is first so its
+        // data_offset equals data_start and is also 64-aligned.
+        assert_eq!(
+            f.tensors[0].data_offset % 64,
+            0,
+            "tensor_a data_offset not 64-aligned"
+        );
+        assert_eq!(f.tensors[0].data_offset, data_start as u64);
+        // tensor_b follows immediately after tensor_a's data; its absolute
+        // offset is data_start + tensor_bytes.
+        assert_eq!(f.tensors[1].data_offset, data_start as u64 + tensor_bytes);
+
+        // Verify tensor values load correctly
+        let a = f.load_tensor_f32("weight_a").unwrap();
+        assert_eq!(a[[0, 0]], 1.0);
+        assert_eq!(a[[0, 3]], 4.0);
+        let b = f.load_tensor_f32("weight_b").unwrap();
+        assert_eq!(b[[0, 0]], 5.0);
+        assert_eq!(b[[0, 3]], 8.0);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_invalid_alignment_rejected() {
+        let tmp33 = std::env::temp_dir().join("kizzasi_test_align33.gguf");
+        let tmp0 = std::env::temp_dir().join("kizzasi_test_align0.gguf");
+
+        for (path, alignment_val) in [(&tmp33, 33u32), (&tmp0, 0u32)] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"GGUF");
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count=0
+            buf.extend_from_slice(&1u64.to_le_bytes()); // kv_count=1
+            let key = b"general.alignment";
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(&4u32.to_le_bytes()); // Uint32
+            buf.extend_from_slice(&alignment_val.to_le_bytes());
+            std::fs::write(path, &buf).unwrap();
+            assert!(
+                GgufFile::open(path).is_err(),
+                "Expected Err for general.alignment={alignment_val}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

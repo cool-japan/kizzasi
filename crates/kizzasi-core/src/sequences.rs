@@ -44,7 +44,7 @@ impl SequenceMask {
         }
 
         let batch_size = lengths.len();
-        let max_len = *lengths.iter().max().unwrap();
+        let max_len = *lengths.iter().max().expect("invariant: lengths non-empty");
 
         if max_len == 0 {
             return Err(CoreError::InvalidConfig(
@@ -183,7 +183,11 @@ impl PackedSequence {
     ///
     /// Output shape: (batch_size, max_seq_len, feature_dim)
     pub fn unpack(&self, padding_value: f32) -> CoreResult<Array3<f32>> {
-        let max_len = *self.sorted_lengths.iter().max().unwrap();
+        let max_len = *self
+            .sorted_lengths
+            .iter()
+            .max()
+            .expect("invariant: sorted_lengths non-empty");
         let mut output =
             Array3::from_elem((self.batch_size, max_len, self.feature_dim), padding_value);
 
@@ -237,7 +241,10 @@ pub fn pad_sequences(
 
     // Collect lengths and find max
     let lengths: Vec<usize> = sequences.iter().map(|s| s.nrows()).collect();
-    let max_len = *lengths.iter().max().unwrap();
+    let max_len = *lengths
+        .iter()
+        .max()
+        .expect("invariant: lengths non-empty from guard");
 
     // Check feature dimensions match
     for (i, seq) in sequences.iter().enumerate() {

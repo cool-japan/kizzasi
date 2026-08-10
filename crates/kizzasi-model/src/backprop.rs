@@ -672,10 +672,10 @@ impl SsmBackward {
                 delta_grad[[t, sn]] = dh_t[sn] * h_t_row[sn] * a_bar[[t, sn]];
             }
 
-            // dx[t] = b_bar[t] * dh_t  (broadcast over input_dim)
-            let b_bar_sum: f32 = b_bar.row(t).sum() / n_state as f32;
+            // dx[t] = (b_bar.row(t) · dh_t) / input_dim  (broadcast over input_dim)
+            let dx_scalar: f32 = b_bar.row(t).dot(&dh_t) / input_dim as f32;
             for d in 0..input_dim {
-                dx[[t, d]] = b_bar_sum * dh_t.sum() / n_state as f32;
+                dx[[t, d]] = dx_scalar;
             }
 
             dh_next = dh_t;
@@ -1313,6 +1313,83 @@ mod tests {
 
         let da_norm: f32 = grads.da.iter().map(|&v| v * v).sum::<f32>().sqrt();
         assert!(da_norm > 1e-6, "da gradient vanished: norm = {da_norm}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 10b. SsmBackward — dx uses dot product (not product of means)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssm_backward_dx_dot_product() {
+        // seq_len=1, state_dim=2, input_dim=1, output_dim=1
+        // c = [1, 0], dy = [[1]], b_bar = [[3, 5]], a_bar = [[0.5, 0.5]]
+        // states = [zeros, zeros] (2 elements for seq_len=1)
+        // dh_t[n] = c[n]*dy_scalar + a_bar[t,n]*dh_next[n]
+        //         = c[n]*1 + 0.5*0 = c[n]  => [1.0, 0.0]
+        // Correct: dx[0,0] = (3*1 + 5*0) / 1 = 3.0
+        // Buggy:   b_bar_sum=(3+5)/2=4, dh_sum=1 => 4*1/2=2.0
+        let seq_len = 1_usize;
+        let state_dim = 2_usize;
+        let input_dim = 1_usize;
+        let output_dim = 1_usize;
+
+        let dy = Array2::from_shape_vec((seq_len, output_dim), vec![1.0_f32]).unwrap();
+        let states: Vec<Array2<f32>> = (0..=seq_len)
+            .map(|_| Array2::<f32>::zeros((1, state_dim)))
+            .collect();
+        let a_bar = Array2::from_shape_vec((seq_len, state_dim), vec![0.5_f32, 0.5]).unwrap();
+        let b_bar = Array2::from_shape_vec((seq_len, state_dim), vec![3.0_f32, 5.0]).unwrap();
+        let c = Array1::from_vec(vec![1.0_f32, 0.0]);
+        let x = Array2::<f32>::zeros((seq_len, input_dim));
+
+        let ssm_bwd = SsmBackward::new(state_dim, seq_len);
+        let grads = ssm_bwd
+            .backward(&dy, &states, &a_bar, &b_bar, &c, &x)
+            .expect("SSM backward ok");
+
+        assert!(
+            (grads.dx[[0, 0]] - 3.0_f32).abs() < 1e-5,
+            "dx dot product: expected 3.0, got {}",
+            grads.dx[[0, 0]]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 10c. SsmBackward — dx divided by input_dim (not n_state)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssm_backward_dx_input_pooling() {
+        // seq_len=1, state_dim=2, input_dim=2, output_dim=1
+        // c=[1,0], dy=[[1]], b_bar=[[3,5]], a_bar=[[0,0]]
+        // dh_t[n] = c[n]*1 + 0*0 = c[n] = [1.0, 0.0]
+        // Correct: dx[0,d] = (3*1 + 5*0) / 2 = 1.5 for d in {0,1}
+        // Buggy:   b_bar_sum=4, dh_sum=1 => 4*1/2=2.0
+        let seq_len = 1_usize;
+        let state_dim = 2_usize;
+        let input_dim = 2_usize;
+        let output_dim = 1_usize;
+
+        let dy = Array2::from_shape_vec((seq_len, output_dim), vec![1.0_f32]).unwrap();
+        let states: Vec<Array2<f32>> = (0..=seq_len)
+            .map(|_| Array2::<f32>::zeros((1, state_dim)))
+            .collect();
+        let a_bar = Array2::from_shape_vec((seq_len, state_dim), vec![0.0_f32, 0.0]).unwrap();
+        let b_bar = Array2::from_shape_vec((seq_len, state_dim), vec![3.0_f32, 5.0]).unwrap();
+        let c = Array1::from_vec(vec![1.0_f32, 0.0]);
+        let x = Array2::<f32>::zeros((seq_len, input_dim));
+
+        let ssm_bwd = SsmBackward::new(state_dim, seq_len);
+        let grads = ssm_bwd
+            .backward(&dy, &states, &a_bar, &b_bar, &c, &x)
+            .expect("SSM backward ok");
+
+        assert!(
+            (grads.dx[[0, 0]] - 1.5_f32).abs() < 1e-5 && (grads.dx[[0, 1]] - 1.5_f32).abs() < 1e-5,
+            "dx input pooling: expected 1.5 for both dims, got [{}, {}]",
+            grads.dx[[0, 0]],
+            grads.dx[[0, 1]]
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -3,12 +3,34 @@
 //! This module provides various sampling strategies for autoregressive prediction:
 //! - **Greedy**: Always select the highest probability value
 //! - **Temperature**: Scale logits to control randomness
-//! - **Top-k**: Sample from the k most likely values
+//! - **Top-k**: Sample from the k most likely candidates
 //! - **Top-p (nucleus)**: Sample from the smallest set with cumulative probability >= p
 //! - **Beam search**: Maintain multiple hypotheses for multi-step prediction
 
 use crate::error::{InferenceError, InferenceResult};
 use scirs2_core::ndarray::{Array1, Array2};
+
+/// Construct a `Send`-safe RNG from an optional seed.
+///
+/// When a seed is provided the RNG is deterministic (reproducible across runs).
+/// When no seed is provided a random `u64` seed is drawn from the thread-local RNG and
+/// used to initialise a `StdRng` — random but `Send`-safe, unlike `ThreadRng` which is
+/// `!Send`.
+///
+/// Uses `scirs2_core::random::StdRng` (= `Random<rand::rngs::StdRng>`) which is `Send`.
+fn make_sampler_rng(seed: Option<u64>) -> scirs2_core::random::StdRng {
+    // `Random::<rand::rngs::ThreadRng>::seed(s)` returns `Random<rand::rngs::StdRng>`
+    let s = match seed {
+        Some(s) => s,
+        None => {
+            // Draw a random seed from the thread-local RNG so the sampler is
+            // non-deterministic by default but still `Send`-safe.
+            use scirs2_core::random::RngExt;
+            scirs2_core::random::rng().random::<u64>()
+        }
+    };
+    scirs2_core::random::ThreadRng::seed(s)
+}
 
 /// Configuration for sampling strategies
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -112,23 +134,30 @@ pub struct Sampler {
     config: SamplingConfig,
     /// Custom sampling function (if strategy is Custom)
     custom_fn: Option<CustomSamplingFn>,
+    /// Internal RNG — deterministic when `config.seed` is `Some`, OS-seeded otherwise.
+    /// Using `StdRng` (= `Random<rand::rngs::StdRng>`, not `ThreadRng`) keeps `Sampler: Send`.
+    rng: scirs2_core::random::StdRng,
 }
 
 impl Sampler {
     /// Create a new sampler with given configuration
     pub fn new(config: SamplingConfig) -> Self {
+        let rng = make_sampler_rng(config.seed);
         Self {
             config,
             custom_fn: None,
+            rng,
         }
     }
 
     /// Create a sampler with a custom sampling function
     pub fn with_custom_fn(mut config: SamplingConfig, custom_fn: CustomSamplingFn) -> Self {
         config.strategy = SamplingStrategy::Custom;
+        let rng = make_sampler_rng(config.seed);
         Self {
             config,
             custom_fn: Some(custom_fn),
+            rng,
         }
     }
 
@@ -196,8 +225,17 @@ impl Sampler {
             .unwrap_or(0.0)
     }
 
-    /// Temperature sampling with optional scaling
+    /// Temperature sampling with optional scaling.
+    ///
+    /// When temperature is at or near zero the distribution collapses to a point
+    /// mass on the argmax.  Dividing by a near-zero temperature would produce
+    /// `±inf` values that propagate as `NaN` through softmax, so we short-circuit
+    /// to greedy sampling instead.
     fn temperature_sample(&mut self, logits: &Array1<f32>) -> InferenceResult<f32> {
+        if self.config.temperature <= 1e-6_f32 {
+            return Ok(self.greedy_sample(logits));
+        }
+
         let scaled = if (self.config.temperature - 1.0).abs() > 1e-6 {
             logits.mapv(|x| x / self.config.temperature)
         } else {
@@ -262,13 +300,14 @@ impl Sampler {
         self.sample_categorical(&filtered_probs)
     }
 
-    /// Sample from a categorical distribution
+    /// Sample from a categorical distribution using the stored RNG.
+    ///
+    /// The RNG is either seeded deterministically (when `SamplingConfig::seed` is
+    /// `Some`) or seeded from OS entropy, ensuring that seeded samplers produce
+    /// fully reproducible sequences across calls.
     fn sample_categorical(&mut self, probs: &Array1<f32>) -> InferenceResult<f32> {
-        // Use simple random sampling based on system RNG
-        use scirs2_core::random::{rng, RngExt};
-
-        let mut rng_gen = rng();
-        let uniform: f32 = rng_gen.random();
+        use scirs2_core::random::RngExt;
+        let uniform: f32 = self.rng.random::<f32>();
         let mut cumsum = 0.0;
         for (idx, &prob) in probs.iter().enumerate() {
             cumsum += prob;
@@ -276,7 +315,7 @@ impl Sampler {
                 return Ok(idx as f32);
             }
         }
-        // Fallback to last index
+        // Fallback to last index (handles floating-point rounding where cumsum < 1.0)
         Ok((probs.len() - 1) as f32)
     }
 
@@ -867,5 +906,70 @@ mod tests {
         assert_eq!(results[0], 1.0);
         assert_eq!(results[1], 0.0);
         assert_eq!(results[2], 2.0);
+    }
+
+    #[test]
+    fn test_seeded_sampling_reproducible() {
+        // Two samplers with the same seed must produce identical sequences.
+        let logits = Array1::from_vec(vec![1.0_f32, 2.0, 0.5, 1.5]);
+        let mut s1 = Sampler::new(
+            SamplingConfig::new()
+                .strategy(SamplingStrategy::Temperature)
+                .temperature(0.8)
+                .seed(42),
+        );
+        let mut s2 = Sampler::new(
+            SamplingConfig::new()
+                .strategy(SamplingStrategy::Temperature)
+                .temperature(0.8)
+                .seed(42),
+        );
+        for _ in 0..20 {
+            let r1 = s1.sample(&logits).expect("s1 sample");
+            let r2 = s2.sample(&logits).expect("s2 sample");
+            assert_eq!(r1.to_bits(), r2.to_bits(), "Seeded samplers diverged");
+        }
+    }
+
+    #[test]
+    fn test_different_seeds_differ() {
+        // Uniform logits → pure randomness; different seeds should yield different sequences.
+        let logits = Array1::from_vec(vec![1.0_f32, 1.0, 1.0, 1.0]);
+        let mut s1 = Sampler::new(
+            SamplingConfig::new()
+                .strategy(SamplingStrategy::Temperature)
+                .temperature(1.0)
+                .seed(1),
+        );
+        let mut s2 = Sampler::new(
+            SamplingConfig::new()
+                .strategy(SamplingStrategy::Temperature)
+                .temperature(1.0)
+                .seed(99999),
+        );
+        let results1: Vec<f32> = (0..20).map(|_| s1.sample(&logits).unwrap()).collect();
+        let results2: Vec<f32> = (0..20).map(|_| s2.sample(&logits).unwrap()).collect();
+        assert!(
+            results1 != results2,
+            "Different seeds produced identical sequences"
+        );
+    }
+
+    #[test]
+    fn test_temperature_zero_is_greedy() {
+        // At T=0, temperature_sample must always return the argmax index.
+        let logits = Array1::from_vec(vec![0.1_f32, 5.0, 0.3, 0.2]); // argmax → index 1
+        let config = SamplingConfig::new()
+            .strategy(SamplingStrategy::Temperature)
+            .temperature(0.0);
+        let mut sampler = Sampler::new(config);
+        for _ in 0..5 {
+            let result = sampler.sample(&logits).expect("sample");
+            assert_eq!(
+                result as usize, 1,
+                "T=0 should pick argmax (index 1), got {}",
+                result
+            );
+        }
     }
 }

@@ -13,6 +13,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::metrics::{MetricsLogger, TrainingMetrics};
 use crate::scheduler::LRScheduler;
 use crate::training_core::{SchedulerType, TrainableSSM, TrainingConfig};
+use candle_core::backprop::GradStore;
 use candle_core::Tensor;
 use candle_nn::{AdamW, Optimizer};
 use serde::{Deserialize, Serialize};
@@ -276,6 +277,19 @@ impl Trainer {
     }
 
     /// Train for one epoch
+    ///
+    /// For each batch the training loop performs:
+    ///
+    /// 1. Forward pass through the model
+    /// 2. Loss evaluation
+    /// 3. Explicit backward pass to materialise a [`GradStore`]
+    /// 4. Optional global-norm gradient clipping (`config.grad_clip`)
+    /// 5. Gradient-norm telemetry (when `config.track_metrics` is set)
+    /// 6. Optimizer step against the (possibly clipped) gradients
+    ///
+    /// Performing the backward pass explicitly (rather than via
+    /// [`Optimizer::backward_step`]) lets us inspect and clip the gradients
+    /// before they are consumed by the optimizer.
     pub fn train_epoch<F>(
         &mut self,
         data_loader: &[(Tensor, Tensor)],
@@ -301,10 +315,28 @@ impl Trainer {
             // Compute loss
             let loss = loss_fn(&predictions, targets)?;
 
-            // Backward pass
+            // Backward pass — retain the gradient store so we can inspect and
+            // clip the gradients before stepping the optimizer.
+            let mut grads = loss
+                .backward()
+                .map_err(|e| CoreError::Generic(format!("Backward pass failed: {}", e)))?;
+
+            // Gradient clipping (global-norm) before metrics so that the
+            // recorded value matches what is actually applied.
+            if let Some(max_norm) = self.config.grad_clip {
+                self.clip_gradients(&mut grads, max_norm)?;
+            }
+
+            // Track gradient norm metric (post-clip, matches optimizer input).
+            if self.config.track_metrics {
+                let grad_norm = self.compute_grad_norm(&grads)?;
+                self.metrics.record_grad_norm(grad_norm);
+            }
+
+            // Optimizer step using the (possibly clipped) gradients.
             self.optimizer
-                .backward_step(&loss)
-                .map_err(|e| CoreError::Generic(format!("Backward step failed: {}", e)))?;
+                .step(&grads)
+                .map_err(|e| CoreError::Generic(format!("Optimizer step failed: {}", e)))?;
 
             // Accumulate loss
             let loss_val = loss
@@ -312,19 +344,10 @@ impl Trainer {
                 .map_err(|e| CoreError::Generic(format!("Failed to extract loss value: {}", e)))?;
             total_loss += loss_val;
 
-            // Track metrics
+            // Loss / batch telemetry
             if self.config.track_metrics {
                 self.metrics.record_train_loss(epoch, loss_val);
                 self.logger.log_batch(epoch, batch_idx, loss_val);
-
-                // Compute and track gradient norm
-                let grad_norm = self.compute_grad_norm()?;
-                self.metrics.record_grad_norm(grad_norm);
-            }
-
-            // Gradient clipping if enabled
-            if let Some(max_norm) = self.config.grad_clip {
-                self.clip_gradients(max_norm)?;
             }
 
             self.current_step += 1;
@@ -333,21 +356,77 @@ impl Trainer {
         Ok(total_loss / num_batches as f32)
     }
 
-    /// Compute gradient norm
-    fn compute_grad_norm(&self) -> CoreResult<f32> {
-        // Placeholder: In candle, gradient norms would be computed from VarMap
-        // For now, return a dummy value
-        // TODO: Implement proper gradient norm computation when candle exposes gradient access
-        Ok(1.0)
+    /// Compute the global L2 norm of all parameter gradients.
+    ///
+    /// Iterates the model's [`VarMap`] and accumulates `||g||_2^2` for every
+    /// variable that has a corresponding gradient in `grads`, then returns
+    /// the square root.
+    ///
+    /// Variables without a gradient (e.g. detached parameters, or parameters
+    /// the current loss does not depend on) are skipped — they contribute 0
+    /// to the norm.
+    fn compute_grad_norm(&self, grads: &GradStore) -> CoreResult<f32> {
+        let mut sum_sq: f64 = 0.0;
+
+        for var in self.model.varmap().all_vars() {
+            let grad = match grads.get(&var) {
+                Some(g) => g,
+                None => continue,
+            };
+
+            // Cast to f32 so the norm calculation is stable regardless of the
+            // parameter dtype (e.g. F16/BF16 mixed precision).
+            let grad_f32 = grad
+                .to_dtype(candle_core::DType::F32)
+                .map_err(|e| CoreError::Generic(format!("grad to_dtype failed: {}", e)))?;
+            let local_sq = grad_f32
+                .sqr()
+                .map_err(|e| CoreError::Generic(format!("grad sqr failed: {}", e)))?
+                .sum_all()
+                .map_err(|e| CoreError::Generic(format!("grad sum_all failed: {}", e)))?
+                .to_scalar::<f32>()
+                .map_err(|e| CoreError::Generic(format!("grad to_scalar failed: {}", e)))?;
+            sum_sq += local_sq as f64;
+        }
+
+        Ok(sum_sq.sqrt() as f32)
     }
 
-    /// Clip gradients by global norm
+    /// Clip gradients by their global L2 norm.
     ///
-    /// Note: Gradient clipping is handled internally by candle's optimizer.
-    /// This is a placeholder for custom gradient clipping if needed.
-    fn clip_gradients(&self, _max_norm: f32) -> CoreResult<()> {
-        // Gradient clipping will be handled by the optimizer's built-in mechanism
-        // or via custom backward hooks in future implementations
+    /// If the global norm exceeds `max_norm`, every gradient tensor is scaled
+    /// by `max_norm / global_norm` (matching the semantics of PyTorch's
+    /// `torch.nn.utils.clip_grad_norm_`). The clipping is performed in-place
+    /// on the [`GradStore`] by reinserting the scaled gradient tensors.
+    ///
+    /// `max_norm` is interpreted as a finite positive threshold; non-positive
+    /// or non-finite values are treated as "no clipping" so that misconfigured
+    /// hyperparameters do not silently zero out the gradients.
+    fn clip_gradients(&self, grads: &mut GradStore, max_norm: f32) -> CoreResult<()> {
+        if !max_norm.is_finite() || max_norm <= 0.0 {
+            return Ok(());
+        }
+
+        let total_norm = self.compute_grad_norm(grads)?;
+        if !total_norm.is_finite() || total_norm <= max_norm {
+            return Ok(());
+        }
+
+        let scale = (max_norm / total_norm) as f64;
+
+        // Collect the vars first so we are not holding immutable borrows on
+        // `grads` while mutating it.
+        let vars = self.model.varmap().all_vars();
+        for var in vars.iter() {
+            let scaled = match grads.get(var) {
+                Some(g) => g
+                    .affine(scale, 0.0)
+                    .map_err(|e| CoreError::Generic(format!("grad scale failed: {}", e)))?,
+                None => continue,
+            };
+            grads.insert(var, scaled);
+        }
+
         Ok(())
     }
 
@@ -376,7 +455,51 @@ impl Trainer {
         Ok(total_loss / num_batches as f32)
     }
 
-    /// Full training loop with validation and early stopping
+    /// Materialise one epoch's worth of `(input, target)` tensors from a
+    /// [`TimeSeriesDataLoader`].
+    ///
+    /// `iter_batches` already handles per-epoch shuffling (after the first
+    /// epoch), so the caller does not need to invoke `shuffle()` manually.
+    /// Each yielded ndarray batch is converted to candle tensors on the
+    /// trainer's device.
+    fn collect_epoch_batches(
+        loader: &mut TimeSeriesDataLoader,
+        device: &candle_core::Device,
+    ) -> CoreResult<Vec<(Tensor, Tensor)>> {
+        // Snapshot the batch count up-front; `iter_batches` would also yield
+        // this many items but we pre-allocate to avoid rehashing.
+        let cap = loader.num_batches();
+        let mut batches: Vec<(Tensor, Tensor)> = Vec::with_capacity(cap);
+
+        // `iter_batches` borrows `loader` mutably and shuffles internally on
+        // epochs past the first. We collect the ndarray pairs first because
+        // `to_tensors` only needs an immutable borrow but the iterator holds a
+        // mutable one for the duration of the for-loop.
+        let mut raw_batches: Vec<(
+            scirs2_core::ndarray::Array2<f32>,
+            scirs2_core::ndarray::Array2<f32>,
+        )> = Vec::with_capacity(cap);
+
+        for batch in loader.iter_batches() {
+            let (inputs, targets) = batch?;
+            raw_batches.push((inputs, targets));
+        }
+
+        for (inputs, targets) in raw_batches.into_iter() {
+            let (x, y) = loader.to_tensors(&inputs, &targets, device)?;
+            batches.push((x, y));
+        }
+
+        Ok(batches)
+    }
+
+    /// Full training loop with validation and early stopping.
+    ///
+    /// Iterates over the supplied data loaders, materialising one epoch's
+    /// worth of `(input, target)` tensors per iteration. Validation batches
+    /// are extracted with the same machinery but reuse the loader's
+    /// configured shuffle behaviour (validation loaders typically have
+    /// `shuffle == false`).
     pub fn fit<F>(
         &mut self,
         mut train_loader: TimeSeriesDataLoader,
@@ -388,23 +511,24 @@ impl Trainer {
     {
         use std::time::Instant;
 
+        // Snapshot device on the model's home device; `train_epoch` and
+        // `evaluate` both move tensors to this device implicitly via the
+        // forward pass, but the tensors must live there to begin with.
+        let device = self.model.device().clone();
+
         for epoch in 0..self.config.epochs {
             let epoch_start = Instant::now();
 
-            // Shuffle training data
-            train_loader.shuffle();
-
-            // Prepare batches (simplified - actual implementation would iterate batches)
-            // For now, this is a placeholder for the integration
-            // TODO: Implement proper batch iteration with TimeSeriesDataLoader
-            let train_batches: Vec<(Tensor, Tensor)> = Vec::new();
+            // Materialise one epoch's worth of training batches as candle
+            // tensors. `iter_batches` handles per-epoch shuffling internally.
+            let train_batches = Self::collect_epoch_batches(&mut train_loader, &device)?;
 
             // Train for one epoch
             let train_loss = self.train_epoch(&train_batches, loss_fn)?;
 
             // Validation
-            let val_loss = if let Some(ref mut _val_data) = val_loader {
-                let val_batches: Vec<(Tensor, Tensor)> = Vec::new();
+            let val_loss = if let Some(ref mut val_data) = val_loader {
+                let val_batches = Self::collect_epoch_batches(val_data, &device)?;
                 let val_loss = self.evaluate(&val_batches, loss_fn)?;
 
                 if self.config.track_metrics {
@@ -1001,5 +1125,250 @@ mod tests {
 
         // Clean up
         fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    /// Build a minimal trainer suitable for gradient-norm and convergence
+    /// tests. Returns the trainer plus a dummy `(input, target)` batch with a
+    /// non-trivial residual so the loss gradient is well-defined and non-zero.
+    fn build_grad_test_trainer(grad_clip: Option<f32>) -> (Trainer, Tensor, Tensor) {
+        use crate::config::KizzasiConfig;
+        use crate::training_core::TrainableSSM;
+
+        let model_config = KizzasiConfig::new()
+            .input_dim(2)
+            .output_dim(2)
+            .hidden_dim(8)
+            .state_dim(4)
+            .num_layers(1);
+
+        let training_config = TrainingConfig {
+            learning_rate: 1e-3,
+            track_metrics: false,
+            grad_clip,
+            early_stopping_patience: None,
+            ..Default::default()
+        };
+
+        let model = TrainableSSM::new(model_config, training_config.clone()).unwrap();
+        let device = model.device().clone();
+        let trainer = Trainer::new(model, training_config).unwrap();
+
+        // Deterministic non-trivial input/target so the residual is non-zero
+        // and the gradient is well-defined. Shape: [batch=1, seq=3, dim=2].
+        let inputs = Tensor::new(&[[[0.1f32, 0.2], [0.3, 0.4], [0.5, 0.6]]], &device).unwrap();
+        let targets = Tensor::new(&[[[1.0f32, -1.0], [0.5, -0.5], [-0.2, 0.8]]], &device).unwrap();
+
+        (trainer, inputs, targets)
+    }
+
+    #[test]
+    fn test_compute_grad_norm_nonzero() {
+        // After a real backward pass, the gradient norm must be finite and
+        // strictly positive — not the historical hard-coded `1.0`.
+        let (trainer, inputs, targets) = build_grad_test_trainer(None);
+
+        let predictions = trainer.model.forward(&inputs).unwrap();
+        let loss = Loss::mse(&predictions, &targets).unwrap();
+        let grads = loss.backward().unwrap();
+
+        let norm = trainer.compute_grad_norm(&grads).unwrap();
+        assert!(
+            norm.is_finite(),
+            "gradient norm should be finite, got {}",
+            norm
+        );
+        assert!(norm > 0.0, "gradient norm should be > 0, got {}", norm);
+        // It should definitely not be the placeholder 1.0 by accident — the
+        // model has dozens of parameters so the L2 norm is essentially never
+        // exactly 1.
+        assert!(
+            (norm - 1.0).abs() > 1e-6,
+            "gradient norm equals the historical placeholder value {}",
+            norm
+        );
+    }
+
+    #[test]
+    fn test_compute_grad_norm_scales_with_loss() {
+        // Analytical check: for MSE loss `(1/n) * sum((p - t)^2)` the upstream
+        // gradient is `(2/n) * (p - t)`. By the chain rule the gradient w.r.t.
+        // every parameter is linear in the residual `(p - t)`, so scaling the
+        // residual by `k` scales the global gradient L2 norm by `|k|`.
+        //
+        // To get a clean factor of 2 the new target tensor must be *constant*
+        // w.r.t. the parameters (otherwise backprop also flows through the
+        // target). We materialise the prediction values, then build a fresh
+        // constant target `t' = 2t - p` so that `p - t' = 2(p - t)`.
+        let (trainer, inputs, targets) = build_grad_test_trainer(None);
+        let device = trainer.model.device().clone();
+
+        let predictions = trainer.model.forward(&inputs).unwrap();
+
+        let pred_shape = predictions.dims().to_vec();
+        let pred_vals: Vec<f32> = predictions.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let target_vals: Vec<f32> = targets.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(pred_vals.len(), target_vals.len());
+
+        // Build a fresh, detached `targets_a` tensor with the same values as
+        // the original targets so the comparison is apples-to-apples.
+        let targets_a = Tensor::from_vec(target_vals.clone(), pred_shape.clone(), &device).unwrap();
+        let loss_a = Loss::mse(&predictions, &targets_a).unwrap();
+        let grads_a = loss_a.backward().unwrap();
+        let norm_a = trainer.compute_grad_norm(&grads_a).unwrap();
+
+        // `t' = 2t - p` → `p - t' = 2*(p - t)`.
+        let scaled_target_vals: Vec<f32> = target_vals
+            .iter()
+            .zip(pred_vals.iter())
+            .map(|(t, p)| 2.0 * t - p)
+            .collect();
+        let targets_b = Tensor::from_vec(scaled_target_vals, pred_shape, &device).unwrap();
+
+        let loss_b = Loss::mse(&predictions, &targets_b).unwrap();
+        let grads_b = loss_b.backward().unwrap();
+        let norm_b = trainer.compute_grad_norm(&grads_b).unwrap();
+
+        assert!(norm_a > 0.0 && norm_b > 0.0);
+        let ratio = norm_b / norm_a;
+        // Within 10% tolerance: the relation is exact in theory but small
+        // numerical effects (mean, summation) introduce sub-percent error.
+        assert!(
+            (ratio - 2.0).abs() < 0.2,
+            "expected gradient-norm ratio ~2.0 when residual doubles, got {} (norm_a={}, norm_b={})",
+            ratio,
+            norm_a,
+            norm_b
+        );
+    }
+
+    #[test]
+    fn test_clip_gradients_caps_global_norm() {
+        // Build a trainer with a very tight clip threshold and verify that
+        // post-clipping the gradient norm is at most `max_norm` (within a
+        // small tolerance). When the pre-clip norm is below the threshold the
+        // gradients should be left untouched.
+        let (trainer, inputs, targets) = build_grad_test_trainer(Some(0.01));
+
+        let predictions = trainer.model.forward(&inputs).unwrap();
+        let loss = Loss::mse(&predictions, &targets).unwrap();
+        let mut grads = loss.backward().unwrap();
+
+        let pre_norm = trainer.compute_grad_norm(&grads).unwrap();
+        trainer.clip_gradients(&mut grads, 0.01).unwrap();
+        let post_norm = trainer.compute_grad_norm(&grads).unwrap();
+
+        if pre_norm > 0.01 {
+            assert!(
+                post_norm <= 0.01 + 1e-4,
+                "clipped grad norm {} should be <= 0.01 (pre={})",
+                post_norm,
+                pre_norm
+            );
+        } else {
+            // No clipping was needed; norm should be unchanged.
+            assert!((post_norm - pre_norm).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_clip_gradients_noop_when_below_threshold() {
+        // A generous threshold should leave the gradients untouched.
+        let (trainer, inputs, targets) = build_grad_test_trainer(Some(1e6));
+
+        let predictions = trainer.model.forward(&inputs).unwrap();
+        let loss = Loss::mse(&predictions, &targets).unwrap();
+        let mut grads = loss.backward().unwrap();
+
+        let pre_norm = trainer.compute_grad_norm(&grads).unwrap();
+        trainer.clip_gradients(&mut grads, 1e6).unwrap();
+        let post_norm = trainer.compute_grad_norm(&grads).unwrap();
+
+        assert!(
+            (post_norm - pre_norm).abs() < 1e-4,
+            "no-op clip should not change norm: pre={}, post={}",
+            pre_norm,
+            post_norm
+        );
+    }
+
+    #[test]
+    fn test_fit_converges_on_synthetic_series() {
+        use crate::config::KizzasiConfig;
+        use crate::dataloader::{DataLoaderConfig, TimeSeriesDataLoader};
+        use crate::training_core::TrainableSSM;
+        use scirs2_core::ndarray::Array2;
+
+        // Build a synthetic AR(1) time series: y[t] = 0.7 * y[t-1] + noise.
+        // The SSM should be able to fit at least some signal during a short
+        // training run, so the final epoch loss should be strictly less than
+        // the initial epoch loss.
+        let n_steps: usize = 200;
+        let n_features: usize = 1;
+        let mut raw = vec![0.0f32; n_steps * n_features];
+        raw[0] = 0.5;
+        // Deterministic "noise" via a small periodic perturbation so the test
+        // is reproducible without pulling in a PRNG dependency.
+        for t in 1..n_steps {
+            let phase = (t as f32) * 0.13;
+            let noise = 0.05 * phase.sin();
+            raw[t] = 0.7 * raw[t - 1] + noise;
+        }
+        let data = Array2::from_shape_vec((n_steps, n_features), raw).unwrap();
+
+        let dl_config = DataLoaderConfig::default()
+            .with_window_size(16)
+            .with_batch_size(4)
+            .with_horizon(16) // Match window so input/target seq lens match
+            .with_shuffle(false);
+        let loader = TimeSeriesDataLoader::new(data, dl_config).unwrap();
+
+        let model_config = KizzasiConfig::new()
+            .input_dim(n_features)
+            .output_dim(n_features)
+            .hidden_dim(8)
+            .state_dim(4)
+            .num_layers(1);
+
+        let training_config = TrainingConfig {
+            learning_rate: 1e-2,
+            epochs: 5,
+            batch_size: 4,
+            track_metrics: true,
+            early_stopping_patience: None,
+            grad_clip: Some(1.0),
+            ..Default::default()
+        };
+
+        let model = TrainableSSM::new(model_config, training_config.clone()).unwrap();
+        let mut trainer = Trainer::new(model, training_config).unwrap();
+
+        trainer.fit(loader, None, Loss::mse).unwrap();
+
+        // Verify that we recorded losses for each epoch and that the trend is
+        // downward.
+        let initial_loss = trainer.metrics.average_train_loss(0);
+        let final_loss = trainer.metrics.average_train_loss(4);
+
+        assert!(initial_loss.is_some(), "no initial epoch loss recorded");
+        assert!(final_loss.is_some(), "no final epoch loss recorded");
+
+        let initial = initial_loss.unwrap();
+        let final_l = final_loss.unwrap();
+
+        assert!(
+            initial.is_finite() && final_l.is_finite(),
+            "losses must be finite: initial={}, final={}",
+            initial,
+            final_l
+        );
+        assert!(
+            final_l < initial,
+            "fit() did not reduce loss: initial={}, final={}",
+            initial,
+            final_l
+        );
+
+        // The trainer must have stepped at least once per epoch.
+        assert!(trainer.current_step() > 0, "no training steps performed");
     }
 }

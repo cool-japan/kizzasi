@@ -300,6 +300,18 @@ impl QuadraticSubproblem {
         self.ub = Some(ub);
         self
     }
+
+    /// Add a per-element lower bound only (no upper bound)
+    pub fn with_lower_bound(mut self, lb: Array1<f32>) -> Self {
+        self.lb = Some(lb);
+        self
+    }
+
+    /// Add a per-element upper bound only (no lower bound)
+    pub fn with_upper_bound(mut self, ub: Array1<f32>) -> Self {
+        self.ub = Some(ub);
+        self
+    }
 }
 
 impl AdmmSubproblem for QuadraticSubproblem {
@@ -320,8 +332,16 @@ impl AdmmSubproblem for QuadraticSubproblem {
         // Clip to box if bounds are present
         let x = match (&self.lb, &self.ub) {
             (Some(lb), Some(ub)) => box_clip(&x, lb, ub),
-            (Some(lb), None) => x.mapv(|v| v.max(lb[0])),
-            (None, Some(ub)) => x.mapv(|v| v.min(ub[0])),
+            (Some(lb), None) => x
+                .iter()
+                .zip(lb.iter())
+                .map(|(&xi, &li)| xi.max(li))
+                .collect(),
+            (None, Some(ub)) => x
+                .iter()
+                .zip(ub.iter())
+                .map(|(&xi, &ui)| xi.min(ui))
+                .collect(),
             (None, None) => x,
         };
 
@@ -1103,6 +1123,70 @@ mod tests {
                 })
             ),
             "expected DimensionMismatch error"
+        );
+    }
+
+    // ─── 13. Lower-bound-only clipping is per-element ───────────────────
+
+    #[test]
+    fn test_quadratic_subproblem_lower_bound_only_elementwise() {
+        // Q = I_2, c = [-0.5, -3.0], lb = [1.0, 5.0], no ub
+        // z = [0, 0], u = [0, 0], rho = 1.0
+        // RHS = rho*(z-u) - c = [0.5, 3.0]
+        // (Q + rho*I) x = [0.5, 3.0]  =>  2x = [0.5, 3.0]  =>  x_free = [0.25, 1.5]
+        // Both below lb → clip element-wise: result = [1.0, 5.0]
+        // Bug would give: [1.0, 1.0] (lb[0] used for all elements)
+        let n = 2usize;
+        let q = eye(n, 1.0);
+        let c = Array1::from_vec(vec![-0.5f32, -3.0]);
+        let lb = Array1::from_vec(vec![1.0f32, 5.0]);
+        let sp = QuadraticSubproblem::new(q, c).with_lower_bound(lb);
+
+        let z = Array1::from_vec(vec![0.0f32, 0.0]);
+        let u = Array1::zeros(n);
+        let result = sp.solve(&z, &u, 1.0).expect("lower-bound-only solve");
+
+        assert!(
+            (result[0] - 1.0).abs() < 1e-3,
+            "result[0] should be clipped to lb[0]=1.0, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 5.0).abs() < 1e-3,
+            "result[1] should be clipped to lb[1]=5.0, got {} (bug gives 1.0)",
+            result[1]
+        );
+    }
+
+    // ─── 14. Upper-bound-only clipping is per-element ───────────────────
+
+    #[test]
+    fn test_quadratic_subproblem_upper_bound_only_elementwise() {
+        // Q = I_2, c = [-2.0, -4.0], ub = [3.0, 6.0], no lb
+        // z = [5.0, 10.0], u = [0, 0], rho = 1.0
+        // RHS = rho*(z-u) - c = [5.0, 10.0] - (-2.0, -4.0) = [7.0, 14.0]
+        // (Q + rho*I) x = [7, 14]  =>  2x = [7, 14]  =>  x_free = [3.5, 7.0]
+        // Both above ub → clip element-wise: result = [3.0, 6.0]
+        // Bug would give: [3.0, 3.0] (ub[0] used for all elements)
+        let n = 2usize;
+        let q = eye(n, 1.0);
+        let c = Array1::from_vec(vec![-2.0f32, -4.0]);
+        let ub = Array1::from_vec(vec![3.0f32, 6.0]);
+        let sp = QuadraticSubproblem::new(q, c).with_upper_bound(ub);
+
+        let z = Array1::from_vec(vec![5.0f32, 10.0]);
+        let u = Array1::zeros(n);
+        let result = sp.solve(&z, &u, 1.0).expect("upper-bound-only solve");
+
+        assert!(
+            (result[0] - 3.0).abs() < 1e-3,
+            "result[0] should be clipped to ub[0]=3.0, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 6.0).abs() < 1e-3,
+            "result[1] should be clipped to ub[1]=6.0, got {} (bug gives 3.0)",
+            result[1]
         );
     }
 }

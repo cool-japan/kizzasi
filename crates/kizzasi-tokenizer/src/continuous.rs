@@ -249,13 +249,13 @@ impl TrainableContinuousTokenizer {
         // Xavier initialization for encoder
         let enc_scale = (2.0 / (input_dim + embed_dim) as f32).sqrt();
         let encoder_init = Tensor::randn(0f32, 1.0, (input_dim, embed_dim), &device)?
-            .affine(0.0, enc_scale as f64)?;
+            .affine(enc_scale as f64, 0.0)?;
         let encoder_var = Var::from_tensor(&encoder_init)?;
 
         // Xavier initialization for decoder
         let dec_scale = (2.0 / (embed_dim + input_dim) as f32).sqrt();
         let decoder_init = Tensor::randn(0f32, 1.0, (embed_dim, input_dim), &device)?
-            .affine(0.0, dec_scale as f64)?;
+            .affine(dec_scale as f64, 0.0)?;
         let decoder_var = Var::from_tensor(&decoder_init)?;
 
         // Add variables to varmap
@@ -973,5 +973,44 @@ mod tests {
 
         // Cleanup
         std::fs::remove_file(&checkpoint_path).ok();
+    }
+
+    #[test]
+    fn test_xavier_init_encoder_not_constant() {
+        // With the bug (.affine(0.0, scale)), all encoder weights are the constant `enc_scale`.
+        // A single non-unit input then produces identical values in all output dimensions.
+        // With the fix (.affine(scale, 0.0)), weights are scale*N(0,1) — different per element.
+        let tokenizer = TrainableContinuousTokenizer::new(4, 8).unwrap();
+        let input = Array1::from_vec(vec![1.0f32, 0.0, 0.0, 0.0]);
+        let encoded = tokenizer.encode(&input).unwrap();
+        let max_val = encoded.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min_val = encoded.iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(
+            max_val - min_val > 1e-6,
+            "Encoder weights are constant (max={}, min={}): affine args are swapped",
+            max_val,
+            min_val
+        );
+    }
+
+    #[test]
+    fn test_xavier_init_two_instances_differ() {
+        // With constant weights, two independently constructed tokenizers produce
+        // identical encodings for the same input. With correct random init they differ.
+        let tok1 = TrainableContinuousTokenizer::new(4, 8).unwrap();
+        let tok2 = TrainableContinuousTokenizer::new(4, 8).unwrap();
+        let input = Array1::from_vec(vec![1.0f32, 0.5, 0.25, 0.125]);
+        let enc1 = tok1.encode(&input).unwrap();
+        let enc2 = tok2.encode(&input).unwrap();
+        let diff: f32 = enc1
+            .iter()
+            .zip(enc2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            diff > 1e-6,
+            "Two independently initialized tokenizers produce identical encodings (diff={}): weights are not random",
+            diff
+        );
     }
 }

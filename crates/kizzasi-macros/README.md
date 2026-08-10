@@ -9,8 +9,8 @@ This crate provides derive macros and procedural macro helpers for Kizzasi, enab
 ## Features
 
 - `#[derive(KizzasiConfig)]` - Automatic builder pattern generation for configurations
-- `#[derive(Preset)]` - Generate preset constructor functions
-- `#[derive(Instrumented)]` - Automatic metrics instrumentation
+- `#[derive(Preset)]` - Generate preset constructor functions. Note: preset attribute parsing and instrumented method auto-wrapping are slated for enhancement in a future release.
+- `#[derive(Instrumented)]` - Automatic metrics instrumentation. Note: preset attribute parsing and instrumented method auto-wrapping are slated for enhancement in a future release.
 
 ## Usage
 
@@ -18,7 +18,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kizzasi-macros = "0.2.1"
+kizzasi-macros = "0.2.2"
 ```
 
 Example:

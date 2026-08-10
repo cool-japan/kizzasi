@@ -1,9 +1,50 @@
 //! Pure Rust math utilities compatible with no_std
 //!
-//! Uses software floating point — no libm dependency by default.
-//! All functions operate on f32 and use compiler intrinsics available in core.
+//! Most operations are implemented locally as Taylor / minimax polynomials
+//! and only rely on `core`. A small handful (currently `sqrt`) genuinely
+//! need an FPU intrinsic or a software-float library, so they are routed
+//! through an internal `core_math` module which dispatches to libstd's
+//! `f32::sqrt` under the `std` feature and to `libm::sqrtf` under the
+//! `libm` feature.
 
 use core::f32::consts::LN_2;
+
+/// `f32` operations that are not directly available in `core`.
+///
+/// On `std` builds these forward to the corresponding `f32` methods (which
+/// in turn use the platform FPU or libstd's software-float). On `no_std`
+/// builds with the `libm` feature they forward to `libm`'s `sqrtf` /
+/// `roundf` family. When neither feature is enabled a crate-level
+/// `compile_error!` in `lib.rs` rejects the build, so the corresponding
+/// shim bodies are never compiled.
+#[cfg(any(feature = "std", feature = "libm"))]
+pub(crate) mod core_math {
+    /// Square root of a non-negative `f32`.
+    #[inline]
+    pub(crate) fn sqrt(x: f32) -> f32 {
+        #[cfg(feature = "std")]
+        {
+            f32::sqrt(x)
+        }
+        #[cfg(all(not(feature = "std"), feature = "libm"))]
+        {
+            libm::sqrtf(x)
+        }
+    }
+
+    /// Round an `f32` to the nearest integer, halves away from zero.
+    #[inline]
+    pub(crate) fn round(x: f32) -> f32 {
+        #[cfg(feature = "std")]
+        {
+            f32::round(x)
+        }
+        #[cfg(all(not(feature = "std"), feature = "libm"))]
+        {
+            libm::roundf(x)
+        }
+    }
+}
 
 /// Compute exp(x) via Taylor series with range reduction.
 ///
@@ -106,8 +147,9 @@ pub fn layer_norm(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
     let n = x.len() as f32;
     let mean = x.iter().sum::<f32>() / n;
     let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
-    // f32::sqrt is available as a compiler intrinsic in core (no libm needed)
-    let std_dev = (var + eps).sqrt();
+    // Routed through `core_math::sqrt` so the call works under both
+    // `std` (libstd's `f32::sqrt`) and `no_std + libm` (`libm::sqrtf`).
+    let std_dev = core_math::sqrt(var + eps);
     for (i, v) in x.iter_mut().enumerate() {
         let w = weight.get(i).copied().unwrap_or(1.0);
         let b = bias.get(i).copied().unwrap_or(0.0);

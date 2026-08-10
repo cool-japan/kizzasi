@@ -64,7 +64,7 @@ graph TB
         IO[kizzasi-io<br/>WebSocket/MQTT/Audio/Serial]
     end
     subgraph Token["Tokenization Layer"]
-        TOK[kizzasi-tokenizer<br/>VQ-VAE / μ-law / Linear]
+        TOK[kizzasi-tokenizer<br/>VQ-VAE / μ-law / Perceptual / PEAQ]
     end
     subgraph Core["Core SSM Engine"]
         CORE[kizzasi-core<br/>SIMD / Parallel Scan / GPU]
@@ -144,15 +144,16 @@ flowchart TD
 | [`kizzasi`](crates/kizzasi) | Unified facade with prelude and ergonomic API | ~7,400 |
 | [`kizzasi-core`](crates/kizzasi-core) | SSM engine, embeddings, SIMD optimizations, parallel scan | ~18,500 |
 | [`kizzasi-model`](crates/kizzasi-model) | Mamba/Mamba2, RWKV v5/v6/v7, S4/S4D, Transformer + training | ~39,200 |
-| [`kizzasi-tokenizer`](crates/kizzasi-tokenizer) | VQ-VAE, μ-law, quantizers, multi-scale tokenization | ~15,900 |
+| [`kizzasi-tokenizer`](crates/kizzasi-tokenizer) | VQ-VAE, μ-law, quantizers, multi-scale tokenization; multi-speaker, perceptual (Bark-scale), PEAQ quality evaluation | ~16,900 |
 | [`kizzasi-inference`](crates/kizzasi-inference) | Pipeline orchestration, sampling, batching, gRPC/REST | ~11,000 |
 | [`kizzasi-logic`](crates/kizzasi-logic) | Constraints, guardrails, projections, LTL/STL | ~20,400 |
 | [`kizzasi-io`](crates/kizzasi-io) | MQTT, Audio, WebSocket, Serial, File, DSP, Beamforming | ~18,500 |
 | [`kizzasi-embedded`](crates/kizzasi-embedded) | no_std SSM inference for edge devices | ~800 |
 | [`kizzasi-python`](crates/kizzasi-python) | Python bindings via PyO3/maturin | ~700 |
 | [`kizzasi-macros`](crates/kizzasi-macros) | Procedural macros for compile-time config | ~100 |
+| [`kizzasi-webgpu`](crates/kizzasi-webgpu) | WebGPU/WGSL GPU acceleration kernels (SSM scan, matvec, SiLU, RMS-norm) | ~400 |
 
-**Total: ~123,000+ lines of Rust code across 355 source files**
+**Total: ~140,000+ lines of Rust code across 414 source files**
 
 ---
 
@@ -498,8 +499,14 @@ Kizzasi is part of the COOLJAPAN scientific computing ecosystem:
 | [scirs2-core](https://crates.io/crates/scirs2-core) | Array operations, random, SIMD |
 | [scirs2-signal](https://crates.io/crates/scirs2-signal) | Signal processing algorithms |
 | [scirs2-fft](https://crates.io/crates/scirs2-fft) | Fast Fourier Transform |
-| [tensorlogic](https://crates.io/crates/tensorlogic) | Neuro-symbolic constraints |
+| [scirs2-linalg](https://crates.io/crates/scirs2-linalg) | Linear algebra |
+| [scirs2-series](https://crates.io/crates/scirs2-series) | Time-series utilities |
+| [tensorlogic-ir](https://crates.io/crates/tensorlogic-ir) | Neuro-symbolic constraints |
 | [candle-core](https://crates.io/crates/candle-core) | ML backend (GPU acceleration) |
+| [oxifft](https://crates.io/crates/oxifft) | Fast Fourier Transform |
+| [oxicode](https://crates.io/crates/oxicode) | Binary serialization |
+| [oxirs-core](https://crates.io/crates/oxirs-core) / [oxirs-gql](https://crates.io/crates/oxirs-gql) | RDF/GraphQL data layer |
+| [wgpu](https://crates.io/crates/wgpu) | GPU compute backend |
 
 See [KIZZASI_POLICY.md](KIZZASI_POLICY.md) for dependency guidelines.
 
@@ -508,16 +515,44 @@ See [KIZZASI_POLICY.md](KIZZASI_POLICY.md) for dependency guidelines.
 ## Project Statistics
 
 ```
-Language            Files        Lines         Code     Comments       Blanks
-───────────────────────────────────────────────────────────────────────────────
-Rust                  355      157,188      123,191        8,836       24,839
-TOML                   13          816          617           94          105
-Markdown               34        9,002            0        7,090        1,912
-Shell                   3          313          232           37           44
-───────────────────────────────────────────────────────────────────────────────
-Total                 410      166,123      123,033       16,117       26,973
+===============================================================================
+ Language            Files        Lines         Code     Comments       Blanks
+===============================================================================
+ Dockerfile              1           53           26           14           13
+ JavaScript              1          142          104           18           20
+ Makefile                1          191          135           28           28
+ Python                  7          503          347           45          111
+ Shell                   3          313          232           37           44
+ TOML                   15         1164          743          291          130
+ YAML                    1           41           38            0            3
+-------------------------------------------------------------------------------
+ HTML                    2           96           88            0            8
+ |- CSS                  2          103          103            0            0
+ |- JavaScript           2          266          209           22           35
+ (Total)                            465          400           22           43
+-------------------------------------------------------------------------------
+ Jupyter Notebooks       3            0            0            0            0
+ |- Markdown             3          169            1          127           41
+ |- Python               3          690          537           57           96
+ (Total)                            859          538          184          137
+-------------------------------------------------------------------------------
+ Markdown               40        11367            0         8752         2615
+ |- BASH                15          214          126           57           31
+ |- Dockerfile           1           19           19            0            0
+ |- Python               3           97           67           12           18
+ |- Rust                27         2673         1889          346          438
+ |- TOML                17          113           88           18            7
+ |- YAML                 1           27           25            0            2
+ (Total)                          14510         2214         9185         3111
+-------------------------------------------------------------------------------
+ Rust                  414       179123       140465        10842        27816
+ |- Markdown           408        23463          858        19105         3500
+ (Total)                         202586       141323        29947        31316
+===============================================================================
+ Total                 488       192993       142178        20027        30788
+===============================================================================
 
-Tests: 2,277 passing | Clippy: 0 warnings | Rustdoc: 0 warnings (strict)
+Tests: 2,567 passing (default features) / 2,744 passing (all-features) | Clippy: 0 warnings | Rustdoc: 0 warnings (strict)
 ```
 
 ---

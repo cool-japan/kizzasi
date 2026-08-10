@@ -117,8 +117,9 @@ impl S5Block {
     fn new(hidden_dim: usize, state_dim: usize, dt: f32) -> Self {
         let mut rng = rng();
 
-        // Initialize log_a with uniform spacing (simplified vs S4's HiPPO)
-        let log_a = Array1::from_shape_fn(state_dim, |i| -((i + 1) as f32).ln());
+        // Initialize log_a as HiPPO-LegS diagonal magnitudes: log|(-(2n+1)/2)|
+        // A[n] = -(2n+1)/2, storing log of absolute value so A[n] = -exp(log_a[n]) < 0
+        let log_a = Array1::from_shape_fn(state_dim, |i| ((2 * i + 1) as f32 / 2.0).ln());
 
         // Initialize B and C with random values
         let scale_b = (2.0 / (state_dim + hidden_dim) as f32).sqrt();
@@ -135,8 +136,18 @@ impl S5Block {
         let d_vec = Array1::from_shape_fn(hidden_dim, |_| rng.random::<f32>() * 0.01);
 
         // Discretize using zero-order hold (ZOH)
-        let a_bar = log_a.mapv(|log_a_i| (dt * log_a_i.exp()).exp());
-        let b_bar = b_matrix.clone() * dt;
+        // A[i] = -exp(log_a[i]) < 0, so a_bar[i] = exp(dt * A[i]) in (0, 1)
+        // B̄[i,:] = B[i,:] * (1 - a_bar[i]) / (-A[i])  — proper ZOH B scale
+        let mut a_bar = Array1::zeros(state_dim);
+        let mut b_bar = Array2::zeros(b_matrix.raw_dim());
+        for i in 0..state_dim {
+            let a_i = -log_a[i].exp(); // negative: a_i < 0
+            a_bar[i] = (dt * a_i).exp(); // 0 < a_bar < 1
+            let scale = (1.0 - a_bar[i]) / (-a_i);
+            for j in 0..hidden_dim {
+                b_bar[[i, j]] = b_matrix[[i, j]] * scale;
+            }
+        }
 
         let state = Array1::zeros(state_dim);
 
@@ -392,5 +403,75 @@ mod tests {
         let mut config = S5Config::new(32, 64, 2);
         config.state_dim = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_s5_block_a_bar_stable() {
+        // After init, all a_bar values must be in (0, 1) — not > 1
+        let block = S5Block::new(8, 16, 0.01);
+        for &val in block.a_bar.iter() {
+            assert!(
+                val > 0.0 && val < 1.0,
+                "a_bar = {} not in (0,1) — SSM is unstable",
+                val
+            );
+        }
+    }
+
+    #[test]
+    fn test_s5_block_state_decays() {
+        // Zero-input SSM from nonzero state must not grow
+        let mut block = S5Block::new(8, 16, 0.01);
+        // Set state to nonzero
+        block.state = Array1::ones(16);
+        let initial_norm: f32 = block.state.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // Run 200 zero-input steps
+        let zero_input = Array1::zeros(8);
+        for _ in 0..200 {
+            let new_state = &block.a_bar * &block.state + block.b_bar.dot(&zero_input);
+            block.state = new_state;
+        }
+        let final_norm: f32 = block.state.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            final_norm <= initial_norm,
+            "State grew from {} to {} — unstable!",
+            initial_norm,
+            final_norm
+        );
+    }
+
+    #[test]
+    fn test_s5_block_hippo_log_a() {
+        // log_a[i] must equal ((2i+1)/2).ln()
+        let block = S5Block::new(8, 16, 0.01);
+        for (i, &val) in block.log_a.iter().enumerate() {
+            let expected = ((2 * i + 1) as f32 / 2.0).ln();
+            assert!(
+                (val - expected).abs() < 1e-5,
+                "log_a[{}]={} expected {}",
+                i,
+                val,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_s5_block_a_bar_matches_zoh_formula() {
+        // a_bar[i] must match exp(dt * (-exp(log_a[i])))
+        let dt = 0.01_f32;
+        let block = S5Block::new(8, 16, dt);
+        for (i, (&log_a_val, &a_bar_val)) in block.log_a.iter().zip(block.a_bar.iter()).enumerate()
+        {
+            let a_i = -log_a_val.exp();
+            let expected = (dt * a_i).exp();
+            assert!(
+                (a_bar_val - expected).abs() < 1e-5,
+                "a_bar[{}]={} expected {}",
+                i,
+                a_bar_val,
+                expected
+            );
+        }
     }
 }

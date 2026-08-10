@@ -144,7 +144,7 @@ impl ShiftSSM {
 
         // Compute weighted sum of shifted inputs
         let mut output = Array1::zeros(self.head_dim);
-        for (i, hist_x) in self.history.iter().enumerate() {
+        for (i, hist_x) in self.history.iter().rev().enumerate() {
             let weight_row = self.shift_weights.row(i);
             output = output + hist_x * &weight_row;
         }
@@ -486,5 +486,104 @@ mod tests {
         model.reset();
         let result = model.set_states(states);
         assert!(result.is_ok());
+    }
+
+    /// Verifies that `shift_weights.row(0)` multiplies the CURRENT (most-recent) input.
+    ///
+    /// We set row(0) = [1, 0, 0, 0] and all other rows to zero, then feed three
+    /// distinct inputs `a`, `b`, `c`.  After the third step the buffer is full and
+    /// `output[0]` must equal `c[0]` (the current input, weighted by row 0 = 1).
+    #[test]
+    fn test_shift_weight0_multiplies_current() {
+        let head_dim = 4;
+        let shift_distance = 4;
+        let mut ssm = ShiftSSM::new(head_dim, shift_distance);
+
+        // Zero all weights, then set row(0)[0] = 1.0 so that only the current
+        // input's first element contributes to output[0].
+        ssm.shift_weights = Array2::zeros((shift_distance, head_dim));
+        ssm.shift_weights[[0, 0]] = 1.0;
+
+        let a = Array1::from_vec(vec![2.0_f32, 0.0, 0.0, 0.0]);
+        let b = Array1::from_vec(vec![5.0_f32, 0.0, 0.0, 0.0]);
+        let c = Array1::from_vec(vec![9.0_f32, 0.0, 0.0, 0.0]);
+
+        let _out_a = ssm.forward(&a);
+        let _out_b = ssm.forward(&b);
+        let out_c = ssm.forward(&c);
+
+        // row(0) must map to x[t] = c, so output[0] == c[0] == 9.0
+        assert!(
+            (out_c[0] - c[0]).abs() < 1e-6,
+            "row(0) should multiply current input c, got {} expected {}",
+            out_c[0],
+            c[0]
+        );
+    }
+
+    /// Verifies that `shift_weights.row(1)` multiplies the PREVIOUS (one-step-ago) input.
+    ///
+    /// We set row(1) = [1, 0, 0, 0] and all other rows to zero, then feed two
+    /// distinct inputs `a`, `b`.  After the second step `output[0]` must equal
+    /// `a[0]` (one step in the past, weighted by row 1 = 1).
+    #[test]
+    fn test_shift_weight1_multiplies_previous() {
+        let head_dim = 4;
+        let shift_distance = 4;
+        let mut ssm = ShiftSSM::new(head_dim, shift_distance);
+
+        // Zero all weights, then set row(1)[0] = 1.0 so that only the element
+        // that is one step old contributes to output[0].
+        ssm.shift_weights = Array2::zeros((shift_distance, head_dim));
+        ssm.shift_weights[[1, 0]] = 1.0;
+
+        let a = Array1::from_vec(vec![3.0_f32, 0.0, 0.0, 0.0]);
+        let b = Array1::from_vec(vec![7.0_f32, 0.0, 0.0, 0.0]);
+
+        let _out_a = ssm.forward(&a);
+        let out_b = ssm.forward(&b);
+
+        // row(1) must map to x[t-1] = a, so output[0] == a[0] == 3.0
+        assert!(
+            (out_b[0] - a[0]).abs() < 1e-6,
+            "row(1) should multiply previous input a, got {} expected {}",
+            out_b[0],
+            a[0]
+        );
+    }
+
+    /// Verifies that during warm-up (buffer has only one element) `row(0)` still
+    /// consistently multiplies the single available (current) input.
+    ///
+    /// With `shift_distance=4` and only one step taken, the buffer holds [x].
+    /// After `.rev()`, index 0 of the reversed iterator is x (the only element),
+    /// so the output must equal `x * row(0)` element-wise.
+    #[test]
+    fn test_shift_warmup_row0_is_current() {
+        let head_dim = 4;
+        let shift_distance = 4;
+        let mut ssm = ShiftSSM::new(head_dim, shift_distance);
+
+        // Give row(0) a known non-trivial value and zero every other row.
+        ssm.shift_weights = Array2::zeros((shift_distance, head_dim));
+        let row0_val = 2.5_f32;
+        for j in 0..head_dim {
+            ssm.shift_weights[[0, j]] = row0_val;
+        }
+
+        let x_val = 1.5_f32;
+        let x = Array1::from_vec(vec![x_val; head_dim]);
+        let out = ssm.forward(&x);
+
+        let expected = x_val * row0_val;
+        for j in 0..head_dim {
+            assert!(
+                (out[j] - expected).abs() < 1e-6,
+                "warm-up: out[{}] = {} expected {}",
+                j,
+                out[j],
+                expected
+            );
+        }
     }
 }

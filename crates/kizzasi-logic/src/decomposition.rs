@@ -179,17 +179,17 @@ impl ConsensusADMM {
 
         // Step 3: Update dual variables uᵢ
         let mut primal_residual = 0.0f32;
-        let mut dual_residual = 0.0f32;
 
+        // Per Boyd et al. (2010), the dual residual is ρ‖z^{k+1} - z^k‖ — a single
+        // vector norm computed once, not accumulated per block.
         let z_diff = &z_new - &self.global_var;
+        let dual_sq: f32 = z_diff.iter().map(|&x| x * x).sum();
         for i in 0..self.num_blocks {
             let xi_minus_z = &self.local_vars[i] - &z_new;
             self.dual_vars[i] = &self.dual_vars[i] + &xi_minus_z;
-
-            // Compute residuals
             primal_residual += xi_minus_z.iter().map(|&x| x * x).sum::<f32>();
-            dual_residual += z_diff.iter().map(|&x| x * x).sum::<f32>();
         }
+        let dual_residual = dual_sq;
 
         self.global_var = z_new;
 
@@ -741,11 +741,17 @@ impl BendersDecomposition {
                     coefficients,
                     ..
                 } => {
-                    // Ensure feasibility cut is satisfied
-                    let cut_value = constant + coefficients.dot(&x);
+                    // Ensure feasibility cut: constant + c·x ≥ 0
+                    let cut_value = *constant + coefficients.dot(&x);
                     if cut_value < 0.0 {
-                        // Adjust x to satisfy cut (simplified)
-                        x = x.mapv(|v| v + 0.1);
+                        // Minimum-norm projected gradient step to satisfy the cut.
+                        // x' = x + α·c / ||c||²  where α = -cut_value + margin
+                        let c_sq_norm: f32 = coefficients.dot(coefficients);
+                        if c_sq_norm > 1e-12 {
+                            let alpha = (-cut_value + 1e-6) / c_sq_norm;
+                            x = &x + &(coefficients * alpha);
+                        }
+                        // If c_sq_norm ≈ 0, the cut has zero gradient — cannot adjust; leave x unchanged.
                     }
                 }
             }
@@ -1021,5 +1027,136 @@ mod tests {
         };
         hier.add_level(level);
         assert_eq!(hier.num_levels(), 1);
+    }
+
+    #[test]
+    fn test_benders_feasibility_cut_satisfied_no_change() {
+        // Cut: 1.0 + [1,0,0]·x >= 0.  At x0=zeros(3) this equals 1.0 >= 0: already satisfied.
+        // solve_master should not alter x away from zero; the cut must remain satisfied.
+        let mut benders = BendersDecomposition::new(3, 2);
+        let ray = Array1::from_vec(vec![0.0, 0.0]);
+        let constant = 1.0f32;
+        let coefficients = Array1::from_vec(vec![1.0f32, 0.0, 0.0]);
+        benders.add_feasibility_cut(ray, constant, coefficients.clone());
+
+        let objective = Array1::from_vec(vec![1.0f32, 1.0, 1.0]);
+        let (solution, _lower_bound) = benders.solve_master(&objective).unwrap();
+
+        let cut_value = constant + coefficients.dot(&solution);
+        assert!(
+            cut_value >= -1e-5,
+            "Feasibility cut must be satisfied; cut_value = {}",
+            cut_value
+        );
+    }
+
+    #[test]
+    fn test_benders_feasibility_cut_violated_fixed() {
+        // Cut: -1.0 + [1,0,0]·x >= 0.  At x0=zeros(3) this equals -1.0 < 0: violated.
+        // After the fix, solve_master projects x along [1,0,0] to exactly restore feasibility.
+        let mut benders = BendersDecomposition::new(3, 2);
+        let ray = Array1::from_vec(vec![0.0, 0.0]);
+        let constant = -1.0f32;
+        let coefficients = Array1::from_vec(vec![1.0f32, 0.0, 0.0]);
+        benders.add_feasibility_cut(ray, constant, coefficients.clone());
+
+        let objective = Array1::from_vec(vec![1.0f32, 1.0, 1.0]);
+        let (solution, _lower_bound) = benders.solve_master(&objective).unwrap();
+
+        let cut_value = constant + coefficients.dot(&solution);
+        assert!(
+            cut_value >= -1e-5,
+            "Violated feasibility cut must be fixed by projected gradient step; cut_value = {}",
+            cut_value
+        );
+    }
+
+    #[test]
+    fn test_benders_multiple_cuts() {
+        // Two orthogonal feasibility cuts:
+        //   Cut A: -0.5 + [1,0,0]·x >= 0   (requires x[0] >= 0.5)
+        //   Cut B: -0.3 + [0,1,0]·x >= 0   (requires x[1] >= 0.3)
+        // Both are violated at x0=zeros(3). solve_master processes cuts sequentially,
+        // so the final x must satisfy both cuts (they are independent/orthogonal).
+        let mut benders = BendersDecomposition::new(3, 2);
+
+        let constant_a = -0.5f32;
+        let coefficients_a = Array1::from_vec(vec![1.0f32, 0.0, 0.0]);
+        benders.add_feasibility_cut(
+            Array1::from_vec(vec![0.0, 0.0]),
+            constant_a,
+            coefficients_a.clone(),
+        );
+
+        let constant_b = -0.3f32;
+        let coefficients_b = Array1::from_vec(vec![0.0f32, 1.0, 0.0]);
+        benders.add_feasibility_cut(
+            Array1::from_vec(vec![0.0, 0.0]),
+            constant_b,
+            coefficients_b.clone(),
+        );
+
+        let objective = Array1::from_vec(vec![1.0f32, 1.0, 1.0]);
+        let (solution, _lower_bound) = benders.solve_master(&objective).unwrap();
+
+        // No panic must occur; both cuts should be approximately satisfied
+        let cut_value_a = constant_a + coefficients_a.dot(&solution);
+        let cut_value_b = constant_b + coefficients_b.dot(&solution);
+        assert!(
+            cut_value_a >= -1e-5,
+            "Cut A must be satisfied; cut_value_a = {}",
+            cut_value_a
+        );
+        assert!(
+            cut_value_b >= -1e-5,
+            "Cut B must be satisfied; cut_value_b = {}",
+            cut_value_b
+        );
+    }
+
+    #[test]
+    fn test_admm_dual_residual_single_block_baseline() {
+        // With num_blocks=1 the old and new code agree (loop runs once → same result).
+        // Verifies the fix doesn't break the single-block case.
+        // z starts at 0, local_update returns [3, 4], so z_new = [3, 4], z_diff = [3, 4].
+        // Expected dual_res = rho * sqrt(9+16) = 1.0 * 5.0 = 5.0.
+        let config = ADMMConfig {
+            rho: 1.0,
+            adaptive_rho: false,
+            ..ADMMConfig::default()
+        };
+        let mut admm = ConsensusADMM::new(1, 2, config);
+        let local_val = Array1::from_vec(vec![3.0f32, 4.0]);
+        let (_, dual_res) = admm.iterate(|_, _, _, _| local_val.clone());
+        assert!(
+            (dual_res - 5.0f32).abs() < 1e-4,
+            "Single-block dual residual should be rho*||z_diff||=5.0, got {}",
+            dual_res
+        );
+    }
+
+    #[test]
+    fn test_admm_dual_residual_multi_block_not_scaled() {
+        // Discriminating: with num_blocks=3 the bug multiplies z_diff‖² by 3, giving
+        // dual_res = rho * sqrt(3) * ‖z_diff‖ instead of rho * ‖z_diff‖.
+        // Setup: all local_update_fn return [1, 0], dual_vars = 0, z_old = 0.
+        // → z_new = mean([1,0],[1,0],[1,0]) = [1, 0], z_diff = [1, 0].
+        // Expected dual_res = 2.0 * 1.0 = 2.0 (not 2.0 * sqrt(3) ≈ 3.464).
+        let config = ADMMConfig {
+            rho: 2.0,
+            adaptive_rho: false,
+            ..ADMMConfig::default()
+        };
+        let mut admm = ConsensusADMM::new(3, 2, config);
+        let local_val = Array1::from_vec(vec![1.0f32, 0.0]);
+        let (_, dual_res) = admm.iterate(|_, _, _, _| local_val.clone());
+        let expected = 2.0f32;
+        assert!(
+            (dual_res - expected).abs() < 1e-4,
+            "Multi-block dual residual must be rho*||z_diff||={}, got {} (bug: sqrt(3)*rho*||z_diff||≈{})",
+            expected,
+            dual_res,
+            expected * 3.0f32.sqrt()
+        );
     }
 }

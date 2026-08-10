@@ -96,6 +96,18 @@ impl EfficientMultiHeadAttention {
         let (seq_len, hidden_dim) = x.dim();
         let num_heads = self.config.num_heads;
         let head_dim = hidden_dim / num_heads;
+        // Per-call span for the chunked multi-head attention forward pass.
+        // We skip `self` and `x` so we don't try to format the projection
+        // matrices and input tensor (large, no Debug required).
+        let _span = tracing::debug_span!(
+            "EfficientMultiHeadAttention::forward",
+            seq_len = seq_len,
+            hidden_dim = hidden_dim,
+            num_heads = num_heads,
+            head_dim = head_dim,
+            chunk_size = self.config.chunk_size,
+        )
+        .entered();
 
         // Project to Q, K, V
         let q = x.dot(&self.wq);
@@ -265,6 +277,16 @@ impl FusedAttentionKernel {
         let (seq_len_q, dim) = q.dim();
         let (seq_len_k, _) = k.dim();
         let scale = (dim as f32).sqrt();
+        // Top-level span for the sequential fused attention kernel. Records
+        // shapes so users can attribute latency in their inference traces.
+        let _span = tracing::debug_span!(
+            "FusedAttentionKernel::forward",
+            seq_len_q = seq_len_q,
+            seq_len_k = seq_len_k,
+            dim = dim,
+            causal = causal,
+        )
+        .entered();
 
         let mut output = Array2::zeros((seq_len_q, dim));
 
@@ -311,66 +333,75 @@ impl FusedAttentionKernel {
         Ok(output)
     }
 
-    /// Sequential version of fused attention (parallel version removed due to rayon dependency)
+    /// Parallel version of fused attention.
     ///
-    /// For now, this is identical to `forward` but kept for API compatibility.
+    /// Each output row (one per query position) is computed independently and
+    /// in parallel via `scirs2_core::parallel_ops` (which dispatches to rayon
+    /// when the `parallel` feature is enabled, per the KIZZASI_POLICY).
+    ///
+    /// Produces results identical to [`Self::forward`] up to floating-point
+    /// rounding (row computations are independent, so summation order is
+    /// preserved within each row).
     pub fn forward_parallel(
         q: &Array2<f32>,
         k: &Array2<f32>,
         v: &Array2<f32>,
         causal: bool,
     ) -> CoreResult<Array2<f32>> {
-        // Use sequential version for now
-        // TODO: Add true parallel implementation when rayon support is available in scirs2
-        Self::forward(q, k, v, causal)
-    }
+        use scirs2_core::parallel_ops::{IntoParallelIterator, ParallelIterator};
 
-    #[allow(dead_code)]
-    fn forward_parallel_internal(
-        q: &Array2<f32>,
-        k: &Array2<f32>,
-        v: &Array2<f32>,
-        causal: bool,
-    ) -> CoreResult<Array2<f32>> {
         let (seq_len_q, dim) = q.dim();
         let (seq_len_k, _) = k.dim();
         let scale = (dim as f32).sqrt();
+        // Sibling span for the rayon-parallel kernel. Named separately from
+        // FusedAttentionKernel::forward so the two paths show up as
+        // distinct entries in flame graphs.
+        let _span = tracing::debug_span!(
+            "FusedAttentionKernel::forward_parallel",
+            seq_len_q = seq_len_q,
+            seq_len_k = seq_len_k,
+            dim = dim,
+            causal = causal,
+        )
+        .entered();
 
-        // Process positions sequentially for now
-        let rows: Vec<Array1<f32>> = (0..seq_len_q)
+        // Compute each output row in parallel. We materialize rows as Vec<f32>
+        // (rather than Array1<f32>) to keep the parallel closure cheap and
+        // avoid any ndarray internal-state contention across threads.
+        let rows: Vec<Vec<f32>> = (0..seq_len_q)
+            .into_par_iter()
             .map(|i| {
                 let q_vec = q.row(i);
                 let k_end = if causal { i + 1 } else { seq_len_k };
 
-                // Compute scores
-                let mut scores = Array1::zeros(k_end);
+                // Compute scores with numerical-stability tracking.
+                let mut scores: Vec<f32> = Vec::with_capacity(k_end);
                 let mut max_score = f32::NEG_INFINITY;
-
                 for j in 0..k_end {
                     let k_vec = k.row(j);
                     let score = q_vec.dot(&k_vec) / scale;
-                    scores[j] = score;
-                    max_score = max_score.max(score);
-                }
-
-                // Softmax
-                let mut sum = 0.0f32;
-                for j in 0..k_end {
-                    scores[j] = numerics::safe_exp(scores[j] - max_score);
-                    sum += scores[j];
-                }
-
-                if sum > 0.0 {
-                    for j in 0..k_end {
-                        scores[j] /= sum;
+                    scores.push(score);
+                    if score > max_score {
+                        max_score = score;
                     }
                 }
 
-                // Weighted sum
-                let mut output_row = Array1::zeros(dim);
-                for j in 0..k_end {
+                // Softmax with shifted exponent.
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = numerics::safe_exp(*s - max_score);
+                    sum += *s;
+                }
+                if sum > 0.0 {
+                    for s in scores.iter_mut() {
+                        *s /= sum;
+                    }
+                }
+
+                // Weighted sum of values.
+                let mut output_row = vec![0.0f32; dim];
+                for (j, weight) in scores.iter().enumerate() {
                     let v_vec = v.row(j);
-                    let weight = scores[j];
                     for d in 0..dim {
                         output_row[d] += weight * v_vec[d];
                     }
@@ -380,10 +411,14 @@ impl FusedAttentionKernel {
             })
             .collect();
 
-        // Stack rows into output matrix
+        // Stack rows into output matrix. This stitch step is sequential but
+        // pure-write into disjoint rows, so it is O(seq_len_q * dim) and not
+        // a bottleneck.
         let mut output = Array2::zeros((seq_len_q, dim));
         for (i, row) in rows.iter().enumerate() {
-            output.row_mut(i).assign(row);
+            for d in 0..dim {
+                output[[i, d]] = row[d];
+            }
         }
 
         Ok(output)
@@ -495,6 +530,49 @@ mod tests {
         let diff = (&output_seq - &output_par).mapv(|x| x.abs()).sum();
 
         assert!(diff < 1e-3, "Sequential and parallel outputs should match");
+    }
+
+    #[test]
+    fn test_forward_parallel_matches_sequential() {
+        // Causal fused attention, seq_len=64, dim=32. We use deterministic
+        // (non-random) inputs so the parallel and sequential paths can be
+        // compared directly with a tight tolerance.
+        let seq_len = 64usize;
+        let dim = 32usize;
+
+        let q = Array2::from_shape_fn((seq_len, dim), |(i, j)| {
+            ((i * 13 + j * 5) % 97) as f32 / 97.0 - 0.5
+        });
+        let k = Array2::from_shape_fn((seq_len, dim), |(i, j)| {
+            ((i * 11 + j * 7) % 89) as f32 / 89.0 - 0.5
+        });
+        let v = Array2::from_shape_fn((seq_len, dim), |(i, j)| {
+            ((i * 17 + j * 3) % 83) as f32 / 83.0 - 0.5
+        });
+
+        let seq_out = FusedAttentionKernel::forward(&q, &k, &v, true).unwrap();
+        let par_out = FusedAttentionKernel::forward_parallel(&q, &k, &v, true).unwrap();
+
+        assert_eq!(seq_out.dim(), (seq_len, dim));
+        assert_eq!(par_out.dim(), (seq_len, dim));
+
+        // Each output row is computed independently, with identical operation
+        // ordering inside the row, so results should match up to floating
+        // point noise from independent thread execution (none expected here
+        // since computations per row are deterministic).
+        for ((i, j), pv) in par_out.indexed_iter() {
+            let sv = seq_out[[i, j]];
+            let diff = (pv - sv).abs();
+            assert!(
+                diff < 1e-6,
+                "row {} col {}: par={} seq={} diff={}",
+                i,
+                j,
+                pv,
+                sv,
+                diff
+            );
+        }
     }
 
     #[test]

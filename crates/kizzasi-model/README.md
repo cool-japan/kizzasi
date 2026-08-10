@@ -44,6 +44,35 @@ let large_model = Mamba::large(64, 1024); // High accuracy
 | Transformer | O(n²) | High | Short contexts |
 | Hybrid | O(n) | Medium | Balanced performance |
 
+## TensorLogic-IR Integration
+
+v0.2.2 adds symbolic constraint compilation via TensorLogic-IR expressions. Constraints built with `kizzasi-logic`'s `TLExpr` can be compiled to executable `CompiledConstraint` objects for model output validation.
+
+```rust
+use kizzasi_model::tensorlogic_bridge::{constraint_from_tl_expr, compile_constraints};
+use kizzasi_logic::TLExpr;
+
+// Compile a single constraint from a TLExpr
+let expr = TLExpr::bounded("logits", 0.0, 1.0); // values in [0, 1]
+let constraint = constraint_from_tl_expr("output_range", &expr, 2)?;
+
+// Evaluate the compiled constraint against model output
+let output = model.forward(&input)?;
+constraint.evaluate(&output)?;
+
+// Batch-compile multiple constraints at once
+let specs = vec![
+    ("output_range",  TLExpr::bounded("logits", 0.0, 1.0), 2),
+    ("seq_len_bound", TLExpr::max_dim("seq", 512),          1),
+];
+let constraints = compile_constraints(&specs)?;
+for c in &constraints {
+    c.evaluate(&output)?;
+}
+```
+
+`constraint_from_tl_expr(name, expr, num_dims)` compiles a single named expression into a `CompiledConstraint`. `compile_constraints` accepts a slice of `(name, TLExpr, num_dims)` tuples and returns all compiled constraints in one call, which is more efficient for validating several invariants simultaneously.
+
 ## Mamba SSM Forward Pass
 
 ```mermaid

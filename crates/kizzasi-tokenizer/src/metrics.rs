@@ -499,15 +499,131 @@ impl PerceptualMetrics {
             0.0
         };
 
-        // Weighted SNR (simplified - in practice would use psychoacoustic model)
-        // Here we just weight lower frequencies more heavily
-        let weighted_snr_db = segmental_snr_db; // Placeholder
+        // Frequency-domain A-weighted SNR (IEC 61672-1)
+        let weighted_snr_db = spectral_weighted_snr(
+            original.as_slice().unwrap_or(&[]),
+            reconstructed.as_slice().unwrap_or(&[]),
+            segment_len,
+        );
 
         Ok(Self {
             segmental_snr_db,
             weighted_snr_db,
         })
     }
+}
+
+/// IEC 61672-1 A-weighting transfer function (unnormalized).
+///
+/// Returns the raw amplitude ratio for the given frequency in Hz.
+/// Zero is returned for non-positive frequencies.
+fn a_weighting(f_hz: f32) -> f32 {
+    if f_hz <= 0.0 {
+        return 0.0;
+    }
+    let f2 = f_hz * f_hz;
+    // Pole/zero frequencies squared from IEC 61672-1
+    let f1_sq = 20.6_f32 * 20.6_f32; // 20.6 Hz
+    let f2_sq = 107.7_f32 * 107.7_f32; // 107.7 Hz
+    let f3_sq = 737.9_f32 * 737.9_f32; // 737.9 Hz
+    let f4_sq = 12200.0_f32 * 12200.0_f32; // 12200 Hz
+    let num = f4_sq * f2 * f2;
+    let den = (f2 + f1_sq) * (f2 + f4_sq) * ((f2 + f2_sq) * (f2 + f3_sq)).sqrt();
+    (num / den).max(0.0)
+}
+
+/// Compute frequency-domain A-weighted SNR by processing the signal in
+/// non-overlapping `segment_len`-sample windows.
+///
+/// A DFT is computed per segment (capped at 256 bins to keep O(N²) tractable),
+/// each spectral bin is weighted by the IEC 61672-1 A-weighting curve evaluated
+/// at `f = k * 44100 / N` Hz, and the resulting weighted signal/noise powers
+/// are accumulated before converting to dB.
+fn spectral_weighted_snr(orig: &[f32], recon: &[f32], segment_len: usize) -> f32 {
+    if orig.is_empty() || recon.is_empty() || segment_len == 0 {
+        return 0.0;
+    }
+
+    let n = orig.len().min(recon.len());
+    let num_segments = n / segment_len;
+    if num_segments == 0 {
+        return 0.0;
+    }
+
+    // Cap DFT bin loop to 256 to keep O(N²) tractable for large segments.
+    let actual_bins = (segment_len / 2 + 1).min(256);
+
+    let mut per_segment_snrs: Vec<f32> = Vec::with_capacity(num_segments);
+
+    for seg_idx in 0..num_segments {
+        let start = seg_idx * segment_len;
+        let end = start + segment_len;
+        let orig_seg = &orig[start..end];
+        let recon_seg = &recon[start..end];
+        let n_f32 = segment_len as f32;
+
+        // Pre-compute difference signal for the noise DFT
+        let diff_seg: Vec<f32> = orig_seg
+            .iter()
+            .zip(recon_seg.iter())
+            .map(|(o, r)| o - r)
+            .collect();
+
+        let mut weighted_signal_power = 0.0_f32;
+        let mut weighted_noise_power = 0.0_f32;
+        let mut total_weight = 0.0_f32;
+
+        // Also accumulate unweighted sums for the zero-weight fallback path
+        let mut unweighted_signal_power = 0.0_f32;
+        let mut unweighted_noise_power = 0.0_f32;
+
+        for k in 0..actual_bins {
+            let mut x_re = 0.0_f32;
+            let mut x_im = 0.0_f32;
+            let mut d_re = 0.0_f32;
+            let mut d_im = 0.0_f32;
+
+            for (t, (&o, &d)) in orig_seg.iter().zip(diff_seg.iter()).enumerate() {
+                let angle = 2.0 * PI * (k as f32) * (t as f32) / n_f32;
+                let (sin_a, cos_a) = angle.sin_cos();
+                x_re += o * cos_a;
+                x_im += -o * sin_a;
+                d_re += d * cos_a;
+                d_im += -d * sin_a;
+            }
+
+            let signal_power_k = x_re * x_re + x_im * x_im;
+            let noise_power_k = d_re * d_re + d_im * d_im;
+
+            let f_hz = (k as f32) * 44100.0 / n_f32;
+            let w = a_weighting(f_hz);
+
+            weighted_signal_power += w * signal_power_k;
+            weighted_noise_power += w * noise_power_k;
+            total_weight += w;
+
+            unweighted_signal_power += signal_power_k;
+            unweighted_noise_power += noise_power_k;
+        }
+
+        // Fallback to unweighted when all A-weights are zero
+        // (happens for extremely short segments whose bins are all sub-20 Hz DC)
+        let (sp, np) = if total_weight <= 0.0 {
+            (unweighted_signal_power, unweighted_noise_power)
+        } else {
+            (weighted_signal_power, weighted_noise_power)
+        };
+
+        if sp > 0.0 && np > 0.0 {
+            per_segment_snrs.push(10.0 * (sp / np).log10());
+        }
+    }
+
+    if per_segment_snrs.is_empty() {
+        return 0.0;
+    }
+
+    per_segment_snrs.iter().sum::<f32>() / per_segment_snrs.len() as f32
 }
 
 use scirs2_core::ndarray::s;
@@ -627,5 +743,104 @@ mod tests {
 
         let bd = curve2.bd_rate(&curve1);
         assert!(bd > 0.0); // curve2 uses more rate
+    }
+
+    // --- A-weighting and spectral weighted SNR tests ---
+
+    #[test]
+    fn test_a_weighting_zero_dc() {
+        assert_eq!(a_weighting(0.0), 0.0);
+        assert_eq!(a_weighting(-1.0), 0.0);
+    }
+
+    #[test]
+    fn test_a_weighting_peaks_midrange() {
+        // A-weighting should favour mid-range frequencies over sub-bass
+        let w100 = a_weighting(100.0);
+        let w1000 = a_weighting(1000.0);
+        let w3000 = a_weighting(3000.0);
+        assert!(
+            w1000 > w100,
+            "Expected a_weighting(1000) > a_weighting(100), got {} vs {}",
+            w1000,
+            w100
+        );
+        assert!(
+            w3000 > w100,
+            "Expected a_weighting(3000) > a_weighting(100), got {} vs {}",
+            w3000,
+            w100
+        );
+    }
+
+    #[test]
+    fn test_weighted_snr_differs_from_segmental() {
+        // Low-frequency sine: 128 samples at a normalised frequency so that
+        // almost all energy sits in the lowest non-DC DFT bins, which are
+        // heavily de-emphasised by A-weighting.  Add noise concentrated in
+        // the first few samples — segmental SNR sees this noise equally across
+        // all segments, but A-weighted SNR will see a different power balance.
+        let n = 128usize;
+        let orig: Vec<f32> = (0..n)
+            .map(|i| {
+                // Very low frequency: one full cycle over 128 samples → bin 1
+                (2.0 * PI * i as f32 / n as f32).sin()
+            })
+            .collect();
+
+        let mut recon = orig.clone();
+        // Burst noise in the first 8 samples — creates spectrally coloured
+        // noise that A-weighting will evaluate differently from flat noise.
+        for (i, sample) in recon.iter_mut().enumerate().take(8) {
+            *sample += 0.3 * (i as f32 + 1.0).recip();
+        }
+
+        let original_arr = Array1::from_vec(orig);
+        let recon_arr = Array1::from_vec(recon);
+        let segment_len = 64;
+
+        let metrics = PerceptualMetrics::compute(&original_arr, &recon_arr, segment_len).unwrap();
+
+        // The two metrics start from the same underlying signal but weight
+        // frequency content differently, so they should differ.
+        assert_ne!(
+            metrics.weighted_snr_db, metrics.segmental_snr_db,
+            "weighted_snr_db and segmental_snr_db should diverge with real A-weighting"
+        );
+    }
+
+    #[test]
+    fn test_weighted_snr_finite() {
+        // Build a deterministic pseudo-random signal using a simple LCG
+        let n = 128usize;
+        let mut state: u64 = 0xdeadbeef_cafebabe;
+        let lcg_next = |s: &mut u64| -> f32 {
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Map to [-1, 1]
+            (*s as i64 as f32) / (i64::MAX as f32)
+        };
+
+        let orig: Vec<f32> = (0..n).map(|_| lcg_next(&mut state)).collect();
+        let recon: Vec<f32> = orig
+            .iter()
+            .map(|&x| x + 0.05 * lcg_next(&mut state))
+            .collect();
+
+        let original_arr = Array1::from_vec(orig);
+        let recon_arr = Array1::from_vec(recon);
+
+        let metrics = PerceptualMetrics::compute(&original_arr, &recon_arr, 32).unwrap();
+
+        assert!(
+            metrics.weighted_snr_db.is_finite(),
+            "weighted_snr_db should be finite, got {}",
+            metrics.weighted_snr_db
+        );
+        assert!(
+            metrics.weighted_snr_db > f32::NEG_INFINITY,
+            "weighted_snr_db should be > NEG_INFINITY"
+        );
     }
 }

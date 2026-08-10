@@ -42,7 +42,7 @@ impl TimestampedSample {
     pub fn age(&self) -> Duration {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system time before Unix epoch")
             .as_micros() as u64;
         Duration::from_micros(now.saturating_sub(self.timestamp))
     }
@@ -458,7 +458,7 @@ mod tests {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system time before Unix epoch")
             .as_micros() as u64;
 
         // Simulate time sync samples with realistic offset

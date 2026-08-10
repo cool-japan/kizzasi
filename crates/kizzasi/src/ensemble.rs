@@ -93,6 +93,8 @@ pub struct EnsemblePredictor {
     strategy: VotingStrategy,
     total_predictions: u64,
     enable_dynamic_weighting: bool,
+    /// Running sum of per-prediction inter-model variance (for stats)
+    variance_sum: f64,
 }
 
 impl EnsemblePredictor {
@@ -103,6 +105,7 @@ impl EnsemblePredictor {
             strategy,
             total_predictions: 0,
             enable_dynamic_weighting: false,
+            variance_sum: 0.0,
         }
     }
 
@@ -249,6 +252,28 @@ impl EnsemblePredictor {
             }
         };
 
+        // Track inter-model variance: mean squared distance from the mean
+        // prediction vector across all models.  For each prediction step we
+        // compute μ = average(p_i), then sum ||p_i - μ||² over all models and
+        // divide by (n_models × output_dim) so the metric is independent of
+        // output dimensionality.  This correctly captures disagreement even
+        // when all norms are identical (e.g. [[1,0],[0,1]]).
+        if predictions.len() > 1 {
+            let mean = self.average_predictions(&predictions);
+            let n_total = (predictions.len() * predictions[0].len()) as f64;
+            let step_variance: f64 = predictions
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .zip(mean.iter())
+                        .map(|(pi, mi)| ((*pi - *mi) as f64).powi(2))
+                        .sum::<f64>()
+                })
+                .sum::<f64>()
+                / n_total;
+            self.variance_sum += step_variance;
+        }
+
         self.total_predictions += 1;
 
         Ok(result)
@@ -282,10 +307,16 @@ impl EnsemblePredictor {
             );
         }
 
+        let avg_variance = if self.total_predictions > 0 {
+            self.variance_sum / self.total_predictions as f64
+        } else {
+            0.0
+        };
+
         EnsembleStats {
             num_models: self.models.len(),
             total_predictions: self.total_predictions,
-            avg_variance: 0.0, // TODO: Calculate actual variance
+            avg_variance,
             model_stats,
         }
     }

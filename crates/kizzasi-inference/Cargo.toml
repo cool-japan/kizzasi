@@ -82,3 +82,8 @@ harness = false
 [[bench]]
 name = "advanced_features"
 harness = false
+required-features = ["streaming"]
+
+[[bench]]
+name = "state_compression_bench"
+harness = false

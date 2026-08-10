@@ -41,10 +41,13 @@ mod error;
 pub mod gpu_quant;
 pub mod metrics;
 mod mulaw;
+pub mod multi_speaker;
 mod multiscale;
 #[cfg(feature = "vqvae")]
 pub mod neural_codec;
 // persistence and serde_utils depend on continuous module (candle-core, not wasm32-safe)
+pub mod peaq;
+pub mod perceptual;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod persistence;
 pub mod pretraining;
@@ -102,6 +105,14 @@ pub use entropy::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use persistence::{load_config, save_config, ModelCheckpoint, ModelMetadata, ModelVersion};
 
+// Re-export PEAQ evaluator
+pub use self::peaq::{OdgGrade, PeaqConfig, PeaqEvaluator, PeaqMovs, PeaqResult};
+
+// Re-export perceptual quantizer types
+pub use self::perceptual::{
+    absolute_threshold_db, frequency_to_bark, BarkBands, PerceptualQuantizer,
+};
+
 // Re-export specialized tokenizers
 pub use specialized::{
     DCTConfig, DCTTokenizer, FourierConfig, FourierTokenizer, KMeansConfig, KMeansTokenizer,
@@ -121,6 +132,11 @@ pub use compat::{AudioMetadata, DType, ModelConfig, OnnxConfig, PyTorchCompat, T
 // Re-export neural codec types
 #[cfg(feature = "vqvae")]
 pub use neural_codec::{NeuralCodec, NeuralCodecConfig};
+
+// Re-export multi-speaker tokenizer
+pub use self::multi_speaker::{
+    MultiSpeakerConfig, MultiSpeakerToken, MultiSpeakerTokenizer, SpeakerCodebook,
+};
 
 // Re-export domain-specific tokenizers
 pub use domain_specific::{

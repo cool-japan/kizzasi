@@ -312,7 +312,7 @@ impl<T: Send + 'static> ConnectionPool<T> {
             }
         }
 
-        let conn = conn.unwrap();
+        let conn = conn.expect("invariant: conn is Some after create or early return on error");
 
         // Validate if configured
         if self.config.validate_on_acquire && !self.factory.validate(&conn).await {

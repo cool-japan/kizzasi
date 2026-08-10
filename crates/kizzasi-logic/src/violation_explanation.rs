@@ -124,11 +124,51 @@ impl<C: ViolationComputable + Clone> MinimalViolatingSubsetFinder<C> {
         Self { constraints, names }
     }
 
-    /// Find minimal violating subset for a given point
+    /// Compute violation gradient for constraint `idx` at `point` via central finite differences.
+    ///
+    /// Returns a `Vec<f32>` of length `point.len()`. If the point is 0-dimensional, returns
+    /// an empty vector. Uses `eps = 1e-4` as the finite difference step size.
+    fn compute_violation_gradient(&self, idx: usize, point: &[f32]) -> Vec<f32> {
+        let n = point.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let eps = 1e-4_f32;
+        let mut grad = vec![0.0_f32; n];
+        let c = &self.constraints[idx];
+        for k in 0..n {
+            let mut p_plus = point.to_vec();
+            let mut p_minus = point.to_vec();
+            p_plus[k] += eps;
+            p_minus[k] -= eps;
+            let v_plus = c.violation(&p_plus);
+            let v_minus = c.violation(&p_minus);
+            grad[k] = (v_plus - v_minus) / (2.0 * eps);
+        }
+        grad
+    }
+
+    /// Compute cosine similarity between two gradient vectors.
+    ///
+    /// Returns a value in [-1, 1]. Near-zero norms are regularised with `eps = 1e-10` to
+    /// prevent division by zero.
+    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len());
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (norm_a * norm_b + 1e-10)
+    }
+
+    /// Find minimal violating subset for a given point.
+    ///
+    /// Uses gradient-based greedy shrink: sorts violated constraints by ascending violation
+    /// magnitude, then removes any constraint whose gradient direction is dominated (cosine
+    /// similarity > 0.9) by another constraint already in the subset.
     pub fn find_mvs(&self, point: &Array1<f32>) -> Vec<usize> {
         let point_slice = point.as_slice().unwrap_or(&[]);
 
-        // First, find all violated constraints
+        // Step 1: collect all violated constraint indices.
         let violated: Vec<usize> = self
             .constraints
             .iter()
@@ -137,20 +177,83 @@ impl<C: ViolationComputable + Clone> MinimalViolatingSubsetFinder<C> {
             .map(|(i, _)| i)
             .collect();
 
-        if violated.is_empty() {
-            return Vec::new(); // No violations
+        // Trivially minimal cases.
+        if violated.len() <= 1 {
+            return violated;
         }
 
-        // Greedy removal: try removing each constraint and see if point becomes feasible
-        let minimal = violated.clone();
-        let mut _changed = true;
+        // Step 2: compute violation magnitudes and gradients for each violated constraint.
+        let violations: Vec<(usize, f32, Vec<f32>)> = violated
+            .iter()
+            .map(|&idx| {
+                let mag = self.constraints[idx].violation(point_slice);
+                let grad = self.compute_violation_gradient(idx, point_slice);
+                (idx, mag, grad)
+            })
+            .collect();
 
-        // Note: This is a placeholder for actual MVS finding
-        // In production, would implement proper greedy algorithm
-        // For now, return all violated constraints
-        let _ = _changed; // Suppress unused warning
+        // Step 3: sort by violation magnitude ascending (smallest violation first —
+        // those are the best removal candidates for redundancy).
+        let mut sorted = violations;
+        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        minimal
+        // Step 4: greedy shrink — maintain running `minimal` set.
+        // We work with indices into `sorted`.
+        let mut minimal_indices: Vec<usize> = (0..sorted.len()).collect();
+
+        let mut remove_positions: Vec<usize> = Vec::new();
+
+        for pos in 0..sorted.len() {
+            if minimal_indices.len() == 1 {
+                break; // Cannot shrink further.
+            }
+
+            // Check whether `pos` is still in minimal_indices.
+            if !minimal_indices.contains(&pos) {
+                continue;
+            }
+
+            let (_, _, ref grad_i) = sorted[pos];
+
+            // A constraint with zero-norm gradient cannot be assessed — keep it.
+            let norm_i: f32 = grad_i.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm_i < 1e-10 {
+                continue;
+            }
+
+            // Check if there exists any other j in minimal_indices with cos(i,j) > 0.9.
+            let dominated = minimal_indices.iter().any(|&other_pos| {
+                if other_pos == pos {
+                    return false;
+                }
+                let (_, _, ref grad_j) = sorted[other_pos];
+                let norm_j: f32 = grad_j.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm_j < 1e-10 {
+                    return false;
+                }
+                let cos = Self::cosine_similarity(grad_i, grad_j);
+                cos > 0.9
+            });
+
+            if dominated {
+                remove_positions.push(pos);
+                minimal_indices.retain(|&p| p != pos);
+            }
+        }
+
+        // Step 5: collect surviving constraint indices preserving original order.
+        let mut result: Vec<usize> = minimal_indices.iter().map(|&pos| sorted[pos].0).collect();
+        result.sort_unstable();
+
+        // Safety invariant: never return empty when violations were non-empty.
+        if result.is_empty() {
+            // Fallback: return the constraint with the largest violation magnitude.
+            if let Some((idx, _, _)) = sorted.last() {
+                result.push(*idx);
+            }
+        }
+
+        result
     }
 
     /// Explain violation with minimal subset
@@ -565,5 +668,182 @@ mod tests {
 
         assert!(!exp.violated_constraints.is_empty());
         assert!(!exp.suggestions.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Helper: simple per-dimension upper-bound constraint for MVS tests.
+    // ---------------------------------------------------------------------------
+    #[derive(Clone)]
+    struct SimpleBound {
+        dim: usize,
+        upper: f32,
+    }
+
+    impl ViolationComputable for SimpleBound {
+        fn check(&self, point: &[f32]) -> bool {
+            point.get(self.dim).is_none_or(|&v| v <= self.upper)
+        }
+        fn violation(&self, point: &[f32]) -> f32 {
+            point
+                .get(self.dim)
+                .map_or(0.0, |&v| (v - self.upper).max(0.0))
+        }
+    }
+
+    // Test 1: feasible point produces empty MVS.
+    #[test]
+    fn test_mvs_returns_empty_for_feasible_point() {
+        let constraints = vec![
+            SimpleBound {
+                dim: 0,
+                upper: 10.0,
+            },
+            SimpleBound {
+                dim: 1,
+                upper: 10.0,
+            },
+        ];
+        let names = vec!["c0".to_string(), "c1".to_string()];
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+
+        // Point (3.0, 3.0) satisfies both x0 <= 10 and x1 <= 10.
+        let point = Array1::from_vec(vec![3.0_f32, 3.0]);
+        let mvs = finder.find_mvs(&point);
+        assert!(
+            mvs.is_empty(),
+            "Expected empty MVS for feasible point, got {:?}",
+            mvs
+        );
+    }
+
+    // Test 2: exactly one violated constraint is returned as-is.
+    #[test]
+    fn test_mvs_single_violated_returned() {
+        let constraints = vec![
+            SimpleBound { dim: 0, upper: 5.0 },
+            SimpleBound {
+                dim: 1,
+                upper: 10.0,
+            },
+        ];
+        let names = vec!["c0".to_string(), "c1".to_string()];
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+
+        // Point (8.0, 2.0): only constraint 0 (x0 <= 5) is violated.
+        let point = Array1::from_vec(vec![8.0_f32, 2.0]);
+        let mvs = finder.find_mvs(&point);
+        assert_eq!(
+            mvs.len(),
+            1,
+            "Expected exactly 1 element in MVS, got {:?}",
+            mvs
+        );
+        assert_eq!(
+            mvs[0], 0,
+            "Expected violated constraint index 0, got {:?}",
+            mvs
+        );
+    }
+
+    // Test 3: two orthogonal constraints — both should remain in MVS.
+    //
+    // Constraint 0: x0 <= 3  (gradient direction: [1, 0])
+    // Constraint 1: x1 <= 3  (gradient direction: [0, 1])
+    // cos([1,0],[0,1]) == 0.0, well below 0.9 threshold → neither is dominated.
+    #[test]
+    fn test_mvs_independent_constraints_all_kept() {
+        let constraints = vec![
+            SimpleBound { dim: 0, upper: 3.0 },
+            SimpleBound { dim: 1, upper: 3.0 },
+        ];
+        let names = vec!["c0".to_string(), "c1".to_string()];
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+
+        // Both violated: x0 = 5 > 3, x1 = 5 > 3.
+        let point = Array1::from_vec(vec![5.0_f32, 5.0]);
+        let mut mvs = finder.find_mvs(&point);
+        mvs.sort_unstable();
+        assert_eq!(
+            mvs.len(),
+            2,
+            "Expected both orthogonal constraints kept in MVS, got {:?}",
+            mvs
+        );
+        assert_eq!(mvs, vec![0, 1]);
+    }
+
+    // Test 4: two parallel constraints on the same dimension — the lesser one is redundant.
+    //
+    // Constraint 0: x0 <= 6  (violation at x0=8: 2.0)  — smaller magnitude
+    // Constraint 1: x0 <= 4  (violation at x0=8: 4.0)  — larger magnitude
+    //
+    // Both gradients are [1.0] (same direction). When sorted ascending by violation,
+    // constraint 0 (viol=2) comes first. Its gradient is dominated by constraint 1 (cos=1).
+    // So constraint 0 is removed; MVS = [1].
+    #[test]
+    fn test_mvs_parallel_constraints_redundant_removed() {
+        let constraints = vec![
+            SimpleBound { dim: 0, upper: 6.0 }, // index 0, smaller violation
+            SimpleBound { dim: 0, upper: 4.0 }, // index 1, larger violation
+        ];
+        let names = vec!["c0".to_string(), "c1".to_string()];
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+
+        // x0 = 8 violates both.
+        let point = Array1::from_vec(vec![8.0_f32]);
+        let mvs = finder.find_mvs(&point);
+        assert_eq!(
+            mvs.len(),
+            1,
+            "Expected one constraint after redundancy removal, got {:?}",
+            mvs
+        );
+        // The surviving constraint must be constraint 1 (tighter bound, larger violation).
+        assert_eq!(
+            mvs[0], 1,
+            "Expected constraint index 1 (tighter) to survive, got {:?}",
+            mvs
+        );
+    }
+
+    // Test 5: three violated constraints — 2 parallel (same dim) + 1 orthogonal.
+    //
+    // Constraint 0: x0 <= 6  (violation at (8,5): 2.0, grad=[1,0])
+    // Constraint 1: x0 <= 4  (violation at (8,5): 4.0, grad=[1,0])  — parallel to 0
+    // Constraint 2: x1 <= 3  (violation at (8,5): 2.0, grad=[0,1])  — orthogonal
+    //
+    // Sorted ascending by violation: {0: 2.0, 2: 2.0, 1: 4.0} (ties broken arbitrarily).
+    // The lesser of the two parallel constraints (index 0, viol=2.0) is dominated by
+    // index 1 and removed. Constraint 2 is orthogonal to all — not dominated.
+    // Result: 2 constraints (indices 1 and 2).
+    #[test]
+    fn test_mvs_mixed_three_constraints() {
+        let constraints = vec![
+            SimpleBound { dim: 0, upper: 6.0 }, // index 0
+            SimpleBound { dim: 0, upper: 4.0 }, // index 1 (tighter, same direction)
+            SimpleBound { dim: 1, upper: 3.0 }, // index 2 (orthogonal)
+        ];
+        let names = vec!["c0".to_string(), "c1".to_string(), "c2".to_string()];
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+
+        let point = Array1::from_vec(vec![8.0_f32, 5.0]);
+        let mut mvs = finder.find_mvs(&point);
+        mvs.sort_unstable();
+        assert_eq!(
+            mvs.len(),
+            2,
+            "Expected 2 constraints in MVS (one parallel removed), got {:?}",
+            mvs
+        );
+        assert!(
+            mvs.contains(&1),
+            "MVS must contain tighter dim-0 constraint (idx 1), got {:?}",
+            mvs
+        );
+        assert!(
+            mvs.contains(&2),
+            "MVS must contain orthogonal dim-1 constraint (idx 2), got {:?}",
+            mvs
+        );
     }
 }

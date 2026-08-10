@@ -156,7 +156,10 @@ impl MPCCost for QuadraticCost {
     }
 
     fn terminal_cost(&self, state: &Array1<f32>) -> f32 {
-        let x_ref = self.x_ref.last().unwrap();
+        let x_ref = self
+            .x_ref
+            .last()
+            .expect("invariant: x_ref non-empty (set during construction)");
         let error = state - x_ref;
 
         error
@@ -329,12 +332,14 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
         // Simulate final trajectory
         let final_states = self.simulate_trajectory(current_state, &controls);
         let final_cost = self.compute_total_cost(&final_states, &controls);
+        let constraint_violation = self.compute_raw_violation(&final_states, &controls);
 
         Ok(MPCSolution {
             controls,
             predicted_states: final_states,
             total_cost: final_cost,
             horizon,
+            constraint_violation,
         })
     }
 
@@ -347,7 +352,12 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
         let mut states = vec![initial_state.clone()];
 
         for control in controls.iter() {
-            let next_state = self.dynamics.step(states.last().unwrap(), control);
+            let next_state = self.dynamics.step(
+                states
+                    .last()
+                    .expect("invariant: states initialized with initial_state"),
+                control,
+            );
             states.push(next_state);
         }
 
@@ -367,7 +377,11 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
         }
 
         // Terminal cost
-        cost += self.cost.terminal_cost(states.last().unwrap()) * self.config.terminal_weight;
+        cost += self.cost.terminal_cost(
+            states
+                .last()
+                .expect("invariant: states initialized with initial_state"),
+        ) * self.config.terminal_weight;
 
         cost
     }
@@ -387,6 +401,27 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
         }
 
         violation
+    }
+
+    /// Compute raw (unscaled) constraint violation sum over a trajectory.
+    ///
+    /// Unlike `constraint_violation_cost`, this does **not** multiply by the
+    /// penalty factor (×100).  It is used at solve-time to populate
+    /// `MPCSolution::constraint_violation` so that `is_feasible()` can make a
+    /// meaningful comparison against a numerical tolerance.
+    fn compute_raw_violation(&self, states: &[Array1<f32>], controls: &[Array1<f32>]) -> f32 {
+        let mut v = 0.0_f32;
+        for (t, control) in controls.iter().enumerate() {
+            let s: Vec<f32> = states[t].iter().copied().collect();
+            for c in &self.state_constraints {
+                v += c.violation(&s);
+            }
+            let u: Vec<f32> = control.iter().copied().collect();
+            for c in &self.control_constraints {
+                v += c.violation(&u);
+            }
+        }
+        v
     }
 
     /// Compute gradient of cost w.r.t. control at time t
@@ -451,6 +486,8 @@ pub struct MPCSolution {
     pub total_cost: f32,
     /// Horizon length
     pub horizon: usize,
+    /// Raw sum of all constraint violations (without penalty scaling)
+    pub constraint_violation: f32,
 }
 
 impl MPCSolution {
@@ -464,10 +501,9 @@ impl MPCSolution {
         self.predicted_states.get(time_step)
     }
 
-    /// Check if all constraints are satisfied
+    /// Check if all constraints are satisfied within numerical tolerance.
     pub fn is_feasible(&self) -> bool {
-        // Simplified feasibility check
-        self.total_cost < f32::INFINITY
+        self.total_cost.is_finite() && self.constraint_violation <= 1e-4
     }
 }
 
@@ -603,11 +639,64 @@ mod tests {
             predicted_states: states,
             total_cost: 1.5,
             horizon: 3,
+            constraint_violation: 0.0,
         };
 
         assert_eq!(solution.first_control()[0], 1.0);
         assert_eq!(solution.predicted_state(0).unwrap()[0], 0.0);
         assert_eq!(solution.predicted_state(2).unwrap()[0], 0.15);
         assert!(solution.is_feasible());
+    }
+
+    #[test]
+    fn test_mpc_is_feasible_discriminates() {
+        // Both solutions have finite total_cost; the old tautological check
+        // would have returned true for both.  The corrected check must
+        // distinguish them via constraint_violation.
+        let dummy_controls = vec![Array1::zeros(1)];
+        let dummy_states = vec![Array1::zeros(1), Array1::zeros(1)];
+
+        let feasible = MPCSolution {
+            controls: dummy_controls.clone(),
+            predicted_states: dummy_states.clone(),
+            total_cost: 2.0,
+            horizon: 1,
+            constraint_violation: 0.0,
+        };
+
+        let infeasible = MPCSolution {
+            controls: dummy_controls,
+            predicted_states: dummy_states,
+            total_cost: 502.0, // finite but violating (penalty already baked in)
+            horizon: 1,
+            constraint_violation: 5.0,
+        };
+
+        assert!(feasible.is_feasible());
+        assert!(!infeasible.is_feasible());
+    }
+
+    #[test]
+    fn test_mpc_is_feasible_rejects_nonfinite() {
+        let dummy_controls = vec![Array1::zeros(1)];
+        let dummy_states = vec![Array1::zeros(1), Array1::zeros(1)];
+
+        let inf_solution = MPCSolution {
+            controls: dummy_controls.clone(),
+            predicted_states: dummy_states.clone(),
+            total_cost: f32::INFINITY,
+            horizon: 1,
+            constraint_violation: 0.0,
+        };
+        assert!(!inf_solution.is_feasible());
+
+        let nan_solution = MPCSolution {
+            controls: dummy_controls,
+            predicted_states: dummy_states,
+            total_cost: f32::NAN,
+            horizon: 1,
+            constraint_violation: 0.0,
+        };
+        assert!(!nan_solution.is_feasible());
     }
 }

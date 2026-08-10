@@ -44,7 +44,8 @@
 - [x] Basic streaming engine with tokio (streaming.rs exists) ✅
 - [x] Add backpressure handling with bounded channels ✅
 - [x] Implement adaptive batching based on latency ✅
-- [x] Add stream transformers (map, buffer, debounce, throttle) ✅
+- [x] Add stream transformers (map, buffer, debounce, throttle, **filter**) ✅
+  - **FilterTransformer added 2026-05-17:** `FilterTransformer<I, F: Fn(&I) -> bool>` with `Arc<F>` cloning; wraps `tokio_stream::StreamExt::filter` via `futures::future::ready(...)` so the borrow of `&I` never crosses an `.await`. 4 tests (basic / passes-all / passes-none / order-preserving). File: `streaming.rs` (621 → 707 lines).
 - [x] Support WebSocket integration ✅
   - **Full WebSocket adapter with JSON and MessagePack support**
   - **Bidirectional streaming with backpressure**
@@ -62,6 +63,7 @@
 - [x] Add checkpointing for long sequences ✅
 - [x] Implement state serialization/deserialization ✅
 - [x] Add state compression for memory efficiency ✅
+  - **Comprehensive unit tests added 2026-05-17:** 10 tests covering roundtrip (dense, sparse, 8-bit), multi-step rollout drift, sparsity threshold boundary, quantization parameter preservation, shape preservation, and edge cases (empty/single-element/all-zero/all-identical). All exercise `StateCompressor::compress`/`decompress` against `CompressedState` (with `Sparse`, `Quantized8Bit`, and `None` methods). File: `compression.rs` (397 → 694 lines).
 - [x] Support distributed state sharding ✅ (conceptually addressed via hot-swapping)
 - [x] Add state rollback for constraint violations (CheckpointManager) ✅
 

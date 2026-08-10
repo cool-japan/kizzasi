@@ -10,11 +10,24 @@ High-performance SSM implementation with O(1) per-step inference, SIMD optimizat
 
 - **Selective SSM**: Input-dependent state transitions with ZOH discretization
 - **Parallel Scan**: O(log N) depth associative scan algorithm
-- **SIMD Operations**: Vectorized dot products, matrix operations, and activations
-- **Memory Efficient**: Array pooling and workspace management
-- **GPU Support**: CUDA and Metal backends via candle
-- **Training**: Full training infrastructure with gradient computation
+- **SIMD Operations**: Vectorized dot products, matrix operations, and activations — multi-SIMD backends (aarch64, AVX512, NEON)
+- **Memory Efficient**: Array pooling and workspace management; memory profiling (`MemoryProfiler`, `ProfilingSession`)
+- **GPU Support**: CUDA and Metal backends via candle; GPU-accelerated SSM prefix scan (added in v0.2.2)
+- **Training**: Full training infrastructure with gradient computation; LoRA adapters (parameter-efficient fine-tuning)
 - **Numerical Stability**: Kahan summation, safe exp/log, Welford variance
+- **Attention**: Flash Attention and Efficient Attention variants
+- **Quantization**: Dynamic quantization with INT8/FP16
+- **Pruning**: Gradient and structured pruning
+- **Checkpoint Compatibility**: PyTorch checkpoint loading (`PyTorchCheckpoint`, `PyTorchConverter`)
+
+## Architectures
+
+- **Mamba2**: Structured state-space duality with SSD kernel
+- **S4D**: Diagonal S4 with DPLR parameterization
+- **RWKV v7**: TimeMixing/ChannelMixing variant
+- **RetNet**: Multi-Scale Retention
+- **H3**: Hungry Hungry Hippos with Diagonal/Shift SSMs
+- **S5**: 5th generation SSM
 
 ## Quick Start
 
@@ -40,7 +53,7 @@ let output = ssm.step(&input)?;
 
 - Single step (d=256): ~80μs
 - Batch processing (B=32, d=256): ~1.5ms
-- 422 comprehensive tests with 100% pass rate
+- 435 comprehensive tests with 100% pass rate
 - Zero-copy operations where possible
 
 ## Documentation

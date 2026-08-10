@@ -54,6 +54,7 @@
 use crate::error::{ModelError, ModelResult};
 use crate::{AutoregressiveModel, ModelType};
 use kizzasi_core::{sigmoid, silu, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor};
+use safetensors::tensor::{Dtype, TensorView};
 use scirs2_core::ndarray::{Array1, Array2};
 use scirs2_core::random::{rng, RngExt};
 #[allow(unused_imports)]
@@ -307,12 +308,13 @@ impl TimeMixing {
                 // Get time decay for this head and dimension
                 let w = self.time_decay[[head, i]].exp();
 
-                // Update WKV state: wkv[t] = w * wkv[t-1] + k[t] * v[t]
-                let new_wkv = w * self.wkv_state[head][i] + k[idx] * v[idx];
+                // Update WKV state: num_t = e^{-w}·num_{t-1} + e^{k_t}·v_t
+                let exp_k = k[idx].exp();
+                let new_wkv = w * self.wkv_state[head][i] + exp_k * v[idx];
                 self.wkv_state[head][i] = new_wkv;
 
-                // Update normalizer: norm[t] = w * norm[t-1] + k[t]
-                self.wkv_norm[head] = w * self.wkv_norm[head] + k[idx];
+                // Update normalizer: den_t = e^{-w}·den_{t-1} + e^{k_t}
+                self.wkv_norm[head] = w * self.wkv_norm[head] + exp_k;
 
                 // Output: wkv / norm
                 let norm = self.wkv_norm[head].max(1e-8);
@@ -1021,10 +1023,141 @@ impl Rwkv {
         Ok(())
     }
 
-    /// Save weights to a SafeTensors model file (legacy stub — use `save_weights_json` instead).
-    #[allow(unused_variables)]
+    /// Save model weights to a SafeTensors file.
+    ///
+    /// All tensors are serialised as `F32` in little-endian byte order.
+    /// The resulting file can be loaded with any SafeTensors-compatible reader.
     pub fn save_weights(&self, path: &str) -> ModelResult<()> {
-        self.save_weights_json(path)
+        // ── 1. Collect (name, flat-f32-bytes, shape) for every tensor ──────
+        let mut raw: Vec<(String, Vec<u8>, Vec<usize>)> = Vec::new();
+
+        let f32_bytes =
+            |slice: &[f32]| -> Vec<u8> { slice.iter().flat_map(|f| f.to_le_bytes()).collect() };
+
+        // Top-level projections
+        {
+            let arr = &self.input_proj;
+            let shape = vec![arr.nrows(), arr.ncols()];
+            let bytes = f32_bytes(arr.as_slice().ok_or_else(|| {
+                ModelError::load_error("rwkv save_weights", "input_proj is not contiguous")
+            })?);
+            raw.push(("input_proj".to_string(), bytes, shape));
+        }
+        {
+            let arr = &self.output_proj;
+            let shape = vec![arr.nrows(), arr.ncols()];
+            let bytes = f32_bytes(arr.as_slice().ok_or_else(|| {
+                ModelError::load_error("rwkv save_weights", "output_proj is not contiguous")
+            })?);
+            raw.push(("output_proj".to_string(), bytes, shape));
+        }
+
+        // Per-layer tensors
+        for (i, layer) in self.layers.iter().enumerate() {
+            let tm = &layer.time_mixing;
+            let cm = &layer.channel_mixing;
+            let tm_prefix = format!("layers.{i}.time_mixing");
+            let cm_prefix = format!("layers.{i}.channel_mixing");
+
+            // ── Time-mixing Array1 fields ──
+            for (suffix, arr) in [
+                ("time_mix_k", &tm.time_mix_k),
+                ("time_mix_v", &tm.time_mix_v),
+                ("time_mix_r", &tm.time_mix_r),
+                ("time_mix_g", &tm.time_mix_g),
+            ] {
+                let shape = vec![arr.len()];
+                let bytes = f32_bytes(arr.as_slice().ok_or_else(|| {
+                    ModelError::load_error(
+                        "rwkv save_weights",
+                        format!("{tm_prefix}.{suffix} is not contiguous"),
+                    )
+                })?);
+                raw.push((format!("{tm_prefix}.{suffix}"), bytes, shape));
+            }
+
+            // ── Time-mixing Array2 fields ──
+            {
+                let arr = &tm.time_decay;
+                let shape = vec![arr.nrows(), arr.ncols()];
+                let bytes = f32_bytes(arr.as_slice().ok_or_else(|| {
+                    ModelError::load_error(
+                        "rwkv save_weights",
+                        format!("{tm_prefix}.time_decay is not contiguous"),
+                    )
+                })?);
+                raw.push((format!("{tm_prefix}.time_decay"), bytes, shape));
+            }
+            for (suffix, arr) in [
+                ("key_proj", &tm.key_proj),
+                ("value_proj", &tm.value_proj),
+                ("receptance_proj", &tm.receptance_proj),
+                ("gate_proj", &tm.gate_proj),
+                ("output_proj", &tm.output_proj),
+            ] {
+                let shape = vec![arr.nrows(), arr.ncols()];
+                let bytes = f32_bytes(arr.as_slice().ok_or_else(|| {
+                    ModelError::load_error(
+                        "rwkv save_weights",
+                        format!("{tm_prefix}.{suffix} is not contiguous"),
+                    )
+                })?);
+                raw.push((format!("{tm_prefix}.{suffix}"), bytes, shape));
+            }
+
+            // ── Channel-mixing Array1 fields ──
+            for (suffix, arr) in [
+                ("time_mix_k", &cm.time_mix_k),
+                ("time_mix_r", &cm.time_mix_r),
+            ] {
+                let shape = vec![arr.len()];
+                let bytes = f32_bytes(arr.as_slice().ok_or_else(|| {
+                    ModelError::load_error(
+                        "rwkv save_weights",
+                        format!("{cm_prefix}.{suffix} is not contiguous"),
+                    )
+                })?);
+                raw.push((format!("{cm_prefix}.{suffix}"), bytes, shape));
+            }
+
+            // ── Channel-mixing Array2 fields ──
+            for (suffix, arr) in [
+                ("key_proj", &cm.key_proj),
+                ("value_proj", &cm.value_proj),
+                ("receptance_proj", &cm.receptance_proj),
+            ] {
+                let shape = vec![arr.nrows(), arr.ncols()];
+                let bytes = f32_bytes(arr.as_slice().ok_or_else(|| {
+                    ModelError::load_error(
+                        "rwkv save_weights",
+                        format!("{cm_prefix}.{suffix} is not contiguous"),
+                    )
+                })?);
+                raw.push((format!("{cm_prefix}.{suffix}"), bytes, shape));
+            }
+        }
+
+        // ── 2. Build TensorView slice (borrows bytes stored in `raw`) ───────
+        let views: Vec<(String, TensorView<'_>)> = raw
+            .iter()
+            .map(|(name, bytes, shape)| {
+                TensorView::new(Dtype::F32, shape.clone(), bytes)
+                    .map(|view| (name.clone(), view))
+                    .map_err(|e| {
+                        ModelError::load_error(
+                            "rwkv save_weights",
+                            format!("TensorView for {name}: {e}"),
+                        )
+                    })
+            })
+            .collect::<ModelResult<Vec<_>>>()?;
+
+        // ── 3. Write to disk ─────────────────────────────────────────────────
+        safetensors::tensor::serialize_to_file(views, None, std::path::Path::new(path)).map_err(
+            |e| ModelError::load_error("rwkv save_weights", format!("serialize_to_file: {e}")),
+        )?;
+
+        Ok(())
     }
 }
 
@@ -1225,5 +1358,75 @@ mod tests {
         assert_eq!(reloaded.len(), 32, "unexpected number of weight keys");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ─── WKV exp(k) correctness ──────────────────────────────────────────
+
+    #[test]
+    fn test_rwkv_wkv_exp_k_bounded_output() {
+        // key_proj filled with -1.0 → k = Σ(-1)*1 = -hidden_dim for unit input
+        // Bug: wkv_norm += k (negative) → clamped to 1e-8 → output ≈ |k|*|v|/1e-8 ~ 1e8
+        // Fix: wkv_norm += exp(k) = exp(-4) ≈ 0.018 → output bounded O(1)
+        let config = RwkvConfig {
+            input_dim: 1,
+            hidden_dim: 4,
+            intermediate_dim: 16,
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 2,
+            dropout: 0.0,
+            time_decay_init: -5.0,
+            use_rms_norm: false,
+        };
+        let mut tm = TimeMixing::new(&config).expect("TimeMixing::new");
+        tm.key_proj.fill(-1.0);
+        tm.time_mix_k.fill(1.0); // xx = x (no prev mixing)
+
+        let x = Array1::from_vec(vec![1.0f32; 4]);
+        let output = tm.forward(&x).expect("TimeMixing::forward");
+
+        assert!(
+            output.iter().all(|&v| v.is_finite() && v.abs() < 1e6),
+            "WKV output must be bounded; missing exp(k) gives ~1e8. Got: {:?}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_rwkv_wkv_positive_denominator() {
+        // exp(k) > 0 ensures the WKV denominator is always positive through the public API.
+        let config = RwkvConfig::new().hidden_dim(8).num_heads(2).num_layers(1);
+        let mut model = Rwkv::new(config).expect("Rwkv::new");
+        let input = Array1::from_vec(vec![0.5f32]);
+        let output = model.step(&input).expect("step");
+        assert!(
+            output.iter().all(|&v| v.is_finite()),
+            "step output must be finite; got: {:?}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_save_weights_roundtrip_safetensors() {
+        let config = RwkvConfig {
+            input_dim: 4,
+            hidden_dim: 8,
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 4,
+            intermediate_dim: 16,
+            dropout: 0.0,
+            time_decay_init: -5.0,
+            use_rms_norm: true,
+        };
+        let model = Rwkv::new(config).expect("model creation failed");
+        let tmp = std::env::temp_dir().join("test_rwkv_save_weights.safetensors");
+        model
+            .save_weights(tmp.to_str().expect("path to str"))
+            .expect("save_weights failed");
+        let data = std::fs::read(&tmp).expect("read file");
+        let tensors = safetensors::SafeTensors::deserialize(&data).expect("deserialize");
+        assert!(!tensors.names().is_empty(), "no tensors written");
+        std::fs::remove_file(&tmp).ok();
     }
 }

@@ -78,6 +78,7 @@ use crate::AutoregressiveModel;
 use kizzasi_core::{
     silu, CausalConv1d, CoreResult, HiddenState, LayerNorm, NormType, SignalPredictor,
 };
+use safetensors::tensor::{Dtype, TensorView};
 use scirs2_core::ndarray::{Array1, Array2};
 use scirs2_core::random::{rng, RngExt};
 use tracing::{debug, instrument, trace};
@@ -462,8 +463,13 @@ impl SelectiveSSM {
                 } else {
                     // Exact ZOH discretization
                     // B̅[n] = (exp(Δ·A[n]) - 1) / A[n] · B[n]
-                    let safe_a_n = if a_n.abs() < 1e-8 { -1.0 } else { a_n };
-                    b_bar[[i, n]] = (a_bar[[i, n]] - 1.0) / safe_a_n * b_vec[[i, n]];
+                    // As A[n] → 0, L'Hôpital gives the limit (e^{Δa}-1)/a → Δ,
+                    // so fall back to the Taylor approximation Δ·B.
+                    if a_n.abs() < 1e-8 {
+                        b_bar[[i, n]] = delta[i] * b_vec[[i, n]];
+                    } else {
+                        b_bar[[i, n]] = (a_bar[[i, n]] - 1.0) / a_n * b_vec[[i, n]];
+                    }
                 }
             }
         }
@@ -985,10 +991,107 @@ impl Mamba {
         Ok(())
     }
 
-    /// Save model weights to safetensors format (legacy stub — use `save_weights_json` instead).
-    #[allow(unused_variables)]
+    /// Save model weights to SafeTensors format.
+    ///
+    /// Serialises every parameter tensor (input projection, output projection,
+    /// and per-layer SSM weights) as F32 little-endian bytes using the
+    /// [SafeTensors](https://github.com/huggingface/safetensors) file format.
+    /// The resulting file can be loaded by any SafeTensors-compatible reader.
     pub fn save_weights<P: AsRef<std::path::Path>>(&self, path: P) -> ModelResult<()> {
-        self.save_weights_json(path)
+        // Phase 1: collect (name, raw-bytes, shape) for every tensor.
+        // The byte Vecs must outlive the TensorView borrows in phase 2.
+        let mut entries: Vec<(String, Vec<u8>, Vec<usize>)> = Vec::new();
+
+        // Helper closures for Array1 / Array2.
+        let array1_bytes =
+            |a: &Array1<f32>| -> Vec<u8> { a.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let array2_bytes =
+            |a: &Array2<f32>| -> Vec<u8> { a.iter().flat_map(|f| f.to_le_bytes()).collect() };
+
+        // Top-level projections.
+        entries.push((
+            "input_proj".to_string(),
+            array2_bytes(&self.input_proj),
+            vec![self.config.input_dim, self.config.hidden_dim],
+        ));
+        entries.push((
+            "output_proj".to_string(),
+            array2_bytes(&self.output_proj),
+            vec![self.config.hidden_dim, self.config.input_dim],
+        ));
+
+        // Per-layer weights.
+        let inner_dim = self.config.hidden_dim * self.config.expand_factor;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+            let ssm = &layer.ssm;
+
+            entries.push((
+                format!("{}.in_proj", prefix),
+                array2_bytes(&layer.in_proj),
+                vec![self.config.hidden_dim, inner_dim * 2],
+            ));
+            entries.push((
+                format!("{}.out_proj", prefix),
+                array2_bytes(&layer.out_proj),
+                vec![inner_dim, self.config.hidden_dim],
+            ));
+            entries.push((
+                format!("{}.ssm.log_a", prefix),
+                array1_bytes(&ssm.log_a),
+                vec![self.config.state_dim],
+            ));
+            entries.push((
+                format!("{}.ssm.delta_proj", prefix),
+                array2_bytes(&ssm.delta_proj),
+                vec![inner_dim, inner_dim],
+            ));
+            entries.push((
+                format!("{}.ssm.delta_bias", prefix),
+                array1_bytes(&ssm.delta_bias),
+                vec![inner_dim],
+            ));
+            entries.push((
+                format!("{}.ssm.b_proj", prefix),
+                array2_bytes(&ssm.b_proj),
+                vec![inner_dim, self.config.state_dim],
+            ));
+            entries.push((
+                format!("{}.ssm.c_proj", prefix),
+                array2_bytes(&ssm.c_proj),
+                vec![inner_dim, self.config.state_dim],
+            ));
+            entries.push((
+                format!("{}.ssm.d_skip", prefix),
+                array1_bytes(&ssm.d_skip),
+                vec![inner_dim],
+            ));
+        }
+
+        // Phase 2: build TensorView slice — borrows from `entries`.
+        let tensor_views: Vec<(String, TensorView<'_>)> = entries
+            .iter()
+            .map(|(name, data, shape)| {
+                let view =
+                    TensorView::new(Dtype::F32, shape.clone(), data.as_slice()).map_err(|e| {
+                        ModelError::load_error(
+                            "mamba save_weights",
+                            format!("TensorView error for '{}': {}", name, e),
+                        )
+                    })?;
+                Ok((name.clone(), view))
+            })
+            .collect::<ModelResult<Vec<_>>>()?;
+
+        // Phase 3: write the file.
+        safetensors::tensor::serialize_to_file(tensor_views, None, path.as_ref()).map_err(|e| {
+            ModelError::load_error(
+                "mamba save_weights",
+                format!("safetensors serialize error: {}", e),
+            )
+        })?;
+
+        Ok(())
     }
 
     /// Get the configuration
@@ -1090,7 +1193,7 @@ impl AutoregressiveModel for Mamba {
             layer.ssm.state = states[layer_idx].state().clone();
             // Also restore convolution history if available
             if let Some(conv_history) = states[layer_idx].conv_history() {
-                layer.conv.set_history(conv_history.clone());
+                let _ = layer.conv.set_history(conv_history.clone());
             }
         }
 
@@ -1315,5 +1418,89 @@ mod tests {
         assert!(result.is_err(), "expected shape mismatch error");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Verify that when |a_n| < 1e-8 and delta >= 0.001 (the else branch),
+    /// the ZOH discretization correctly uses the L'Hôpital limit Δ·B instead
+    /// of the former broken substitute `-1.0` that produced near-zero state.
+    #[test]
+    fn test_mamba_bbar_zoh_limit_near_zero_a() {
+        // Use hidden_dim=4, state_dim=4, expand_factor=1 so inner_dim=4
+        let config = MambaConfig::new()
+            .input_dim(4)
+            .hidden_dim(4)
+            .state_dim(4)
+            .num_layers(1);
+
+        let mut ssm = SelectiveSSM::new(&config).expect("SelectiveSSM::new failed");
+
+        // Force |a_n| ≈ 9.4e-14  (well inside the < 1e-8 guard).
+        // log_a = -30 → a_n = -exp(-30) ≈ -9.4e-14
+        ssm.log_a.fill(-30.0);
+
+        // Force delta to clamp to 0.1 (>= 0.001), triggering the else branch.
+        // softplus(2.0) ≈ 2.127 which the clamp reduces to 0.1.
+        ssm.delta_bias.fill(2.0);
+        // Zero out delta_proj so the projected contribution is 0 and
+        // only the bias term controls delta.
+        ssm.delta_proj.fill(0.0);
+
+        // Set b_proj so that b_vec is nonzero and predictable.
+        ssm.b_proj.fill(1.0);
+
+        // Simple unit input.
+        let x = Array1::from_elem(4, 1.0_f32);
+
+        // After the fix: b_bar = delta * b_vec (Taylor), state ≠ 0.
+        // Before the fix: b_bar = (a_bar - 1) / (-1) * b_vec ≈ 0 (since a_bar ≈ 1).
+        let _output = ssm.forward_step(&x).expect("forward_step failed");
+
+        // The state must have at least one nonzero entry after absorbing the input.
+        assert!(
+            ssm.state.iter().any(|&v| v.abs() > 1e-6),
+            "state should be nonzero after ZOH limit fix (delta={:.4}, a_n≈{:.2e})",
+            0.1_f32,
+            (-30.0_f32).exp()
+        );
+    }
+
+    /// Regression guard: the common path (default HiPPO init, |a_n| >= 1)
+    /// must still produce finite outputs after the b_bar change.
+    #[test]
+    fn test_mamba_bbar_default_init_regression() {
+        let config = MambaConfig::new()
+            .input_dim(4)
+            .hidden_dim(4)
+            .state_dim(4)
+            .num_layers(1);
+
+        let mut ssm = SelectiveSSM::new(&config).expect("SelectiveSSM::new failed");
+
+        let x = Array1::from_vec(vec![0.1_f32, 0.2, 0.3, 0.4]);
+        let output = ssm.forward_step(&x).expect("forward_step failed");
+
+        assert!(
+            output.iter().all(|v| v.is_finite()),
+            "all output elements must be finite with default HiPPO init"
+        );
+    }
+
+    #[test]
+    fn test_save_weights_roundtrip_safetensors() {
+        let config = MambaConfig {
+            input_dim: 4,
+            hidden_dim: 8,
+            state_dim: 4,
+            num_layers: 1,
+            expand_factor: 2,
+            ..Default::default()
+        };
+        let model = Mamba::new(config).expect("model creation failed");
+        let tmp = std::env::temp_dir().join("test_mamba_save_weights.safetensors");
+        model.save_weights(&tmp).expect("save_weights failed");
+        let data = std::fs::read(&tmp).expect("read file");
+        let tensors = safetensors::SafeTensors::deserialize(&data).expect("deserialize");
+        assert!(!tensors.names().is_empty(), "no tensors written");
+        std::fs::remove_file(&tmp).ok();
     }
 }

@@ -207,8 +207,8 @@ fn test_dct_pipeline() {
     let signal = Array1::linspace(0.0, 1.0, 128);
 
     let encoded = tokenizer.encode(&signal).expect("Encoding failed");
-    // DCT returns num_coeffs elements, not signal.len()
-    assert_eq!(encoded.len(), 64);
+    // DCT: token[0] = max_val header, tokens[1..65] = 64 quantized coefficients.
+    assert_eq!(encoded.len(), 65);
 
     let decoded = tokenizer.decode(&encoded).expect("Decoding failed");
     // DCT decoder reconstructs to num_coeffs length (lossy compression)

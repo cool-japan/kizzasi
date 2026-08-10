@@ -13,9 +13,14 @@ publish = false
 
 [features]
 default = ["std"]
-std = []
-fixed-point = []
+# `std` implies `alloc` and provides f32 math methods (sqrt, round, ...).
+std = ["alloc"]
+# `alloc` enables heap allocation via the `alloc` crate (Vec, Box, ...).
 alloc = []
+# `libm` provides f32 math shims (sqrt, round, ...) for `no_std` targets.
+libm = ["dep:libm"]
+# `fixed-point` enables Q16.16 fixed-point arithmetic.
+fixed-point = []
 
 [dependencies]
 libm = { version = "0.2", optional = true }

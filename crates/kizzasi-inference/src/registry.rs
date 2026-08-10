@@ -240,12 +240,44 @@ impl ModelRegistry {
                 let model = Rwkv5Model::new(model_config).map_err(InferenceError::ModelError)?;
                 Ok(Box::new(model))
             }
-            ModelType::NeuralOde => Err(InferenceError::PipelineConfig(
-                "NeuralOde not yet supported in registry - use NeuralOdeModel directly".into(),
-            )),
-            ModelType::MultiModal => Err(InferenceError::PipelineConfig(
-                "MultiModal not yet supported in registry - use MultiModalModel directly".into(),
-            )),
+            ModelType::NeuralOde => {
+                use kizzasi_model::neural_ode::{NeuralOdeConfig, NeuralOdeModel, OdeSolver};
+                let model_config = NeuralOdeConfig {
+                    input_dim: config.input_dim,
+                    hidden_dim: config.hidden_dim,
+                    num_layers: config.num_layers.max(1),
+                    solver: OdeSolver::Rk4,
+                    dt: 0.01,
+                    integration_steps: 10,
+                    context_length: 4096.max(config.input_dim),
+                };
+                let model =
+                    NeuralOdeModel::new(model_config).map_err(InferenceError::ModelError)?;
+                Ok(Box::new(model))
+            }
+            ModelType::MultiModal => {
+                use kizzasi_model::multimodal::{
+                    FusionStrategy, Modality, ModalityEncoderConfig, MultiModalConfig,
+                    MultiModalModel,
+                };
+                let fusion_dim = config.hidden_dim;
+                let modality = ModalityEncoderConfig {
+                    modality: Modality::Sensor,
+                    input_dim: config.input_dim,
+                    projection_dim: fusion_dim,
+                    num_layers: config.num_layers.max(1),
+                };
+                let model_config = MultiModalConfig {
+                    fusion_dim,
+                    fusion_strategy: FusionStrategy::Addition,
+                    output_dim: config.output_dim,
+                    modalities: vec![modality],
+                    context_length: 4096.max(config.input_dim),
+                };
+                let model =
+                    MultiModalModel::new(model_config).map_err(InferenceError::ModelError)?;
+                Ok(Box::new(model))
+            }
             ModelType::Snn => {
                 use kizzasi_model::spiking::{SpikingConfig, SpikingNeuralNetwork};
                 let model_config = SpikingConfig::new(
@@ -615,5 +647,110 @@ mod tests {
         let _ = std::fs::remove_file(&bad_path);
 
         assert!(result.is_err(), "bad JSON should produce error");
+    }
+
+    // -----------------------------------------------------------------
+    // Track 4: NeuralOde and MultiModal factory arms
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_registry_creates_neural_ode() {
+        let mut registry = ModelRegistry::new();
+        let config = ModelConfig {
+            model_type: ModelType::NeuralOde,
+            input_dim: 4,
+            hidden_dim: 16,
+            output_dim: 4,
+            num_layers: 1,
+            state_dim: 8,
+            weights_path: None,
+        };
+        registry.register("test-neural-ode", config);
+        let result = registry.create_model("test-neural-ode");
+        assert!(
+            result.is_ok(),
+            "NeuralOde registry creation failed: {:?}",
+            result.err()
+        );
+        let model = result.unwrap();
+        assert_eq!(model.model_type(), ModelType::NeuralOde);
+    }
+
+    #[test]
+    fn test_registry_creates_multimodal() {
+        let mut registry = ModelRegistry::new();
+        let config = ModelConfig {
+            model_type: ModelType::MultiModal,
+            input_dim: 4,
+            hidden_dim: 16,
+            output_dim: 4,
+            num_layers: 1,
+            state_dim: 8,
+            weights_path: None,
+        };
+        registry.register("test-multimodal", config);
+        let result = registry.create_model("test-multimodal");
+        assert!(
+            result.is_ok(),
+            "MultiModal registry creation failed: {:?}",
+            result.err()
+        );
+        let model = result.unwrap();
+        assert_eq!(model.model_type(), ModelType::MultiModal);
+    }
+
+    #[test]
+    fn test_registry_neural_ode_step_finite() {
+        use scirs2_core::ndarray::Array1;
+        let registry = ModelRegistry::new();
+        let config = ModelConfig {
+            model_type: ModelType::NeuralOde,
+            input_dim: 4,
+            hidden_dim: 16,
+            output_dim: 4,
+            num_layers: 1,
+            state_dim: 8,
+            weights_path: None,
+        };
+        let mut model = registry
+            .create_from_config(&config)
+            .expect("create NeuralOde model");
+        let input = Array1::zeros(4);
+        let result = model.step(&input);
+        assert!(result.is_ok(), "NeuralOde step failed: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(
+            output.iter().all(|v| v.is_finite()),
+            "NeuralOde step output contains non-finite values: {:?}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_registry_multimodal_step_finite() {
+        use scirs2_core::ndarray::Array1;
+        let registry = ModelRegistry::new();
+        let config = ModelConfig {
+            model_type: ModelType::MultiModal,
+            input_dim: 4,
+            hidden_dim: 16,
+            output_dim: 4,
+            num_layers: 1,
+            state_dim: 8,
+            weights_path: None,
+        };
+        let mut model = registry
+            .create_from_config(&config)
+            .expect("create MultiModal model");
+        // MultiModal with a single Sensor encoder of input_dim=4 expects 4-element input
+        let input = Array1::zeros(4);
+        let result = model.step(&input);
+        assert!(result.is_ok(), "MultiModal step failed: {:?}", result.err());
+        let output = result.unwrap();
+        assert!(
+            output.iter().all(|v| v.is_finite()),
+            "MultiModal step output contains non-finite values: {:?}",
+            output
+        );
     }
 }

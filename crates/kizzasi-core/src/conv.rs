@@ -3,6 +3,7 @@
 //! Causal convolutions are essential for autoregressive models as they
 //! ensure the output at time t only depends on inputs at times <= t.
 
+use crate::error::{CoreError, CoreResult};
 use scirs2_core::ndarray::Array1;
 
 /// 1D Causal Convolution Layer
@@ -130,35 +131,42 @@ impl CausalConv1d {
     }
 
     /// Get the current history buffer state
-    /// Returns kernel_size - 1 frames (excluding current input if present)
+    ///
+    /// Returns ALL frames currently held in the ring buffer, exactly as they
+    /// exist. Length is in the range `0..=kernel_size`. In particular, the
+    /// returned buffer is enough to fully reproduce the convolution state for a
+    /// round trip with [`Self::set_history`].
+    ///
+    /// Note: under normal usage, `history.len()` is either `kernel_size - 1`
+    /// (between calls) or `kernel_size` (mid-`forward_step`, before trim). The
+    /// fresh state has `kernel_size - 1` zero-filled frames.
     pub fn get_history(&self) -> Vec<Vec<f32>> {
-        // If history has kernel_size elements (after forward_step but before next call),
-        // we only save the first kernel_size - 1 elements
-        let expected_len = self.kernel_size - 1;
-        if self.history.len() >= expected_len {
-            self.history[..expected_len].to_vec()
-        } else {
-            self.history.clone()
-        }
+        self.history.clone()
     }
 
     /// Set the history buffer state
-    pub fn set_history(&mut self, history: Vec<Vec<f32>>) {
-        assert_eq!(
-            history.len(),
-            self.kernel_size - 1,
-            "History length must be kernel_size - 1 = {}",
-            self.kernel_size - 1
-        );
+    ///
+    /// Accepts a history buffer of any length up to `kernel_size`. Each frame
+    /// must have exactly `in_channels` elements. Returns
+    /// [`CoreError::DimensionMismatch`] if either constraint is violated, so
+    /// the caller can surface state-restoration failures rather than panicking.
+    pub fn set_history(&mut self, history: Vec<Vec<f32>>) -> CoreResult<()> {
+        if history.len() > self.kernel_size {
+            return Err(CoreError::DimensionMismatch {
+                expected: self.kernel_size,
+                got: history.len(),
+            });
+        }
         for h in &history {
-            assert_eq!(
-                h.len(),
-                self.in_channels,
-                "Each history frame must have in_channels = {} elements",
-                self.in_channels
-            );
+            if h.len() != self.in_channels {
+                return Err(CoreError::DimensionMismatch {
+                    expected: self.in_channels,
+                    got: h.len(),
+                });
+            }
         }
         self.history = history;
+        Ok(())
     }
 
     /// Get kernel size
@@ -261,7 +269,9 @@ impl DepthwiseCausalConv1d {
 
     /// Forward for Array1
     pub fn forward(&mut self, input: &Array1<f32>) -> Array1<f32> {
-        Array1::from_vec(self.forward_step(input.as_slice().unwrap()))
+        Array1::from_vec(
+            self.forward_step(input.as_slice().expect("invariant: Array1 is contiguous")),
+        )
     }
 
     /// Forward pass for batch
@@ -277,35 +287,38 @@ impl DepthwiseCausalConv1d {
     }
 
     /// Get the current history buffer state
-    /// Returns kernel_size - 1 frames (excluding current input if present)
+    ///
+    /// Returns ALL frames currently held in the ring buffer, exactly as they
+    /// exist. Length is in the range `0..=kernel_size`. The fresh state has
+    /// `kernel_size - 1` zero-filled frames; after each `forward_step`, the
+    /// buffer is trimmed back to `kernel_size - 1`. Used for full-fidelity
+    /// state snapshots.
     pub fn get_history(&self) -> Vec<Vec<f32>> {
-        // If history has kernel_size elements (after forward_step but before next call),
-        // we only save the first kernel_size - 1 elements
-        let expected_len = self.kernel_size - 1;
-        if self.history.len() >= expected_len {
-            self.history[..expected_len].to_vec()
-        } else {
-            self.history.clone()
-        }
+        self.history.clone()
     }
 
     /// Set the history buffer state
-    pub fn set_history(&mut self, history: Vec<Vec<f32>>) {
-        assert_eq!(
-            history.len(),
-            self.kernel_size - 1,
-            "History length must be kernel_size - 1 = {}",
-            self.kernel_size - 1
-        );
+    ///
+    /// Accepts a history buffer of any length up to `kernel_size`. Each frame
+    /// must have exactly `channels` elements. Returns
+    /// [`CoreError::DimensionMismatch`] otherwise.
+    pub fn set_history(&mut self, history: Vec<Vec<f32>>) -> CoreResult<()> {
+        if history.len() > self.kernel_size {
+            return Err(CoreError::DimensionMismatch {
+                expected: self.kernel_size,
+                got: history.len(),
+            });
+        }
         for h in &history {
-            assert_eq!(
-                h.len(),
-                self.channels,
-                "Each history frame must have channels = {} elements",
-                self.channels
-            );
+            if h.len() != self.channels {
+                return Err(CoreError::DimensionMismatch {
+                    expected: self.channels,
+                    got: h.len(),
+                });
+            }
         }
         self.history = history;
+        Ok(())
     }
 
     /// Get kernel size
@@ -438,7 +451,9 @@ impl DilatedCausalConv1d {
 
     /// Forward for Array1
     pub fn forward(&mut self, input: &Array1<f32>) -> Array1<f32> {
-        Array1::from_vec(self.forward_step(input.as_slice().unwrap()))
+        Array1::from_vec(
+            self.forward_step(input.as_slice().expect("invariant: Array1 is contiguous")),
+        )
     }
 
     /// Reset history
@@ -613,5 +628,139 @@ mod tests {
         let _ = conv2.forward_step(&[0.5, 0.5]);
 
         // First two outputs were identical, proving causality
+    }
+
+    /// Generate a deterministic test sequence for round-trip tests.
+    fn make_sequence(num_steps: usize, channels: usize) -> Vec<Vec<f32>> {
+        (0..num_steps)
+            .map(|t| {
+                (0..channels)
+                    .map(|c| 0.05 + (t as f32) * 0.07 + (c as f32) * 0.013)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Round-trip check helper for `CausalConv1d`.
+    ///
+    /// Drives the conv `num_steps` times with a deterministic sequence,
+    /// snapshots its state, advances it with a "throwaway" step that is
+    /// guaranteed to mutate the buffer, then restores the snapshot and steps
+    /// it forward with the SAME final input. The post-snapshot output must
+    /// match the snapshot-restored output bit-exactly: if `get_history` /
+    /// `set_history` are lossy, the two outputs diverge.
+    fn assert_causal_conv1d_roundtrip(in_channels: usize, kernel_size: usize, num_steps: usize) {
+        let mut conv = CausalConv1d::new(in_channels, in_channels.max(1), kernel_size);
+        let sequence = make_sequence(num_steps + 2, in_channels);
+
+        // Warm up `num_steps`.
+        for step in sequence.iter().take(num_steps) {
+            let _ = conv.forward_step(step);
+        }
+
+        // Snapshot, then step with sequence[num_steps] and record the output.
+        let snapshot = conv.get_history();
+        let final_input = &sequence[num_steps];
+        let original_output = conv.forward_step(final_input);
+
+        // Mutate the conv further so any state leakage shows up.
+        for step in sequence.iter().skip(num_steps + 1) {
+            let _ = conv.forward_step(step);
+        }
+
+        // Restore snapshot and replay the SAME step. Output must match exactly.
+        conv.set_history(snapshot)
+            .expect("set_history must accept its own snapshot");
+        let restored_output = conv.forward_step(final_input);
+
+        assert_eq!(
+            original_output.len(),
+            restored_output.len(),
+            "round-trip output length mismatch at num_steps={num_steps}",
+        );
+        for (i, (a, b)) in original_output
+            .iter()
+            .zip(restored_output.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "Causal conv round-trip differ at num_steps={num_steps}, idx {i}: {a} vs {b}",
+            );
+        }
+    }
+
+    /// Round-trip check helper for `DepthwiseCausalConv1d`.
+    fn assert_depthwise_roundtrip(channels: usize, kernel_size: usize, num_steps: usize) {
+        let mut conv = DepthwiseCausalConv1d::new(channels, kernel_size);
+        let sequence = make_sequence(num_steps + 2, channels);
+
+        for step in sequence.iter().take(num_steps) {
+            let _ = conv.forward_step(step);
+        }
+
+        let snapshot = conv.get_history();
+        let final_input = &sequence[num_steps];
+        let original_output = conv.forward_step(final_input);
+
+        for step in sequence.iter().skip(num_steps + 1) {
+            let _ = conv.forward_step(step);
+        }
+
+        conv.set_history(snapshot)
+            .expect("set_history must accept its own snapshot");
+        let restored_output = conv.forward_step(final_input);
+
+        for (i, (a, b)) in original_output
+            .iter()
+            .zip(restored_output.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "Depthwise conv round-trip differ at num_steps={num_steps}, idx {i}: {a} vs {b}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_causal_conv1d_history_roundtrip() {
+        // Cover the boundary cases: no steps (initial buffer of zeros),
+        // partial fill, exactly kernel_size - 1, exactly kernel_size, and
+        // well past kernel_size so the ring buffer has been trimmed.
+        let kernel_size = 4;
+        for num_steps in [0, 1, kernel_size - 1, kernel_size, kernel_size + 5] {
+            assert_causal_conv1d_roundtrip(3, kernel_size, num_steps);
+        }
+    }
+
+    #[test]
+    fn test_depthwise_causal_history_roundtrip() {
+        let kernel_size = 5;
+        for num_steps in [0, 1, kernel_size - 1, kernel_size, kernel_size + 7] {
+            assert_depthwise_roundtrip(4, kernel_size, num_steps);
+        }
+    }
+
+    #[test]
+    fn test_causal_conv1d_set_history_rejects_oversized() {
+        let mut conv = CausalConv1d::new(2, 2, 3);
+        // kernel_size = 3, so anything > 3 frames must be rejected.
+        let too_many = vec![vec![0.0; 2]; 4];
+        assert!(conv.set_history(too_many).is_err());
+
+        // Wrong channel width must also be rejected.
+        let wrong_width = vec![vec![0.0; 7]; 2];
+        assert!(conv.set_history(wrong_width).is_err());
+    }
+
+    #[test]
+    fn test_depthwise_set_history_rejects_oversized() {
+        let mut conv = DepthwiseCausalConv1d::new(4, 3);
+        let too_many = vec![vec![0.0; 4]; 5];
+        assert!(conv.set_history(too_many).is_err());
+
+        let wrong_width = vec![vec![0.0; 9]; 2];
+        assert!(conv.set_history(wrong_width).is_err());
     }
 }

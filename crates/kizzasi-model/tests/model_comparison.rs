@@ -100,60 +100,118 @@ fn test_all_models_forward() {
     assert_eq!(output.unwrap().len(), 1);
 }
 
-/// Test state persistence across multiple steps
+/// Test state persistence across multiple steps.
+///
+/// Strategy mirrors `comprehensive_tests::test_state_persistence`: after
+/// running some steps, snapshot the state, advance, then restore the snapshot
+/// twice and confirm subsequent `step()` calls produce identical output. This
+/// validates determinism + `set_states` reproducibility without conflating
+/// `get_states` round-trip fidelity (which has known fidelity limitations for
+/// Mamba's auxiliary conv buffers — see issue #ssm-state-round-trip).
 #[test]
 fn test_state_persistence() {
     let mut mamba =
         Mamba::new(MambaConfig::new().hidden_dim(32).state_dim(8).num_layers(2)).unwrap();
 
-    // Run multiple steps
     let inputs = vec![
         Array1::from_vec(vec![0.1]),
         Array1::from_vec(vec![0.2]),
         Array1::from_vec(vec![0.3]),
     ];
 
-    let mut outputs = Vec::new();
+    // Build up some state.
     for input in &inputs {
-        let output = mamba.step(input).unwrap();
-        outputs.push(output);
+        let _ = mamba.step(input).unwrap();
     }
 
-    // Save states
-    let states = mamba.get_states();
-    assert_eq!(states.len(), 2); // 2 layers
+    // Snapshot state.
+    let snapshot = mamba.get_states();
+    assert_eq!(snapshot.len(), 2); // 2 layers
 
-    // Reset and run again - should get different outputs
+    // Advance the model past the snapshot.
+    for input in &inputs {
+        let _ = mamba.step(input).unwrap();
+    }
+
+    // Confirm reset diverges from the snapshot trajectory.
     mamba.reset();
     let output_after_reset = mamba.step(&inputs[2]).unwrap();
 
-    // The output should be different from the third output before reset
-    // (since state was reset)
-    let diff: f32 = outputs[2]
+    // Restore snapshot, step once.
+    mamba.set_states(snapshot.clone()).unwrap();
+    let output_first_restore = mamba.step(&inputs[2]).unwrap();
+
+    // Reset trajectory must be different from the snapshot-restored trajectory.
+    let diff_reset: f32 = output_first_restore
         .iter()
         .zip(output_after_reset.iter())
         .map(|(a, b)| (a - b).abs())
         .sum();
-    assert!(diff > 1e-6, "Reset should change the output");
+    assert!(
+        diff_reset > 1e-6,
+        "Reset trajectory should differ from snapshot-restored trajectory (diff = {})",
+        diff_reset
+    );
 
-    // Restore states and run - should match
-    mamba.reset();
-    for input in &inputs[..2] {
+    // Restore the same snapshot again — second restore must reproduce the
+    // first restore exactly (determinism).
+    mamba.set_states(snapshot).unwrap();
+    let output_second_restore = mamba.step(&inputs[2]).unwrap();
+
+    for i in 0..output_first_restore.len() {
+        assert!(
+            (output_first_restore[i] - output_second_restore[i]).abs() < 1e-4,
+            "Mismatch at index {}: first={} vs second={}",
+            i,
+            output_first_restore[i],
+            output_second_restore[i]
+        );
+    }
+}
+
+/// Test that `Mamba::get_states` / `set_states` round-trip is fully faithful.
+///
+/// This is the strict counterpart to `test_state_persistence`: it does not
+/// merely check determinism on repeated restore — it checks that
+/// `set_states(snapshot)` followed by `step(x)` produces the SAME output as
+/// the original `step(x)` taken immediately after `get_states()`. A lossy
+/// state snapshot (e.g. one that drops a frame of the conv history buffer)
+/// will fail this test even though it can still pass the determinism check.
+#[test]
+fn test_state_roundtrip_fidelity() {
+    let mut mamba =
+        Mamba::new(MambaConfig::new().hidden_dim(32).state_dim(8).num_layers(2)).unwrap();
+    let inputs: Vec<Array1<f32>> = (0..8)
+        .map(|i| Array1::from_vec(vec![0.1 + i as f32 * 0.07]))
+        .collect();
+
+    // Run 5 steps to build up nontrivial state across both layers and the
+    // causal conv history buffers, then snapshot.
+    for input in inputs.iter().take(5) {
         let _ = mamba.step(input).unwrap();
     }
-    mamba.set_states(states).unwrap();
-    let output_after_restore = mamba.step(&inputs[2]).unwrap();
+    let snapshot = mamba.get_states();
+    let original_output = mamba.step(&inputs[5]).unwrap();
 
-    let diff: f32 = outputs[2]
-        .iter()
-        .zip(output_after_restore.iter())
-        .map(|(a, b)| (a - b).abs())
-        .sum();
-    assert!(
-        diff < 1e-3,
-        "Restored state should produce same output: diff = {}",
-        diff
-    );
+    // Advance the model so any state leakage from the snapshot is visible
+    // immediately. Then restore the snapshot and replay the SAME input.
+    let _ = mamba.step(&inputs[6]).unwrap();
+    let _ = mamba.step(&inputs[7]).unwrap();
+    mamba.set_states(snapshot).unwrap();
+    let restored_output = mamba.step(&inputs[5]).unwrap();
+
+    assert_eq!(original_output.len(), restored_output.len());
+    for i in 0..original_output.len() {
+        let diff = (original_output[i] - restored_output[i]).abs();
+        assert!(
+            diff < 1e-6,
+            "State round-trip should be exact: idx {} original={} restored={} diff={}",
+            i,
+            original_output[i],
+            restored_output[i],
+            diff,
+        );
+    }
 }
 
 /// Test numerical stability with edge cases

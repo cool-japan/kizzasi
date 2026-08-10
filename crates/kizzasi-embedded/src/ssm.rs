@@ -4,8 +4,11 @@
 //! recurrent hidden state, while the step functions themselves require no
 //! additional heap allocation at inference time.
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+// Pull `Vec` and the `vec!` macro from the `alloc` crate when building
+// without `std`. The `std` feature implies `alloc`, but when `std` is on we
+// rely on libstd's prelude to already provide both.
+#[cfg(all(feature = "alloc", not(feature = "std")))]
+use alloc::{vec, vec::Vec};
 
 use crate::error::{EmbeddedError, EmbeddedResult};
 use crate::math::{exp_approx, softplus};

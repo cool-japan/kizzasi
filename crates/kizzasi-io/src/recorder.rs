@@ -193,6 +193,14 @@ impl StreamRecorder {
                     .write_all(header_str.as_bytes())
                     .await
                     .map_err(|e| IoError::WriteFailed(format!("Failed to write header: {}", e)))?;
+                // Terminate the header on its own line. `StreamPlayer::new` splits the file
+                // by accumulating lines until the buffer parses as a standalone JSON value;
+                // without this newline, the header's closing `}` glues onto the first JSONL
+                // frame line (`}{"samples":...}`), which never parses as valid JSON on its
+                // own, so the header is never recognized as complete.
+                writer.write_all(b"\n").await.map_err(|e| {
+                    IoError::WriteFailed(format!("Failed to write header terminator: {}", e))
+                })?;
             }
             RecorderFormat::Csv => {
                 // Write CSV header
@@ -362,6 +370,10 @@ pub struct StreamPlayer {
     reader: BufReader<File>,
     frame_count: usize,
     format: RecorderFormat,
+    /// Pre-loaded frames for JSON/CSV formats
+    text_frames: Vec<RecordedFrame>,
+    /// Index into text_frames for the next frame to return
+    text_frame_index: usize,
 }
 
 impl StreamPlayer {
@@ -400,10 +412,181 @@ impl StreamPlayer {
 
             (RecorderFormat::Binary, config)
         } else {
-            // Try JSON or CSV
-            return Err(IoError::ReadFailed(
-                "Non-binary format playback not yet implemented".into(),
-            ));
+            // Try JSON or CSV — magic contains the first 8 bytes of the text file
+            // Read the rest of the file
+            let mut rest = Vec::new();
+            reader
+                .read_to_end(&mut rest)
+                .await
+                .map_err(|e| IoError::ReadFailed(format!("Failed to read file: {}", e)))?;
+
+            // Reconstruct full file content
+            let mut content = Vec::with_capacity(8 + rest.len());
+            content.extend_from_slice(&magic);
+            content.extend_from_slice(&rest);
+
+            let content_str = String::from_utf8(content)
+                .map_err(|e| IoError::ReadFailed(format!("File is not valid UTF-8: {}", e)))?;
+
+            // Detect format by first non-whitespace byte
+            let first_char = content_str.trim_start().chars().next().unwrap_or('\0');
+
+            if first_char == '{' || first_char == '[' {
+                // JSON format: first line is pretty-printed header, rest are JSONL frames
+                let all_lines: Vec<&str> = content_str.lines().collect();
+                let mut header_buf = String::new();
+                let mut header_parsed: Option<serde_json::Value> = None;
+                let mut remaining_lines: Vec<&str> = Vec::new();
+                let mut i = 0;
+                while i < all_lines.len() {
+                    header_buf.push_str(all_lines[i]);
+                    header_buf.push('\n');
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&header_buf) {
+                        header_parsed = Some(v);
+                        i += 1;
+                        remaining_lines = all_lines[i..].to_vec();
+                        break;
+                    }
+                    i += 1;
+                }
+
+                let header_val = header_parsed
+                    .ok_or_else(|| IoError::ReadFailed("Failed to parse JSON header".into()))?;
+
+                let config: RecorderConfig = serde_json::from_value(header_val["config"].clone())
+                    .map_err(|e| {
+                    IoError::ReadFailed(format!("Failed to parse config from JSON header: {}", e))
+                })?;
+
+                // Parse JSONL frames
+                let mut text_frames: Vec<RecordedFrame> = Vec::new();
+                for line in remaining_lines {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let frame: RecordedFrame = serde_json::from_str(trimmed).map_err(|e| {
+                        IoError::ReadFailed(format!("Failed to parse JSON frame: {}", e))
+                    })?;
+                    text_frames.push(frame);
+                }
+
+                info!("Stream player opened: Json ({} frames)", text_frames.len());
+
+                return Ok(Self {
+                    config,
+                    reader,
+                    frame_count: 0,
+                    format: RecorderFormat::Json,
+                    text_frames,
+                    text_frame_index: 0,
+                });
+            } else {
+                // CSV format
+                let mut csv_lines = content_str.lines();
+
+                let header_line = csv_lines
+                    .next()
+                    .ok_or_else(|| IoError::ReadFailed("CSV file is empty".into()))?;
+
+                // Detect whether timestamps are present
+                let has_timestamp = header_line.contains("timestamp");
+
+                let config = RecorderConfig {
+                    record_timestamps: has_timestamp,
+                    ..RecorderConfig::default()
+                };
+
+                let mut text_frames: Vec<RecordedFrame> = Vec::new();
+                for (line_idx, line) in csv_lines.enumerate() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let (frame_number, timestamp, samples) = if has_timestamp {
+                        let parts: Vec<&str> = trimmed.splitn(3, ',').collect();
+                        if parts.len() < 3 {
+                            return Err(IoError::ReadFailed(format!(
+                                "CSV line {} has too few fields: {:?}",
+                                line_idx + 2,
+                                trimmed
+                            )));
+                        }
+                        let fn_ = parts[0].parse::<usize>().map_err(|e| {
+                            IoError::ReadFailed(format!(
+                                "Invalid frame number on line {}: {}",
+                                line_idx + 2,
+                                e
+                            ))
+                        })?;
+                        let ts = parts[1].parse::<f64>().map_err(|e| {
+                            IoError::ReadFailed(format!(
+                                "Invalid timestamp on line {}: {}",
+                                line_idx + 2,
+                                e
+                            ))
+                        })?;
+                        let s: Vec<f32> = parts[2]
+                            .split(';')
+                            .filter(|s| !s.is_empty())
+                            .map(|s| {
+                                s.parse::<f32>().map_err(|e| {
+                                    IoError::ReadFailed(format!(
+                                        "Invalid sample value '{}': {}",
+                                        s, e
+                                    ))
+                                })
+                            })
+                            .collect::<IoResult<Vec<f32>>>()?;
+                        (fn_, Some(ts), s)
+                    } else {
+                        let parts: Vec<&str> = trimmed.splitn(2, ',').collect();
+                        if parts.len() < 2 {
+                            return Err(IoError::ReadFailed(format!(
+                                "CSV line {} has too few fields: {:?}",
+                                line_idx + 2,
+                                trimmed
+                            )));
+                        }
+                        let fn_ = parts[0].parse::<usize>().map_err(|e| {
+                            IoError::ReadFailed(format!(
+                                "Invalid frame number on line {}: {}",
+                                line_idx + 2,
+                                e
+                            ))
+                        })?;
+                        let s: Vec<f32> = parts[1]
+                            .split(';')
+                            .filter(|s| !s.is_empty())
+                            .map(|s| {
+                                s.parse::<f32>().map_err(|e| {
+                                    IoError::ReadFailed(format!(
+                                        "Invalid sample value '{}': {}",
+                                        s, e
+                                    ))
+                                })
+                            })
+                            .collect::<IoResult<Vec<f32>>>()?;
+                        (fn_, None, s)
+                    };
+                    text_frames.push(RecordedFrame {
+                        samples,
+                        timestamp,
+                        frame_number,
+                    });
+                }
+
+                info!("Stream player opened: Csv ({} frames)", text_frames.len());
+
+                return Ok(Self {
+                    config,
+                    reader,
+                    frame_count: 0,
+                    format: RecorderFormat::Csv,
+                    text_frames,
+                    text_frame_index: 0,
+                });
+            }
         };
 
         info!("Stream player opened: {:?}", format);
@@ -413,6 +596,8 @@ impl StreamPlayer {
             reader,
             frame_count: 0,
             format,
+            text_frames: Vec::new(),
+            text_frame_index: 0,
         })
     }
 
@@ -470,14 +655,86 @@ impl StreamPlayer {
 
                 Ok(Some(frame))
             }
-            _ => Err(IoError::ReadFailed("Format not supported yet".into())),
+            RecorderFormat::Json | RecorderFormat::Csv => {
+                if self.text_frame_index >= self.text_frames.len() {
+                    return Ok(None);
+                }
+                let mut frame = self.text_frames[self.text_frame_index].clone();
+                frame.frame_number = self.frame_count;
+                self.text_frame_index += 1;
+                self.frame_count += 1;
+                debug!("Read frame {}", frame.frame_number);
+                Ok(Some(frame))
+            }
         }
     }
 
     /// Seek to frame
-    pub async fn seek_to_frame(&mut self, _frame_number: usize) -> IoResult<()> {
-        // TODO: Implement seeking
-        Err(IoError::ReadFailed("Seeking not yet implemented".into()))
+    pub async fn seek_to_frame(&mut self, frame_number: usize) -> IoResult<()> {
+        use std::io::SeekFrom;
+        use tokio::io::AsyncSeekExt;
+
+        match self.format {
+            RecorderFormat::Binary => {
+                // Rewind to file start
+                self.reader
+                    .seek(SeekFrom::Start(0))
+                    .await
+                    .map_err(|e| IoError::ReadFailed(format!("Failed to seek to start: {}", e)))?;
+
+                // Skip 8-byte magic ("ZHREC001")
+                self.reader
+                    .seek(SeekFrom::Current(8))
+                    .await
+                    .map_err(|e| IoError::ReadFailed(format!("Failed to skip magic: {}", e)))?;
+
+                // Read config_len, then skip those bytes
+                let mut len_bytes = [0u8; 4];
+                self.reader.read_exact(&mut len_bytes).await.map_err(|e| {
+                    IoError::ReadFailed(format!("Failed to read config length: {}", e))
+                })?;
+                let config_len = u32::from_le_bytes(len_bytes) as i64;
+                self.reader
+                    .seek(SeekFrom::Current(config_len))
+                    .await
+                    .map_err(|e| IoError::ReadFailed(format!("Failed to skip config: {}", e)))?;
+
+                // Advance past frame_number frames
+                let ts_bytes: i64 = if self.config.record_timestamps { 8 } else { 0 };
+                for i in 0..frame_number {
+                    let mut count_buf = [0u8; 4];
+                    match self.reader.read_exact(&mut count_buf).await {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            return Err(IoError::ReadFailed(format!(
+                                "Cannot seek to frame {}: only {} frames in recording",
+                                frame_number, i
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(IoError::ReadFailed(format!(
+                                "Failed to read frame {} count: {}",
+                                i, e
+                            )));
+                        }
+                    }
+                    let sample_count = u32::from_le_bytes(count_buf) as i64;
+                    let frame_body = ts_bytes + sample_count * 4;
+                    self.reader
+                        .seek(SeekFrom::Current(frame_body))
+                        .await
+                        .map_err(|e| {
+                            IoError::ReadFailed(format!("Failed to skip frame {}: {}", i, e))
+                        })?;
+                }
+
+                self.frame_count = frame_number;
+                Ok(())
+            }
+            _ => Err(IoError::ReadFailed(
+                "Seeking is only supported for binary format".into(),
+            )),
+        }
     }
 
     /// Get configuration
@@ -563,5 +820,259 @@ mod tests {
 
         // Cleanup
         std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_seek_to_frame_binary() {
+        let temp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path = temp_dir.join(format!(
+            "kizzasi_seek_test_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+
+        let config = RecorderConfig {
+            path: path.to_string_lossy().to_string(),
+            format: RecorderFormat::Binary,
+            sample_rate: 44100.0,
+            channels: 1,
+            buffer_size: 1024,
+            record_timestamps: true,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mut recorder = StreamRecorder::new(config).await.unwrap();
+        for i in 0usize..5 {
+            let v = i as f32;
+            recorder
+                .record_samples(&[v, v + 1.0, v + 2.0], None)
+                .await
+                .unwrap();
+        }
+        recorder.finalize().await.unwrap();
+
+        let mut player = StreamPlayer::new(&path).await.unwrap();
+        player.seek_to_frame(2).await.unwrap();
+        let frame = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame.frame_number, 2);
+        assert_eq!(frame.samples, vec![2.0, 3.0, 4.0]);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_seek_to_frame_zero() {
+        let temp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(1);
+        let path = temp_dir.join(format!(
+            "kizzasi_seek_zero_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+
+        let config = RecorderConfig {
+            path: path.to_string_lossy().to_string(),
+            format: RecorderFormat::Binary,
+            sample_rate: 44100.0,
+            channels: 1,
+            buffer_size: 1024,
+            record_timestamps: true,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mut recorder = StreamRecorder::new(config).await.unwrap();
+        recorder.record_samples(&[1.0, 2.0], None).await.unwrap();
+        recorder.record_samples(&[3.0, 4.0], None).await.unwrap();
+        recorder.finalize().await.unwrap();
+
+        let mut player = StreamPlayer::new(&path).await.unwrap();
+        // Advance to frame 1
+        let _ = player.next_frame().await.unwrap();
+        // Seek back to 0
+        player.seek_to_frame(0).await.unwrap();
+        let frame = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame.frame_number, 0);
+        assert_eq!(frame.samples, vec![1.0, 2.0]);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_seek_past_end() {
+        let temp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(2);
+        let path = temp_dir.join(format!(
+            "kizzasi_seek_past_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+
+        let config = RecorderConfig {
+            path: path.to_string_lossy().to_string(),
+            format: RecorderFormat::Binary,
+            sample_rate: 44100.0,
+            channels: 1,
+            buffer_size: 1024,
+            record_timestamps: true,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mut recorder = StreamRecorder::new(config).await.unwrap();
+        recorder.record_samples(&[1.0], None).await.unwrap();
+        recorder.record_samples(&[2.0], None).await.unwrap();
+        recorder.record_samples(&[3.0], None).await.unwrap();
+        recorder.finalize().await.unwrap();
+
+        let mut player = StreamPlayer::new(&path).await.unwrap();
+        let result = player.seek_to_frame(10).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("3") || err_msg.contains("frame"),
+            "Error message should mention frame count: {}",
+            err_msg
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_seek_no_timestamps() {
+        let temp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(3);
+        let path = temp_dir.join(format!(
+            "kizzasi_seek_nots_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+
+        let config = RecorderConfig {
+            path: path.to_string_lossy().to_string(),
+            format: RecorderFormat::Binary,
+            sample_rate: 44100.0,
+            channels: 1,
+            buffer_size: 1024,
+            record_timestamps: false,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mut recorder = StreamRecorder::new(config).await.unwrap();
+        recorder.record_samples(&[10.0, 20.0], None).await.unwrap();
+        recorder.record_samples(&[30.0, 40.0], None).await.unwrap();
+        recorder.record_samples(&[50.0, 60.0], None).await.unwrap();
+        recorder.finalize().await.unwrap();
+
+        let mut player = StreamPlayer::new(&path).await.unwrap();
+        player.seek_to_frame(2).await.unwrap();
+        let frame = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame.frame_number, 2);
+        assert_eq!(frame.samples, vec![50.0, 60.0]);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_json_playback() {
+        let temp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(42);
+        let path = temp_dir.join(format!("kizzasi_json_{}_{}.json", std::process::id(), id));
+
+        let config = RecorderConfig {
+            path: path.to_string_lossy().to_string(),
+            format: RecorderFormat::Json,
+            sample_rate: 44100.0,
+            channels: 1,
+            buffer_size: 1024,
+            record_timestamps: true,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mut recorder = StreamRecorder::new(config).await.unwrap();
+        recorder
+            .record_samples(&[1.0, 2.0, 3.0], Some(0.1))
+            .await
+            .unwrap();
+        recorder
+            .record_samples(&[4.0, 5.0, 6.0], Some(0.2))
+            .await
+            .unwrap();
+        recorder.finalize().await.unwrap();
+
+        let mut player = StreamPlayer::new(&path).await.unwrap();
+
+        let frame1 = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame1.samples, vec![1.0, 2.0, 3.0]);
+        assert_eq!(frame1.frame_number, 0);
+        assert!(frame1.timestamp.is_some());
+
+        let frame2 = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame2.samples, vec![4.0, 5.0, 6.0]);
+        assert_eq!(frame2.frame_number, 1);
+        assert!(frame2.timestamp.is_some());
+
+        assert!(player.next_frame().await.unwrap().is_none());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_csv_playback() {
+        let temp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(43);
+        let path = temp_dir.join(format!("kizzasi_csv_{}_{}.csv", std::process::id(), id));
+
+        let config = RecorderConfig {
+            path: path.to_string_lossy().to_string(),
+            format: RecorderFormat::Csv,
+            sample_rate: 44100.0,
+            channels: 1,
+            buffer_size: 1024,
+            record_timestamps: true,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mut recorder = StreamRecorder::new(config).await.unwrap();
+        recorder
+            .record_samples(&[10.0, 20.0], Some(0.5))
+            .await
+            .unwrap();
+        recorder
+            .record_samples(&[30.0, 40.0], Some(1.0))
+            .await
+            .unwrap();
+        recorder.finalize().await.unwrap();
+
+        let mut player = StreamPlayer::new(&path).await.unwrap();
+
+        let frame1 = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame1.samples, vec![10.0, 20.0]);
+        assert_eq!(frame1.frame_number, 0);
+
+        let frame2 = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame2.samples, vec![30.0, 40.0]);
+        assert_eq!(frame2.frame_number, 1);
+
+        assert!(player.next_frame().await.unwrap().is_none());
+
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }

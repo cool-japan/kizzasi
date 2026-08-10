@@ -117,7 +117,44 @@ impl DerivativeConstraint {
                 let (_, v3) = values[3];
                 Some((v0 - &(v1 * 3.0) + &(v2 * 3.0) - v3) / (self.dt * self.dt * self.dt))
             }
-            _ => None, // Higher orders not implemented
+            _ => {
+                // General n-th order backward finite difference
+                // ∇ⁿ x[t] = sum_{k=0}^{n} (-1)^k * C(n,k) * x[t - k*dt]
+                // Needs n+1 values (already checked above).
+                //
+                // values[0] = most recent (x[t]), values[k] = x[t - k*dt]
+                // (collected via .iter().rev().take(n+1) above)
+                //
+                // Clamp to order 8 to prevent u64 overflow in binomial
+                // coefficients and catastrophic numeric instability.
+                let effective_n = n.min(8);
+
+                if values.len() < effective_n + 1 {
+                    return None;
+                }
+
+                // Compute binomial coefficients C(effective_n, k) via the
+                // multiplicative recurrence:
+                //   C(n, 0) = 1
+                //   C(n, k) = C(n, k-1) * (n - k + 1) / k
+                let mut binom = vec![0_u64; effective_n + 1];
+                binom[0] = 1;
+                for k in 1..=effective_n {
+                    binom[k] = binom[k - 1].saturating_mul((effective_n - k + 1) as u64) / k as u64;
+                }
+
+                let dt_n = self.dt.powi(effective_n as i32);
+
+                let dim = values[0].1.len();
+                let mut result = Array1::<f32>::zeros(dim);
+                for k in 0..=effective_n {
+                    let sign = if k % 2 == 0 { 1.0_f32 } else { -1.0_f32 };
+                    let coeff = sign * binom[k] as f32;
+                    result = result + &values[k].1 * coeff;
+                }
+
+                Some(result / dt_n)
+            }
         }
     }
 
@@ -655,5 +692,81 @@ mod tests {
 
         assert!(set.check_all());
         assert_eq!(set.num_constraints(), 1);
+    }
+
+    #[test]
+    fn test_derivative_constraint_4th_order() {
+        // 4th derivative of a quadratic x(t) = t^2 is 0.
+        // Feed samples at dt=1.0 so x[k] = k^2: [0, 1, 4, 9, 16, 25].
+        // max_history = 4+2 = 6, exactly fits all 6 points.
+        let dt = 1.0_f32;
+        let mut constraint =
+            DerivativeConstraint::new("jounce", DerivativeOrder::Custom(4), dt, 1000.0);
+
+        for step in 0_i32..6 {
+            constraint.observe(step as f32 * dt, Array1::from_vec(vec![step.pow(2) as f32]));
+        }
+
+        let deriv = constraint.get_derivative();
+        assert!(
+            deriv.is_some(),
+            "expected Some derivative after 6 observations"
+        );
+        let d = deriv.unwrap();
+        // 4th derivative of quadratic is exactly 0; allow generous float tolerance
+        assert!(
+            d[0].abs() < 1.0,
+            "4th derivative of quadratic should be ~0, got {}",
+            d[0]
+        );
+    }
+
+    #[test]
+    fn test_derivative_constraint_insufficient_history() {
+        // Custom(4) requires at least 5 observations; feeding only 3 must yield None.
+        let mut constraint =
+            DerivativeConstraint::new("jounce", DerivativeOrder::Custom(4), 1.0, 1000.0);
+
+        for step in 0_i32..3 {
+            constraint.observe(step as f32, Array1::from_vec(vec![step as f32]));
+        }
+
+        assert!(
+            constraint.get_derivative().is_none(),
+            "should return None when fewer than n+1 observations are available"
+        );
+    }
+
+    #[test]
+    fn test_derivative_constraint_custom_check() {
+        // Feed a near-impulse sequence [0,0,0,0,0,1] with tight max_magnitude.
+        // The 4th-order finite difference over this will produce a large value,
+        // causing a violation when max_magnitude = 0.001.
+        let dt = 0.1_f32;
+        let mut constraint =
+            DerivativeConstraint::new("jounce_check", DerivativeOrder::Custom(4), dt, 0.001);
+
+        let signal: [f32; 6] = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        for (i, &val) in signal.iter().enumerate() {
+            constraint.observe(i as f32 * dt, Array1::from_vec(vec![val]));
+        }
+
+        // The derivative must be Some (we have 6 >= 5 observations).
+        let deriv = constraint.get_derivative();
+        assert!(
+            deriv.is_some(),
+            "expected Some derivative for impulse signal"
+        );
+
+        // The 4th-order backward difference of [0,0,0,0,0,1] relative to dt=0.1
+        // is substantial; violation must be positive and check() must be false.
+        assert!(
+            constraint.violation() > 0.0,
+            "expected positive violation for impulse signal with tight max_magnitude"
+        );
+        assert!(
+            !constraint.check(),
+            "check() should fail for impulse signal with max_magnitude=0.001"
+        );
     }
 }
