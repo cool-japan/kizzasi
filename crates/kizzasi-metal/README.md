@@ -2,7 +2,7 @@
 
 Apple Metal backend activation shim for the Kizzasi ecosystem.
 
-![version](https://img.shields.io/badge/version-0.2.3-blue)
+![version](https://img.shields.io/badge/version-0.2.4-blue)
 ![status](https://img.shields.io/badge/status-alpha-orange)
 ![license](https://img.shields.io/badge/license-Apache--2.0-green)
 

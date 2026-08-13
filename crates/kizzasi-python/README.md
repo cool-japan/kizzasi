@@ -5,7 +5,7 @@
 Python bindings for the [Kizzasi](https://github.com/cool-japan/kizzasi) Rust framework, providing high-performance signal prediction using State Space Models (Mamba, RWKV, S4, Spiking NNs, Neural ODE) with neuro-symbolic constraint enforcement.
 
 ![status](https://img.shields.io/badge/status-alpha-orange)
-![version](https://img.shields.io/badge/version-0.2.3-blue)
+![version](https://img.shields.io/badge/version-0.2.4-blue)
 ![license](https://img.shields.io/badge/license-Apache--2.0-green)
 
 All classes below are fully implemented — 0 stub markers. Covered by both the crate's Rust-side unit test suite (`cargo nextest run -p kizzasi-python --all-features`, 100+ tests, including `Python::attach`-based tests that call the real `#[pymethods]` through actual `PyArray` conversions rather than the wrapped Rust types directly) and a Python-level `pytest` suite (`tests/test_smoke.py`) that imports the built wheel and exercises every registered class through the public Python API.
@@ -42,7 +42,7 @@ All classes are re-exported from the single `kizzasi` extension module — the s
 
 ```bash
 pip install kizzasi          # latest release
-pip install kizzasi==0.2.3   # pin to the current release
+pip install kizzasi==0.2.4   # pin to the current release
 ```
 
 ## Quick Start

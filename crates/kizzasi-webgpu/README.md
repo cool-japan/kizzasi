@@ -2,7 +2,7 @@
 
 GPU-accelerated WebGPU compute kernels for SSM inference in the Kizzasi ecosystem.
 
-![version](https://img.shields.io/badge/version-0.2.3-blue)
+![version](https://img.shields.io/badge/version-0.2.4-blue)
 ![status](https://img.shields.io/badge/status-alpha-orange)
 ![tests](https://img.shields.io/badge/tests-53%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-Apache--2.0-green)

@@ -1,7 +1,7 @@
 # kizzasi-embedded
 
 ![status](https://img.shields.io/badge/status-API%20evolving-yellow)
-![version](https://img.shields.io/badge/version-0.2.3-blue)
+![version](https://img.shields.io/badge/version-0.2.4-blue)
 ![license](https://img.shields.io/badge/license-Apache--2.0-green)
 ![published](https://img.shields.io/badge/crates.io-not%20published-lightgrey)
 

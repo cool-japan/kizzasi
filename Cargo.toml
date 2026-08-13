@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/kizzasi"
@@ -25,16 +25,16 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 # Internal crates
-kizzasi = { path = "crates/kizzasi", version = "0.2.3" }
-kizzasi-core = { path = "crates/kizzasi-core", version = "0.2.3" }
-kizzasi-model = { path = "crates/kizzasi-model", version = "0.2.3" }
-kizzasi-tokenizer = { path = "crates/kizzasi-tokenizer", version = "0.2.3" }
-kizzasi-inference = { path = "crates/kizzasi-inference", version = "0.2.3" }
-kizzasi-logic = { path = "crates/kizzasi-logic", version = "0.2.3" }
-kizzasi-io = { path = "crates/kizzasi-io", version = "0.2.3" }
-kizzasi-macros = { path = "crates/kizzasi-macros", version = "0.2.3" }
-kizzasi-metal = { path = "crates/kizzasi-metal", version = "0.2.3" }
-kizzasi-webgpu = { path = "crates/kizzasi-webgpu", version = "0.2.3" }
+kizzasi = { path = "crates/kizzasi", version = "0.2.4" }
+kizzasi-core = { path = "crates/kizzasi-core", version = "0.2.4" }
+kizzasi-model = { path = "crates/kizzasi-model", version = "0.2.4" }
+kizzasi-tokenizer = { path = "crates/kizzasi-tokenizer", version = "0.2.4" }
+kizzasi-inference = { path = "crates/kizzasi-inference", version = "0.2.4" }
+kizzasi-logic = { path = "crates/kizzasi-logic", version = "0.2.4" }
+kizzasi-io = { path = "crates/kizzasi-io", version = "0.2.4" }
+kizzasi-macros = { path = "crates/kizzasi-macros", version = "0.2.4" }
+kizzasi-metal = { path = "crates/kizzasi-metal", version = "0.2.4" }
+kizzasi-webgpu = { path = "crates/kizzasi-webgpu", version = "0.2.4" }
 wgpu = { version = "30" }
 
 # ============================================

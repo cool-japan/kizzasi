@@ -1,7 +1,7 @@
 # kizzasi-model
 
 [![Status: Stable](https://img.shields.io/badge/status-stable-brightgreen)](https://github.com/cool-japan/kizzasi)
-[![Version: 0.2.3](https://img.shields.io/badge/version-0.2.3-blue)](Cargo.toml)
+[![Version: 0.2.4](https://img.shields.io/badge/version-0.2.4-blue)](Cargo.toml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE)
 
 Model architectures for Kizzasi AGSP - Mamba, RWKV, S4, Transformer.

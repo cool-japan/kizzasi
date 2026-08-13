@@ -3,7 +3,7 @@
 Procedural macros for the Kizzasi AGSP ecosystem.
 
 ![status](https://img.shields.io/badge/status-stable-brightgreen)
-![version](https://img.shields.io/badge/version-0.2.3-blue)
+![version](https://img.shields.io/badge/version-0.2.4-blue)
 ![license](https://img.shields.io/badge/license-Apache--2.0-green)
 
 ## Overview
@@ -24,7 +24,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kizzasi-macros = "0.2.3"
+kizzasi-macros = "0.2.4"
 ```
 
 ### `#[derive(KizzasiConfig)]`

@@ -192,7 +192,7 @@ A Rust-native system for predicting continuous signal streams (audio, sensors, v
 
 ---
 
-## Current Status (v0.2.3)
+## Current Status (v0.2.4)
 
 ### Codebase Metrics
 
