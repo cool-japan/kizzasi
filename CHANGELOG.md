@@ -5,6 +5,100 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - Unreleased
+
+### Added
+
+**kizzasi-metal** (new workspace crate)
+- Target-gated activation of candle's Apple Metal backend. Declares `candle-core`/`candle-nn`
+  under `cfg(target_vendor = "apple")` with `features = ["metal"]` and plain `candle-core` under
+  `cfg(not(target_vendor = "apple"))`, which under `resolver = "2"` keeps the Metal backend out of
+  the dependency graph on non-Apple targets.
+- `BACKEND_COMPILED`, `unavailable_reason()`, `new_device()`, `is_available()`,
+  `device_ordinals()` — the last three return an honest failure (never a CPU device in disguise)
+  on targets where the backend was not compiled in.
+
+**kizzasi-io**
+- `video-pure` feature: a pure-Rust video backend (the OxiMedia stack — `oximedia-container` /
+  `oximedia-core` / `oximedia-cv` / `oximedia-capture` / `oximedia-codec` / `oximedia-simd`, no C
+  compiled or linked) alongside the existing FFmpeg-backed `video` feature. Decodes Y4M
+  (YUV4MPEG2) files end to end (demux, YUV→RGB/RGBA/Gray conversion, bilinear rescale) and
+  captures from cameras on Linux (V4L2), macOS (AVFoundation) and Windows (Media Foundation) —
+  `oximedia-capture` negotiates NV12 / YUYV / UYVY / planar-4:2:0 / RGB24 / MJPEG in ascending
+  conversion cost, `oximedia-codec` decodes MJPEG, `oximedia-simd` converts the packed 4:2:2
+  layouts. A live camera cannot seek (`IoError::Unsupported`, not silent frame-dropping); network
+  streams and non-Y4M containers stay FFmpeg-only. New `VideoBackend` enum (`Auto` / `Ffmpeg` /
+  `Pure`) on `VideoConfig::backend`: `Auto` (the default) prefers the pure backend per source where
+  it can open it and falls back to FFmpeg, forcing a backend errors honestly instead of silently
+  falling back if its feature is off or the source is unsupported. `oximedia-*` currently resolves
+  through `[patch.crates-io]` to a sibling `../oximedia` checkout (0.2.1 plus further uncommitted
+  work) because crates.io tops out at oximedia 0.2.0 — `cargo publish -p kizzasi-io` is blocked
+  until oximedia 0.2.2 ships the crates this feature depends on (see the `[patch.crates-io]`
+  comment in the root `Cargo.toml`).
+- `src/video.rs` (2152 lines; the pre-sweep version was a near-total stub — `VideoReader::new`
+  never opened anything, `read_frame` always returned immediate end-of-stream, `metadata()` was
+  hardcoded 30fps/0s/1920x1080 — fixed in an earlier pass this cycle, see `backend_ffmpeg`'s own
+  doc comment for the details it now replaces) split into `src/video/{mod, types, processing,
+  backend_ffmpeg, backend_pure, backend_pure_camera}.rs`. The public `kizzasi_io::Video*` surface
+  is unchanged; `backend_ffmpeg` is the only file touching `ffmpeg_next`,
+  `backend_pure`/`backend_pure_camera` the only files touching the `oximedia_*` crates.
+- `tracing` instrumentation (`debug!`/`info!`) across the video module: backend open/read paths,
+  camera device/format resolution, enumeration. The previous `video.rs` had none.
+
+### Changed
+
+**kizzasi-io**
+- `mqtt-tls` is now pure Rust. TLS transport moved off rustls's default aws-lc-rs provider (which
+  compiles the AWS-LC C/assembly library, `aws-lc-sys`) onto an explicitly-injected pure-Rust
+  RustCrypto provider (`oxitls-rustcrypto-provider`, a COOLJAPAN fork of `rustls-rustcrypto`
+  carrying the RUSTSEC-2026-0104 fix). Cipher suites narrow to the 9 AEAD suites the provider
+  implements — ECDHE-{ECDSA,RSA} × {AES-GCM,ChaCha20}, plus the three TLS 1.3 suites — with **no
+  CBC suites**; a broker pinned to CBC-only cipher suites will now fail the handshake. The provider
+  is unaudited pure-Rust code.
+- `CameraDevice::list_devices()`: with the new `video-pure` feature compiled in, this is now
+  `oximedia-capture`'s enumeration on every OS (see Added, above), preferred over the `video`-only
+  path even when `video` is also enabled. On Linux specifically this is a behaviour change even for
+  existing callers: the `video`-only path lists every `/dev/video*` node unconditionally, while
+  `oximedia-capture`'s V4L2 backend reports a node only when `VIDIOC_QUERYCAP` confirms
+  `V4L2_CAP_VIDEO_CAPTURE` *and* `V4L2_CAP_STREAMING` — a metadata, output-only, or M2M-encoder
+  node that used to appear in the list no longer does once `video-pure` is enabled.
+
+**Dependencies**
+- **The tensor backend moved from `candle-core`/`candle-nn` to `oxicandle-core`/`oxicandle-nn`**,
+  the COOLJAPAN fork of candle 0.11.0. Upstream candle-core's mandatory `tokenizers` dependency
+  selects the `onig` feature, which builds the Oniguruma C library (`onig`/`onig_sys`) — the one C
+  compilation that survived every previous purification pass, with no configuration lever inside
+  kizzasi to remove it. The fork selects `fancy-regex` instead (upstream candle PR #3790).
+  **The default build now compiles no C, for consumers of the published crates as well as for this
+  workspace.** That last part is the point of the change: the previous release candidate handled
+  this with a `[patch.crates-io]` entry pointing at a sibling `../candle` checkout, which fixed the
+  build here and nowhere else — `[patch]` does not propagate to crates.io, so anyone depending on a
+  published kizzasi crate still compiled `onig`. Verified against the published crate from outside
+  this workspace with `cargo tree -i onig`.
+
+  The dependency *keys* are unchanged (`candle-core` / `candle-nn` with `package = "oxicandle-*"`)
+  and the fork keeps the upstream library names, so `use candle_core::…` compiles unchanged and no
+  source file in this workspace was touched. `candle-metal-kernels` no longer needs an entry of its
+  own: the old patch had to cover it because a path-sourced and a registry-sourced crate of the same
+  version are distinct crates to Cargo, which made `--features metal` resolve two incompatible
+  instances; both fork crates now depend on the upstream registry `candle-metal-kernels 0.11.0`.
+  `deny.toml` bans `onig`/`onig_sys` outright and scopes the pre-existing `zip` exemption to the
+  renamed `oxicandle-core` wrapper.
+
+### Fixed
+
+- `cargo build`/`test`/`clippy --all-features` failed on every non-Apple host with
+  ``error: `objc2` only works on Apple platforms``. `kizzasi-core`'s `metal` feature forwarded
+  `candle-core/metal` directly, and Cargo features are not target-aware, so `--all-features` — the
+  command documented in the README and run by CI — pulled candle's Metal backend (and with it
+  `objc2`) into Linux and Windows builds. `metal` is now `["dep:kizzasi-metal"]`, so it resolves
+  everywhere and is live only on Apple. Enabling it off-Apple is inert but loud:
+  `is_metal_available()` is `false`, `get_best_device()` stays on CPU, and `DeviceType::Metal`
+  yields a `CoreError::DeviceError` naming the target.
+- **kizzasi-io**: `VideoConfig::from_camera` hardcoded `"video4linux2"` as the default
+  `camera_format` on every OS, even though `CameraDevice::default_format()` is platform-gated
+  (`dshow` on Windows, `avfoundation` on macOS) — the two now agree.
+
 ## [0.2.2] - 2026-08-09
 
 This release spans roughly three months of work across every crate in the workspace: a new

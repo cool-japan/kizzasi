@@ -3,12 +3,18 @@
 //! Provides an axum-based HTTP/1.1 + HTTP/2 REST server that exposes the Kizzasi
 //! inference engine over a simple JSON API.
 //!
+//! `POST /infer` is only engine-backed when a [`StreamingEngine`] is attached
+//! via [`RestAdapter::with_engine`] / [`RestServer::with_engine`]; an adapter
+//! built via [`RestAdapter::new`] / [`RestServer::new`] has no engine and
+//! answers every `/infer` call with `503 Service Unavailable` rather than
+//! fabricated numbers.
+//!
 //! # Endpoints
 //!
 //! | Method | Path      | Description                      |
 //! |--------|-----------|----------------------------------|
 //! | GET    | /health   | Liveness / readiness probe       |
-//! | POST   | /infer    | Single-step inference (JSON)     |
+//! | POST   | /infer    | Single-step / multi-step inference (JSON) |
 //! | GET    | /metrics  | Lightweight Prometheus-style dump |
 //!
 //! # Feature gate
@@ -19,15 +25,19 @@
 //! kizzasi-inference = { features = ["rest"] }
 //! ```
 
+use crate::error::InferenceError;
+use crate::streaming::{SamplingOverrides, StreamingEngine};
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
+use scirs2_core::ndarray::Array1;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn};
@@ -175,21 +185,52 @@ impl ServerMetrics {
 
 /// Low-level axum REST adapter.
 ///
-/// Owns the server configuration and the shared metrics state.  Callers
-/// interact with it either through [`RestServer`] (the high-level wrapper) or
-/// by building a [`Router`] directly via [`RestAdapter::router`].
+/// Owns the server configuration, the shared metrics state, and (optionally)
+/// the [`StreamingEngine`] that backs `POST /infer`. Callers interact with it
+/// either through [`RestServer`] (the high-level wrapper) or by building a
+/// [`Router`] directly via [`RestAdapter::router`].
 pub struct RestAdapter {
     config: RestConfig,
     metrics: Arc<ServerMetrics>,
+    /// The engine backing `POST /infer`, if any. `None` (from
+    /// [`RestAdapter::new`]) makes `/infer` answer `503 Service Unavailable`
+    /// instead of fabricating a prediction.
+    engine: Option<Arc<StreamingEngine>>,
 }
 
 impl RestAdapter {
-    /// Create a new `RestAdapter` from the given [`RestConfig`].
+    /// Create a new `RestAdapter` from the given [`RestConfig`], with no
+    /// inference engine attached.
+    ///
+    /// `POST /infer` on an adapter built this way returns
+    /// `503 Service Unavailable` for every request; use
+    /// [`RestAdapter::with_engine`] to serve real predictions.
     pub fn new(config: RestConfig) -> Self {
         Self {
             config,
             metrics: Arc::new(ServerMetrics::default()),
+            engine: None,
         }
+    }
+
+    /// Create a new `RestAdapter` backed by `engine`: `POST /infer` runs real
+    /// inference through it.
+    pub fn with_engine(config: RestConfig, engine: StreamingEngine) -> Self {
+        Self {
+            config,
+            metrics: Arc::new(ServerMetrics::default()),
+            engine: Some(Arc::new(engine)),
+        }
+    }
+
+    /// Attach (or replace) the [`StreamingEngine`] backing `POST /infer`.
+    pub fn set_engine(&mut self, engine: StreamingEngine) {
+        self.engine = Some(Arc::new(engine));
+    }
+
+    /// Whether an inference engine is currently attached.
+    pub fn has_engine(&self) -> bool {
+        self.engine.is_some()
     }
 
     /// Return a reference to the current [`RestConfig`].
@@ -211,6 +252,7 @@ impl RestAdapter {
         let adapter = Arc::new(RestAdapter {
             config: self.config.clone(),
             metrics: self.metrics.clone(),
+            engine: self.engine.clone(),
         });
         let app = build_router(adapter);
         let listener = TcpListener::bind(&self.config.addr)
@@ -247,6 +289,7 @@ impl RestAdapter {
         let adapter = Arc::new(RestAdapter {
             config: self.config.clone(),
             metrics: self.metrics.clone(),
+            engine: self.engine.clone(),
         });
         let app = build_router(adapter);
         let listener = TcpListener::bind(&self.config.addr)
@@ -274,10 +317,19 @@ pub struct RestServer {
 }
 
 impl RestServer {
-    /// Create a new `RestServer` with the given [`RestConfig`].
+    /// Create a new `RestServer` with the given [`RestConfig`] and no
+    /// inference engine attached (`/infer` answers `503`).
     pub fn new(config: RestConfig) -> Self {
         Self {
             adapter: RestAdapter::new(config),
+        }
+    }
+
+    /// Create a new `RestServer` backed by `engine`, so `/infer` runs real
+    /// inference.
+    pub fn with_engine(config: RestConfig, engine: StreamingEngine) -> Self {
+        Self {
+            adapter: RestAdapter::with_engine(config, engine),
         }
     }
 
@@ -313,12 +365,14 @@ impl RestServer {
 /// going through the full bind/serve lifecycle.
 pub(crate) fn build_router(adapter: Arc<RestAdapter>) -> Router {
     let cors_enabled = adapter.config.cors_enabled;
+    let max_body_size = adapter.config.max_body_size;
 
     let mut router = Router::new()
         .route("/health", get(health_handler))
         .route("/infer", post(infer_handler))
         .route("/metrics", get(metrics_handler))
-        .with_state(adapter);
+        .with_state(adapter)
+        .layer(DefaultBodyLimit::max(max_body_size));
 
     if cors_enabled {
         router = router.layer(
@@ -349,63 +403,143 @@ async fn metrics_handler(State(state): State<Arc<RestAdapter>>) -> impl IntoResp
     Json(state.metrics.snapshot())
 }
 
-/// `POST /infer` — single-step or multi-step inference.
+/// Map an [`InferenceError`] onto an HTTP status code.
 ///
-/// The mock implementation multiplies each input sample by `0.9` per step,
-/// mimicking an exponential decay.  In production, replace the body of this
-/// function with a call to the real inference engine.
+/// A missing/uninitialized engine is the server's own configuration problem
+/// (`503`); a shape or sampling-parameter mismatch is the caller's mistake
+/// (`422`); anything else is an unexpected internal failure (`500`).
+fn status_for_inference_error(e: &InferenceError) -> StatusCode {
+    match e {
+        InferenceError::NotInitialized => StatusCode::SERVICE_UNAVAILABLE,
+        InferenceError::InvalidConfiguration(_) | InferenceError::DimensionMismatch { .. } => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
+}
+
+/// `POST /infer` — single-step or multi-step inference, engine-backed.
+///
+/// Returns `503 Service Unavailable` when no [`StreamingEngine`] is attached
+/// (see [`RestAdapter::with_engine`]), `422 Unprocessable Entity` for an
+/// empty/mis-shaped signal or a rejected sampling override, and
+/// `504 Gateway Timeout` if the request exceeds
+/// [`RestConfig::request_timeout_ms`] (`0` disables the deadline).
 async fn infer_handler(
     State(state): State<Arc<RestAdapter>>,
     Json(req): Json<RestInferRequest>,
 ) -> impl IntoResponse {
     if req.signal.is_empty() {
         state.metrics.record_error();
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "signal must not be empty"
-            })),
-        )
-            .into_response();
+        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "signal must not be empty");
     }
 
-    let start = std::time::Instant::now();
-    let steps = req.steps.unwrap_or(1).max(1);
-    let temperature = req.temperature.unwrap_or(1.0);
+    let Some(engine) = state.engine.clone() else {
+        state.metrics.record_error();
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no inference engine attached to this REST adapter; construct it via \
+             RestAdapter::with_engine / RestServer::with_engine",
+        );
+    };
 
     debug!(
         signal_len = req.signal.len(),
-        steps = steps,
-        temperature = temperature,
+        steps = ?req.steps,
+        temperature = ?req.temperature,
         "REST /infer request"
     );
 
-    // -----------------------------------------------------------------------
-    // Mock inference kernel:
-    // For each step apply gain = 0.9 * clamp(temperature, 0.1, 10.0)⁻¹.
-    // This is a placeholder; real code would call engine.infer() here.
-    // -----------------------------------------------------------------------
-    let gain = 0.9_f32 / temperature.clamp(0.1, 10.0);
-    let mut prediction = req.signal.clone();
-    for _ in 0..steps {
-        for sample in prediction.iter_mut() {
-            *sample *= gain;
-        }
+    let work = run_inference(state.clone(), engine, req);
+
+    if state.config.request_timeout_ms == 0 {
+        // `0` means "no deadline", matching the `GrpcServerConfig` convention
+        // used elsewhere in this crate's adapters.
+        return work.await;
     }
 
-    let latency_ms = start.elapsed().as_millis() as u64;
-    state.metrics.record_success(latency_ms);
+    match tokio::time::timeout(Duration::from_millis(state.config.request_timeout_ms), work).await {
+        Ok(response) => response,
+        Err(_) => {
+            state.metrics.record_error();
+            json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "inference exceeded the configured request_timeout_ms ({} ms)",
+                    state.config.request_timeout_ms
+                ),
+            )
+        }
+    }
+}
 
-    (
-        StatusCode::OK,
-        Json(RestInferResponse {
-            prediction,
-            model_id: "kizzasi-default".to_string(),
-            latency_ms,
-            steps_executed: steps,
-        }),
-    )
-        .into_response()
+/// The actual engine call, factored out of [`infer_handler`] so it can be
+/// raced against a deadline via `tokio::time::timeout`.
+async fn run_inference(
+    state: Arc<RestAdapter>,
+    engine: Arc<StreamingEngine>,
+    req: RestInferRequest,
+) -> Response {
+    let start = std::time::Instant::now();
+    let steps = req.steps.unwrap_or(1).max(1);
+
+    let input_dim = engine.config().engine.input_dim;
+    if req.signal.len() != input_dim {
+        state.metrics.record_error();
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "signal has {} sample(s) but the attached model expects input_dim = {input_dim}",
+                req.signal.len()
+            ),
+        );
+    }
+
+    let overrides = SamplingOverrides {
+        temperature: req.temperature,
+        top_k: None,
+        top_p: None,
+        max_tokens: Some(steps),
+    };
+    let input = Array1::from_vec(req.signal.clone());
+
+    match engine.step_async_with(input, &overrides).await {
+        Ok(outputs) => {
+            let latency_ms = start.elapsed().as_millis() as u64;
+            state.metrics.record_success(latency_ms);
+
+            // Autoregressive rollout: report the final steps-ahead
+            // prediction (the "output signal" after `steps` iterations),
+            // matching the crate's other adapters (see
+            // `adapters::flatten_outputs` for the alternative "concatenate
+            // every step" convention used by the streaming adapters).
+            let prediction = outputs.last().map(|o| o.to_vec()).unwrap_or_default();
+            let model_id = engine
+                .model_info()
+                .await
+                .map(|info| info.model_type.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            (
+                StatusCode::OK,
+                Json(RestInferResponse {
+                    prediction,
+                    model_id,
+                    latency_ms,
+                    steps_executed: outputs.len(),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            state.metrics.record_error();
+            json_error(status_for_inference_error(&e), e.to_string())
+        }
+    }
 }
 
 // ============================================================================
@@ -425,6 +559,26 @@ mod tests {
 
     fn make_adapter() -> Arc<RestAdapter> {
         Arc::new(RestAdapter::new(RestConfig::default()))
+    }
+
+    /// Build an adapter backed by a real, deterministic (`input_dim = 1`)
+    /// [`crate::testutil::CountingModel`] engine, so `/infer` tests can
+    /// assert genuine engine output instead of the old hardcoded mock.
+    async fn make_engine_adapter() -> Arc<RestAdapter> {
+        make_engine_adapter_with_config(RestConfig::default()).await
+    }
+
+    async fn make_engine_adapter_with_config(config: RestConfig) -> Arc<RestAdapter> {
+        use crate::engine::EngineConfig;
+        use crate::streaming::{StreamConfig, StreamingEngine};
+        use crate::testutil::CountingModel;
+
+        let mut stream_config = StreamConfig::new();
+        stream_config.engine = EngineConfig::new(1, 1);
+        let mut engine = StreamingEngine::new(stream_config).expect("engine must construct");
+        engine.set_model(Box::new(CountingModel::new())).await;
+
+        Arc::new(RestAdapter::with_engine(config, engine))
     }
 
     // -----------------------------------------------------------------------
@@ -523,11 +677,15 @@ mod tests {
         assert!(!health.version.is_empty());
     }
 
+    /// Regression: `/infer` used to be a hardcoded mock (`input * 0.9` per
+    /// step) that never touched any model, always reporting
+    /// `model_id: "kizzasi-default"`. It must now run the real, attached
+    /// engine and report the real model type.
     #[tokio::test]
     async fn test_infer_endpoint_returns_prediction() {
-        let app = build_router(make_adapter());
+        let app = build_router(make_engine_adapter().await);
         let body = serde_json::json!({
-            "signal": [1.0_f32, 2.0_f32, 3.0_f32],
+            "signal": [1.0_f32],
             "steps": 1
         });
         let req = Request::builder()
@@ -542,19 +700,25 @@ mod tests {
             .await
             .unwrap();
         let infer_resp: RestInferResponse = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(infer_resp.prediction.len(), 3);
+        assert_eq!(infer_resp.prediction.len(), 1);
         assert_eq!(infer_resp.steps_executed, 1);
-        assert_eq!(infer_resp.model_id, "kizzasi-default");
+        assert_ne!(
+            infer_resp.model_id, "kizzasi-default",
+            "model_id must reflect the real attached model, not the old fabricated constant"
+        );
+        assert_eq!(infer_resp.model_id, "S4D"); // CountingModel reports ModelType::S4D
     }
 
+    /// Regression: prediction values used to follow the mock's
+    /// `input * 0.9^steps` formula regardless of what model was configured.
+    /// They must now be the real, deterministic `CountingModel` recurrence
+    /// (`accumulated = accumulated * 0.5 + input`, starting from `0.0`).
     #[tokio::test]
     async fn test_infer_prediction_values_single_step() {
-        let app = build_router(make_adapter());
-        let signal = vec![10.0_f32, 20.0_f32];
+        let app = build_router(make_engine_adapter().await);
         let body = serde_json::json!({
-            "signal": signal,
-            "steps": 1,
-            "temperature": 1.0
+            "signal": [10.0_f32],
+            "steps": 1
         });
         let req = Request::builder()
             .uri("/infer")
@@ -568,14 +732,216 @@ mod tests {
             .await
             .unwrap();
         let infer_resp: RestInferResponse = serde_json::from_slice(&body_bytes).unwrap();
-        // gain = 0.9 / clamp(1.0, 0.1, 10.0) = 0.9
-        for (input, output) in signal.iter().zip(infer_resp.prediction.iter()) {
-            let expected = input * 0.9;
-            assert!(
-                (output - expected).abs() < 1e-5,
-                "expected {expected} got {output}"
-            );
+        // CountingModel: accumulated = 0.0 * 0.5 + 10.0 = 10.0 — NOT 10.0 * 0.9.
+        let expected = 10.0_f32;
+        assert!(
+            (infer_resp.prediction[0] - expected).abs() < 1e-5,
+            "expected {expected} got {}",
+            infer_resp.prediction[0]
+        );
+    }
+
+    /// `POST /infer` on an adapter with no engine attached must fail loudly
+    /// (`503`) instead of fabricating a prediction.
+    #[tokio::test]
+    async fn test_infer_without_engine_returns_503() {
+        let app = build_router(make_adapter());
+        let body = serde_json::json!({ "signal": [1.0_f32] });
+        let req = Request::builder()
+            .uri("/infer")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A signal whose length doesn't match the attached model's `input_dim`
+    /// must be rejected with `422`, not silently truncated/padded or panic.
+    #[tokio::test]
+    async fn test_infer_rejects_signal_length_mismatch() {
+        let app = build_router(make_engine_adapter().await);
+        // CountingModel expects input_dim = 1; this sends 3.
+        let body = serde_json::json!({ "signal": [1.0_f32, 2.0, 3.0] });
+        let req = Request::builder()
+            .uri("/infer")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// An oversized request body must be rejected (`413`) rather than
+    /// accepted unbounded, per the configured `max_body_size`.
+    #[tokio::test]
+    async fn test_infer_oversized_body_returns_413() {
+        let config = RestConfig {
+            max_body_size: 16,
+            ..Default::default()
+        };
+        let app = build_router(Arc::new(RestAdapter::new(config)));
+
+        let body = serde_json::json!({ "signal": [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0] });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        assert!(
+            bytes.len() > 16,
+            "test body must actually exceed the configured limit"
+        );
+
+        let req = Request::builder()
+            .uri("/infer")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(bytes))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// `request_timeout_ms: 0` must disable the deadline rather than firing
+    /// immediately (a `Duration::from_millis(0)` timeout would fail every
+    /// request).
+    #[tokio::test]
+    async fn test_request_timeout_zero_disables_wrapper() {
+        let app = build_router(
+            make_engine_adapter_with_config(RestConfig {
+                request_timeout_ms: 0,
+                ..Default::default()
+            })
+            .await,
+        );
+        let body = serde_json::json!({ "signal": [1.0_f32] });
+        let req = Request::builder()
+            .uri("/infer")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Regression: `request_timeout_ms` used to have no reads outside
+    /// `Default`/tests — a network-facing server had no request deadline at
+    /// all. A request that outlives the deadline (because the engine's
+    /// internal lock is held by another, slow in-flight request) must now
+    /// receive `504` instead of hanging indefinitely.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_infer_request_timeout_returns_504_under_lock_contention() {
+        use crate::engine::EngineConfig;
+        use crate::streaming::{StreamConfig, StreamingEngine};
+        use kizzasi_core::{CoreResult, HiddenState, SignalPredictor};
+        use kizzasi_model::{AutoregressiveModel, ModelResult, ModelType};
+
+        /// A model whose `step` blocks the calling worker thread for longer
+        /// than the configured request timeout, simulating an expensive
+        /// forward pass. `StreamingEngine::step_async_with` holds its
+        /// internal `tokio::sync::Mutex` for the duration of `step`, so a
+        /// second concurrent request genuinely awaits (yields on) that lock
+        /// — a real async suspension point `tokio::time::timeout` can race
+        /// against, unlike the blocking call itself.
+        ///
+        /// `started` flips to `true` as soon as `step` begins, so the test
+        /// can deterministically wait for the slow request to actually be
+        /// holding the lock before firing the second one, instead of
+        /// guessing a fixed delay (which would be flaky under heavy
+        /// concurrent test load).
+        struct SlowModel {
+            started: Arc<std::sync::atomic::AtomicBool>,
         }
+        impl SignalPredictor for SlowModel {
+            fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+                self.started
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(input.clone())
+            }
+            fn reset(&mut self) {}
+            fn context_window(&self) -> usize {
+                usize::MAX
+            }
+        }
+        impl AutoregressiveModel for SlowModel {
+            fn hidden_dim(&self) -> usize {
+                1
+            }
+            fn state_dim(&self) -> usize {
+                1
+            }
+            fn num_layers(&self) -> usize {
+                1
+            }
+            fn model_type(&self) -> ModelType {
+                ModelType::S4D
+            }
+            fn get_states(&self) -> Vec<HiddenState> {
+                // Must match `num_layers()` (1): `InferenceEngine::step`
+                // rejects a state count that disagrees with the context's
+                // configured layer count.
+                vec![HiddenState::new(1, 1)]
+            }
+            fn set_states(&mut self, _states: Vec<HiddenState>) -> ModelResult<()> {
+                Ok(())
+            }
+        }
+
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut stream_config = StreamConfig::new();
+        stream_config.engine = EngineConfig::new(1, 1);
+        let mut engine = StreamingEngine::new(stream_config).expect("engine must construct");
+        engine
+            .set_model(Box::new(SlowModel {
+                started: started.clone(),
+            }))
+            .await;
+
+        let config = RestConfig {
+            request_timeout_ms: 50, // much shorter than SlowModel's 300ms step
+            ..Default::default()
+        };
+        let app = build_router(Arc::new(RestAdapter::with_engine(config, engine)));
+
+        let make_request = || {
+            let body = serde_json::json!({ "signal": [1.0_f32] });
+            Request::builder()
+                .uri("/infer")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+
+        // Fire the slow request first, without waiting for it, so it is
+        // holding the engine's internal lock while the second request races
+        // its own timeout against lock acquisition.
+        let app_for_slow = app.clone();
+        let slow_task = tokio::spawn(async move { app_for_slow.oneshot(make_request()).await });
+
+        // Deterministically wait for the slow request to actually acquire
+        // the lock and start blocking inside `SlowModel::step`, rather than
+        // guessing a fixed delay.
+        let mut slow_request_started = false;
+        for _ in 0..200 {
+            if started.load(std::sync::atomic::Ordering::SeqCst) {
+                slow_request_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            slow_request_started,
+            "the slow request must have started within the polling window"
+        );
+
+        let resp = app.oneshot(make_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let slow_resp = slow_task.await.expect("slow task must not panic").unwrap();
+        assert_eq!(slow_resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -611,7 +977,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_increments_on_infer() {
-        let adapter = make_adapter();
+        let adapter = make_engine_adapter().await;
         let app = build_router(adapter.clone());
 
         let body = serde_json::json!({ "signal": [1.0_f32] });
@@ -626,6 +992,27 @@ mod tests {
         let snap = adapter.metrics.snapshot();
         assert_eq!(snap.requests_total, 1);
         assert_eq!(snap.errors_total, 0);
+    }
+
+    /// `/infer` on an adapter with no engine attached must still be counted
+    /// as an error, not silently omitted from the metrics.
+    #[tokio::test]
+    async fn test_metrics_records_error_when_no_engine() {
+        let adapter = make_adapter();
+        let app = build_router(adapter.clone());
+
+        let body = serde_json::json!({ "signal": [1.0_f32] });
+        let req = Request::builder()
+            .uri("/infer")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+
+        let snap = adapter.metrics.snapshot();
+        assert_eq!(snap.requests_total, 0);
+        assert_eq!(snap.errors_total, 1);
     }
 
     #[tokio::test]
@@ -670,11 +1057,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_infer_multi_step() {
-        let app = build_router(make_adapter());
+        let app = build_router(make_engine_adapter().await);
         let body = serde_json::json!({
             "signal": [100.0_f32],
-            "steps": 2,
-            "temperature": 1.0
+            "steps": 2
         });
         let req = Request::builder()
             .uri("/infer")
@@ -689,8 +1075,12 @@ mod tests {
             .unwrap();
         let infer_resp: RestInferResponse = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(infer_resp.steps_executed, 2);
-        // gain = 0.9 / 1.0 = 0.9; after 2 steps: 100.0 * 0.9^2 = 81.0
-        let expected = 100.0_f32 * 0.9_f32 * 0.9_f32;
+        // CountingModel autoregressive rollout (accumulated <- accumulated *
+        // 0.5 + input, output fed back as the next input):
+        //   step 1: accumulated = 0.0 * 0.5 + 100.0 = 100.0
+        //   step 2: accumulated = 100.0 * 0.5 + 100.0 = 150.0
+        // NOT the old mock's 100.0 * 0.9^2 = 81.0.
+        let expected = 150.0_f32;
         assert!(
             (infer_resp.prediction[0] - expected).abs() < 1e-4,
             "expected {expected} got {}",

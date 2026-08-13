@@ -11,7 +11,7 @@ Unified facade crate for Kizzasi AGSP.
 | Core API | Production | 100% |
 | Builder Pattern | Production | 100% |
 | Presets | Production | 100% |
-| Async API | Production | 95% |
+| Async API | Production | 100% |
 | Error Handling | Production | 100% |
 | Examples | Production | 100% |
 | Property Tests | Production | 100% |
@@ -52,7 +52,7 @@ Unified facade crate for Kizzasi AGSP.
 
 ---
 
-## In Progress
+## Documentation & Testing (Complete)
 
 ### Documentation
 - [x] Tutorial examples in `examples/`
@@ -67,7 +67,7 @@ Unified facade crate for Kizzasi AGSP.
 
 ---
 
-## Planned Features
+## Completed Features (Originally Planned: P1-P3)
 
 ### P1: High Priority
 
@@ -136,8 +136,11 @@ Unified facade crate for Kizzasi AGSP.
 | `logic` | kizzasi-logic | ✓ |
 | `mqtt` | MQTT client | ✓ |
 | `audio` | Audio I/O | ✓ |
-| `async` | Async/streaming | ○ |
+| `async` | Async/streaming, connection pooling, distributed prediction | ✓ |
 | `config-files` | TOML/YAML config loading | ✓ |
+| `macros` | Derive macros (kizzasi-macros) | ✓ |
+| `cuda` | GPU acceleration (propagates to kizzasi-core/cuda) | ○ |
+| `metal` | GPU acceleration (propagates to kizzasi-core/metal) | ○ |
 
 ---
 
@@ -850,4 +853,4 @@ The kizzasi crate is **production-ready** with:
 
 ---
 
-*Last Updated: 2026-03-16*
+*Last Updated: 2026-08-10*

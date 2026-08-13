@@ -68,7 +68,7 @@ use safetensors::tensor::{Dtype, TensorView};
 use scirs2_core::ndarray::{Array1, Array2};
 use scirs2_core::random::{rng, RngExt};
 #[allow(unused_imports)]
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 /// Configuration for Mamba2 with SSD
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -89,7 +89,8 @@ pub struct Mamba2Config {
     pub conv_kernel_size: usize,
     /// Number of layers
     pub num_layers: usize,
-    /// Dropout rate
+    /// Dropout rate applied to each layer output while training mode is
+    /// enabled via `set_training(true)` (inverted dropout; inert at inference)
     pub dropout: f32,
     /// Use RMSNorm instead of LayerNorm
     pub use_rms_norm: bool,
@@ -434,6 +435,8 @@ pub struct Mamba2 {
     input_proj: Array2<f32>,
     /// Output projection
     output_proj: Array2<f32>,
+    /// Whether `Mamba2Config::dropout` is active (see [`Mamba2::set_training`]).
+    training: bool,
 }
 
 impl Mamba2 {
@@ -464,6 +467,7 @@ impl Mamba2 {
             layers,
             input_proj,
             output_proj,
+            training: false,
         })
     }
 
@@ -558,7 +562,31 @@ impl Mamba2 {
     /// - `input_proj` / `output_proj`: top-level projections (row-major flat)
     /// - `layers.{i}.a_log`, `layers.{i}.b_proj`, `layers.{i}.c_proj`,
     ///   `layers.{i}.d_skip`, `layers.{i}.gate_proj`, `layers.{i}.out_proj`
+    ///
+    /// # Limitation: `conv` and `norm` are not saved
+    ///
+    /// `Mamba2Layer::conv` (a [`kizzasi_core::conv::CausalConv1d`]) and
+    /// `Mamba2Layer::norm` (an `Option<`[`kizzasi_core::LayerNorm`]`>`) are
+    /// **not** included above, and [`Self::load_weights_json`] never
+    /// touches them either — `kizzasi-core` exposes `set_weights`/
+    /// `set_bias`/`set_gamma`/`set_beta` setters for both types but no
+    /// matching getters, so this crate has no way to read their *current*
+    /// values back out to serialize them.
+    ///
+    /// Both are deterministically derived from layer config at construction
+    /// time (no randomness involved), so a save→load round trip reproduces
+    /// them correctly *only if* they were never modified after
+    /// construction; for a model whose `conv`/`norm` **were** customized
+    /// (e.g. loaded from a real trained checkpoint), a save→load round trip
+    /// silently discards that customization and the reloaded model reverts
+    /// to the fresh from-config default instead.
     pub fn save_weights_json<P: AsRef<std::path::Path>>(&self, path: P) -> ModelResult<()> {
+        warn!(
+            "Mamba2::save_weights_json does not persist conv/norm parameters \
+             (kizzasi-core exposes no getters for CausalConv1d/LayerNorm); a \
+             save\u{2192}load round trip silently drops any conv/norm \
+             customization made after construction. See this method's docs."
+        );
         let mut weights: std::collections::HashMap<String, Vec<f32>> =
             std::collections::HashMap::new();
 
@@ -611,7 +639,26 @@ impl Mamba2 {
         Ok(())
     }
 
+    /// Enable or disable training mode.
+    ///
+    /// Models are created in inference mode, where `Mamba2Config::dropout` is inert
+    /// and [`step`](crate::SignalPredictor::step) is deterministic. Set this to
+    /// `true` during training so the configured dropout rate is applied to each
+    /// layer output (inverted dropout — no rescale is needed when switching
+    /// back to inference).
+    pub fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
+    /// Whether the model is currently in training mode (dropout active).
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
     /// Load weights from a JSON file previously written by `save_weights_json`.
+    ///
+    /// Note: `conv`/`norm` are never among the applied keys, since
+    /// `save_weights_json` never writes them — see that method's doc for why.
     pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
         let file = std::fs::File::open(path.as_ref()).map_err(|e| {
             ModelError::load_error("mamba2 load_weights", format!("failed to open file: {e}"))
@@ -623,7 +670,23 @@ impl Mamba2 {
                     format!("JSON deserialization failed: {e}"),
                 )
             })?;
+        self.load_weights_map(&weights).map(|_| ())
+    }
 
+    /// Load weights from an in-memory `name → flat f32 values` map.
+    ///
+    /// This is the in-process counterpart of [`Self::load_weights_json`]: it
+    /// applies exactly the same shape checks and partial-loading semantics
+    /// without routing the parameters through a serialized file.
+    pub fn load_weights_map(
+        &mut self,
+        weights: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> ModelResult<usize> {
+        // Number of tensors actually applied. The caller needs this to tell a
+        // genuine partial load from a weight map whose names match nothing at
+        // all — the latter would otherwise leave the model randomly
+        // initialised while reporting success.
+        let applied = std::cell::Cell::new(0usize);
         let load_array2 = |map: &std::collections::HashMap<String, Vec<f32>>,
                            key: &str,
                            rows: usize,
@@ -649,6 +712,7 @@ impl Mamba2 {
                         format!("failed to reshape '{}': {e}", key),
                     )
                 })?;
+                applied.set(applied.get() + 1);
                 Ok(Some(arr))
             } else {
                 Ok(None)
@@ -671,6 +735,7 @@ impl Mamba2 {
                         ),
                     ));
                 }
+                applied.set(applied.get() + 1);
                 Ok(Some(Array1::from_vec(data.clone())))
             } else {
                 Ok(None)
@@ -678,7 +743,7 @@ impl Mamba2 {
         };
 
         if let Some(arr) = load_array2(
-            &weights,
+            weights,
             "input_proj",
             self.config.input_dim,
             self.config.hidden_dim,
@@ -686,7 +751,7 @@ impl Mamba2 {
             self.input_proj = arr;
         }
         if let Some(arr) = load_array2(
-            &weights,
+            weights,
             "output_proj",
             self.config.hidden_dim,
             self.config.input_dim,
@@ -702,12 +767,12 @@ impl Mamba2 {
             let prefix = format!("layers.{}", i);
 
             if let Some(arr) =
-                load_array2(&weights, &format!("{}.a_log", prefix), num_heads, state_dim)?
+                load_array2(weights, &format!("{}.a_log", prefix), num_heads, state_dim)?
             {
                 layer.a_log = arr;
             }
             if let Some(arr) = load_array2(
-                &weights,
+                weights,
                 &format!("{}.b_proj", prefix),
                 hidden_dim,
                 state_dim,
@@ -715,18 +780,18 @@ impl Mamba2 {
                 layer.b_proj = arr;
             }
             if let Some(arr) = load_array2(
-                &weights,
+                weights,
                 &format!("{}.c_proj", prefix),
                 hidden_dim,
                 state_dim,
             )? {
                 layer.c_proj = arr;
             }
-            if let Some(arr) = load_array1(&weights, &format!("{}.d_skip", prefix), hidden_dim)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.d_skip", prefix), hidden_dim)? {
                 layer.d_skip = arr;
             }
             if let Some(arr) = load_array2(
-                &weights,
+                weights,
                 &format!("{}.gate_proj", prefix),
                 hidden_dim,
                 hidden_dim,
@@ -734,7 +799,7 @@ impl Mamba2 {
                 layer.gate_proj = arr;
             }
             if let Some(arr) = load_array2(
-                &weights,
+                weights,
                 &format!("{}.out_proj", prefix),
                 hidden_dim,
                 hidden_dim,
@@ -743,7 +808,7 @@ impl Mamba2 {
             }
         }
 
-        Ok(())
+        Ok(applied.get())
     }
 
     /// Save weights to a SafeTensors file at the given path.
@@ -853,12 +918,17 @@ impl Mamba2 {
 impl SignalPredictor for Mamba2 {
     #[instrument(skip(self, input))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.input_proj.shape()[0])?;
+
         // Project input to hidden dimension
         let mut hidden = input.dot(&self.input_proj);
 
         // Pass through each layer
+        let dropout_rate = self.config.dropout;
+        let training = self.training;
         for layer in &mut self.layers {
             hidden = layer.forward(&hidden)?;
+            crate::dropout::apply_dropout(&mut hidden, dropout_rate, training);
         }
 
         // Project back to input dimension

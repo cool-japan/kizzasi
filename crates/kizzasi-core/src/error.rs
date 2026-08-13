@@ -1,8 +1,5 @@
 //! Error types for kizzasi-core
 
-#[cfg(not(feature = "std"))]
-use alloc::string::String;
-
 use scirs2_core::ndarray::ShapeError;
 use thiserror::Error;
 

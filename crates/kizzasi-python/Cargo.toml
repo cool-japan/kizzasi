@@ -13,7 +13,16 @@ publish = false
 
 [lib]
 name = "kizzasi"
-crate-type = ["cdylib", "rlib"]
+# `cdylib` only. An `rlib` here would be emitted as `target/<profile>/libkizzasi.rlib`,
+# the exact path the `kizzasi` crate's own rlib already occupies, so a workspace build
+# printed a cargo "output filename collision" warning (a future hard error, see
+# rust-lang/cargo#6313) and one of the two rlibs silently overwrote the other. Nothing
+# links this crate as a Rust library: it is `publish = false`, absent from
+# `[workspace.dependencies]`, and no crate names it as a dependency — maturin consumes
+# the `cdylib` and installs it as `kizzasi._kizzasi` (see `module-name` in
+# pyproject.toml). Unit tests are unaffected; cargo builds the `--test` harness straight
+# from `src/lib.rs` regardless of `crate-type`.
+crate-type = ["cdylib"]
 doc = false
 
 [dependencies]
@@ -21,7 +30,12 @@ kizzasi = { path = "../kizzasi", default-features = false, features = ["std", "l
 kizzasi-core = { path = "../kizzasi-core" }
 kizzasi-inference = { path = "../kizzasi-inference", default-features = false, features = ["std"] }
 kizzasi-logic = { path = "../kizzasi-logic" }
-pyo3 = { version = "0.29", features = ["abi3-py310"] }
+# Already part of this crate's build graph transitively (via `kizzasi` and
+# `kizzasi-inference`, both of which depend on it); declared directly here
+# only to expose `MuLawCodec` as a pyclass (`src/mulaw.rs`) — adds no new
+# third-party dependency.
+kizzasi-tokenizer.workspace = true
+pyo3.workspace = true
 scirs2-numpy = "0.6.5"
 scirs2-core.workspace = true
 thiserror.workspace = true

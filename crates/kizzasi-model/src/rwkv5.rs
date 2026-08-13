@@ -332,7 +332,7 @@ impl Rwkv5TimeMixing {
             }
 
             // wkv_h = r_h @ state_h + first_h * (r_h ⊙ k_h) ⊙ v_h
-            let state_r = matvec_small(head_state, &r_h);
+            let state_r = matvec(head_state, &r_h);
             for i in 0..self.head_dim {
                 let direct = first_h * r_h[i] * k_h[i] * v_h[i];
                 output[lo + i] = state_r[i] + direct;
@@ -558,6 +558,8 @@ impl Rwkv5Model {
 impl SignalPredictor for Rwkv5Model {
     #[instrument(skip(self, input))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.input_proj.shape()[0])?;
+
         // Project input into hidden space
         let mut hidden = input.dot(&self.input_proj);
 
@@ -661,7 +663,19 @@ impl AutoregressiveModel for Rwkv5Model {
 // ---------------------------------------------------------------------------
 
 /// Matrix-vector multiply: `y = W @ x` (W is rows × cols, x is cols-vector)
+///
+/// `w.dot(x)` dispatches to ndarray/matrixmultiply with the correct
+/// (row-major) traversal and no per-element `Index` bounds-check overhead,
+/// instead of walking `w[[i, j]]` through ndarray's checked 2D indexing one
+/// scalar at a time. It requires `x.len() == w.ncols()` exactly (ndarray
+/// panics otherwise), which holds for every call site in this module; the
+/// original clamped loop is kept as a fallback for any case where that
+/// invariant doesn't hold, so a shape mismatch degrades to the old (slower,
+/// silently truncated) behavior instead of panicking.
 fn matvec(w: &Array2<f32>, x: &Array1<f32>) -> Array1<f32> {
+    if x.len() == w.shape()[1] {
+        return w.dot(x);
+    }
     let rows = w.shape()[0];
     let cols = w.shape()[1];
     let xlen = x.len();
@@ -676,17 +690,25 @@ fn matvec(w: &Array2<f32>, x: &Array1<f32>) -> Array1<f32> {
     out
 }
 
-/// Small-matrix vector multiply (identical implementation; named for clarity at call sites)
-fn matvec_small(w: &Array2<f32>, x: &Array1<f32>) -> Array1<f32> {
-    matvec(w, x)
-}
-
-/// Project `x` through `w` (rows × out_dim layout) up to `out_dim` outputs.
+/// Project `x` through `w` (rows × out_dim layout) up to `out_dim` outputs:
+/// `out[j] = sum_i w[i, j] * x[i]`, i.e. `out = w^T @ x` truncated to
+/// `out_dim`.
+///
+/// `w.t().dot(x)` is bit-identical to the manual loop below when shapes line
+/// up (`x.len() == w.nrows()` and `out_dim >= w.ncols()`, the normal case)
+/// and traverses each column of `w` as a genuine strided ndarray view
+/// instead of walking `w[[i, j]]` with `i` (the row index) as the inner,
+/// stride-`cols` loop variable — the worst-case traversal for a row-major
+/// array. The manual loop remains as a fallback for the truncated/padded
+/// case the `.min()` clamps exist for.
 fn project(w: &Array2<f32>, x: &Array1<f32>, out_dim: usize) -> Array1<f32> {
     let rows = w.shape()[0];
     let cols = w.shape()[1];
     let xlen = x.len();
     let n_out = out_dim.min(cols);
+    if xlen == rows && n_out == cols {
+        return w.t().dot(x);
+    }
     let mut out = Array1::zeros(n_out);
     for j in 0..n_out {
         let mut sum = 0.0_f32;
@@ -698,21 +720,11 @@ fn project(w: &Array2<f32>, x: &Array1<f32>, out_dim: usize) -> Array1<f32> {
     out
 }
 
-/// Project `x` through `w` (rows × out_dim layout, transposed access) for down-projection.
+/// Project `x` through `w` (rows × out_dim layout, transposed access) for
+/// down-projection. Computation is identical to [`project`] — kept as a
+/// separate name purely for call-site clarity (down- vs up-projection).
 fn project_t(w: &Array2<f32>, x: &Array1<f32>, out_dim: usize) -> Array1<f32> {
-    let rows = w.shape()[0];
-    let cols = w.shape()[1];
-    let xlen = x.len();
-    let n_out = out_dim.min(cols);
-    let mut out = Array1::zeros(n_out);
-    for j in 0..n_out {
-        let mut sum = 0.0_f32;
-        for i in 0..rows.min(xlen) {
-            sum += w[[i, j]] * x[i];
-        }
-        out[j] = sum;
-    }
-    out
+    project(w, x, out_dim)
 }
 
 // ---------------------------------------------------------------------------

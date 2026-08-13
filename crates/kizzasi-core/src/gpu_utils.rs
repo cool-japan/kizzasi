@@ -206,10 +206,24 @@ impl Default for MemoryStats {
     }
 }
 
-/// GPU memory pool for efficient tensor allocation
+/// GPU memory pool for efficient tensor allocation.
+///
+/// Maintains a free-list of previously-[`release`](Self::release)d tensor
+/// buffers, bucketed by `(shape, dtype)`. [`allocate`](Self::allocate) first
+/// tries to pop a matching buffer from the free-list (re-zeroing it in
+/// place) before falling back to a fresh `Tensor::zeros` device allocation.
+///
+/// Because `Tensor` is reference-counted internally, `release` takes the
+/// tensor back **by value**: callers must drop every other clone of it
+/// before releasing, otherwise the buffer that gets zeroed and handed back
+/// out by a future `allocate` may still be aliased elsewhere.
 pub struct GPUMemoryPool {
     device: Device,
     stats: MemoryStats,
+    /// Free-list of released buffers, keyed by `(shape, dtype)` so
+    /// `allocate` only reuses a buffer whose layout actually matches what
+    /// was requested.
+    free_list: HashMap<(Vec<usize>, candle_core::DType), Vec<Tensor>>,
 }
 
 impl GPUMemoryPool {
@@ -218,26 +232,63 @@ impl GPUMemoryPool {
         Self {
             device,
             stats: MemoryStats::new(),
+            free_list: HashMap::new(),
         }
     }
 
-    /// Allocate a tensor on GPU
+    /// Allocate a tensor on GPU, reusing a released buffer of the same
+    /// shape/dtype from the free-list when one is available instead of
+    /// always issuing a fresh device allocation.
     pub fn allocate(
         &mut self,
         name: String,
         shape: &[usize],
         dtype: candle_core::DType,
     ) -> CoreResult<Tensor> {
-        let tensor = Tensor::zeros(shape, dtype, &self.device)
-            .map_err(|e| CoreError::DeviceError(format!("Failed to allocate tensor: {}", e)))?;
+        let key = (shape.to_vec(), dtype);
+        let tensor = match self.free_list.get_mut(&key).and_then(Vec::pop) {
+            Some(reused) => {
+                // Re-zero the reused buffer in place so `allocate` has the
+                // same "fresh zeros" semantics regardless of whether the
+                // storage came from the free-list or `Tensor::zeros`.
+                reused.zero_set().map_err(|e| {
+                    CoreError::DeviceError(format!("Failed to clear reused tensor: {}", e))
+                })?;
+                reused
+            }
+            None => Tensor::zeros(shape, dtype, &self.device)
+                .map_err(|e| CoreError::DeviceError(format!("Failed to allocate tensor: {}", e)))?,
+        };
 
         self.stats.track_tensor(name, &tensor);
         Ok(tensor)
     }
 
-    /// Release a tensor from the pool
-    pub fn release(&mut self, name: &str) {
+    /// Release a tensor back to the pool.
+    ///
+    /// Takes ownership of `tensor` and stores it in the free-list (bucketed
+    /// by its own shape/dtype) so a future [`allocate`](Self::allocate)
+    /// call requesting a matching shape/dtype can reuse its storage instead
+    /// of allocating fresh device memory. See the type-level docs for the
+    /// aliasing caveat implied by taking `tensor` by value.
+    pub fn release(&mut self, name: &str, tensor: Tensor) {
         self.stats.untrack_tensor(name);
+        let key = (tensor.dims().to_vec(), tensor.dtype());
+        self.free_list.entry(key).or_default().push(tensor);
+    }
+
+    /// Number of buffers currently held in the free-list, available for
+    /// reuse by a future [`allocate`](Self::allocate) call without a fresh
+    /// device allocation.
+    pub fn pooled_buffer_count(&self) -> usize {
+        self.free_list.values().map(Vec::len).sum()
+    }
+
+    /// Drop every buffer held in the free-list, releasing their device
+    /// memory back to the allocator (rather than keeping it reserved for
+    /// reuse).
+    pub fn clear_pool(&mut self) {
+        self.free_list.clear();
     }
 
     /// Get memory statistics
@@ -258,10 +309,10 @@ impl TensorPrefetch {
     /// Prefetch tensor to device (async hint for backends that support it)
     ///
     /// Note: This is a hint to the backend. Actual async behavior depends on
-    /// the device backend (CUDA/Metal).
+    /// the device backend (Metal, with the `metal` feature).
     pub fn prefetch(tensor: &Tensor, device: &Device) -> CoreResult<Tensor> {
         // For now, this is synchronous. Future implementations could leverage
-        // async streams on CUDA or Metal command buffers
+        // Metal command buffers
         TensorTransfer::to_device(tensor, device)
     }
 
@@ -352,8 +403,93 @@ mod tests {
         assert_eq!(pool.stats().tensor_count, 1);
         assert_eq!(pool.stats().total_bytes(), 100 * 100 * 4);
 
-        pool.release("test_tensor");
+        pool.release("test_tensor", tensor);
         assert_eq!(pool.stats().tensor_count, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests: `GPUMemoryPool` used to be a bookkeeping counter
+    // wearing a pool's name -- `allocate()` always called `Tensor::zeros`
+    // and `release()` only decremented a counter, with no free-list of any
+    // kind.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_gpu_memory_pool_reuses_released_buffer() {
+        let mut pool = GPUMemoryPool::new(Device::Cpu);
+        assert_eq!(pool.pooled_buffer_count(), 0);
+
+        let t1 = pool
+            .allocate("t1".to_string(), &[8, 8], DType::F32)
+            .unwrap();
+        pool.release("t1", t1);
+        assert_eq!(
+            pool.pooled_buffer_count(),
+            1,
+            "release() must add the buffer to the free-list"
+        );
+
+        // A second allocate() with the SAME shape/dtype must reuse the
+        // free-listed buffer (draining the free-list) instead of adding a
+        // brand new one on top of it.
+        let t2 = pool
+            .allocate("t2".to_string(), &[8, 8], DType::F32)
+            .unwrap();
+        assert_eq!(
+            pool.pooled_buffer_count(),
+            0,
+            "allocate() must pop the matching buffer from the free-list rather than leaving it \
+             untouched and allocating fresh"
+        );
+        assert_eq!(t2.dims(), &[8, 8]);
+
+        // Reused storage must be re-zeroed, not left with stale data.
+        let values = t2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(values.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_gpu_memory_pool_does_not_reuse_mismatched_shape_or_dtype() {
+        let mut pool = GPUMemoryPool::new(Device::Cpu);
+
+        let t1 = pool
+            .allocate("t1".to_string(), &[4, 4], DType::F32)
+            .unwrap();
+        pool.release("t1", t1);
+        assert_eq!(pool.pooled_buffer_count(), 1);
+
+        // Different shape: must NOT reuse the [4,4] buffer.
+        let _t2 = pool
+            .allocate("t2".to_string(), &[4, 5], DType::F32)
+            .unwrap();
+        assert_eq!(
+            pool.pooled_buffer_count(),
+            1,
+            "a shape mismatch must not consume the free-listed buffer"
+        );
+
+        // Different dtype, same shape: also must not reuse.
+        let _t3 = pool
+            .allocate("t3".to_string(), &[4, 4], DType::I64)
+            .unwrap();
+        assert_eq!(
+            pool.pooled_buffer_count(),
+            1,
+            "a dtype mismatch must not consume the free-listed buffer"
+        );
+    }
+
+    #[test]
+    fn test_gpu_memory_pool_clear_pool_drops_free_list() {
+        let mut pool = GPUMemoryPool::new(Device::Cpu);
+        let t1 = pool
+            .allocate("t1".to_string(), &[4, 4], DType::F32)
+            .unwrap();
+        pool.release("t1", t1);
+        assert_eq!(pool.pooled_buffer_count(), 1);
+
+        pool.clear_pool();
+        assert_eq!(pool.pooled_buffer_count(), 0);
     }
 
     #[test]

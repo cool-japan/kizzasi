@@ -129,6 +129,18 @@ impl BarkBands {
 /// zero bits. The encode/decode path uses Hann-windowed STFT (via OxiFFT) and
 /// overlap-add synthesis.
 ///
+/// # Reconstruction is magnitude-only, zero-phase
+///
+/// Phase is not transmitted: every reconstructed bin is placed on the real
+/// axis (`Complex::new(mag, 0.0)`), so `decode(encode(x))` is **not**
+/// waveform-accurate even when quantization is lossless — only per-band
+/// energy is preserved. This is a deliberate scope choice (transmitting
+/// quantized phase would need its own bit budget, separate from
+/// `total_bits_per_frame`, which currently allocates bits for magnitude
+/// only); callers that need phase-accurate reconstruction should use
+/// [`FourierTokenizer`](crate::FourierTokenizer) or
+/// [`DCTTokenizer`](crate::DCTTokenizer) instead.
+///
 /// # Example
 /// ```ignore
 /// use kizzasi_tokenizer::PerceptualQuantizer;
@@ -170,6 +182,15 @@ impl PerceptualQuantizer {
         if !frame_size.is_power_of_two() {
             return Err(TokenizerError::InvalidConfig(format!(
                 "frame_size must be a power of two, got {frame_size}"
+            )));
+        }
+        // `frame_size == 1` is a power of two but makes `hop_size == 0`,
+        // which `encode` divides by (`div_ceil(self.hop_size)`), and makes
+        // the Hann window's `(frame_size - 1)` divisor zero (NaN window).
+        // `frame_size == 2` is the smallest value that keeps both safe.
+        if frame_size < 2 {
+            return Err(TokenizerError::InvalidConfig(format!(
+                "frame_size must be >= 2, got {frame_size}"
             )));
         }
 
@@ -318,9 +339,13 @@ impl PerceptualQuantizer {
     /// Token layout per frame:
     /// ```text
     /// [bits[0], bits[1], …, bits[num_bands-1],
-    ///  quant_indices_for_band_0,
-    ///  quant_indices_for_band_1, …]
+    ///  <band_0: scale_bits, quant_indices...> | <0 placeholder if band_0 carries no bits>,
+    ///  <band_1: scale_bits, quant_indices...> | <0 placeholder if band_1 carries no bits>,
+    ///  …]
     /// ```
+    /// `scale_bits` is the band's per-frame magnitude scale (`max_mag +
+    /// EPSILON`), bit-cast from `f32` via `f32::to_bits`, so `decode_frame`
+    /// can recover real amplitudes instead of values confined to `[0, 1]`.
     fn encode_frame(
         &self,
         frame: &[f32],
@@ -371,6 +396,11 @@ impl PerceptualQuantizer {
             let max_mag = mags.iter().cloned().fold(0.0_f32, f32::max);
             let scale = max_mag + f32::EPSILON;
             let levels = 1usize << bits.min(20); // guard overflow
+
+            // Transmit the per-band scale so `decode_frame` can undo the
+            // `mag / scale` normalisation below and recover a real
+            // amplitude instead of a value confined to [0, 1].
+            tokens.push(scale.to_bits());
 
             for mag in &mags {
                 // Mid-tread uniform quantization in [0, scale]
@@ -424,6 +454,17 @@ impl PerceptualQuantizer {
             let levels = 1usize << bits.min(20);
             let num_bins_in_band = bin_indices.len();
 
+            // Read the per-band magnitude scale written by `encode_frame`
+            // before the quantized indices.
+            if cursor >= tokens.len() {
+                return Err(TokenizerError::decoding(
+                    "perceptual",
+                    "token stream ended prematurely (band scale)",
+                ));
+            }
+            let scale = f32::from_bits(tokens[cursor]);
+            cursor += 1;
+
             if cursor + num_bins_in_band > tokens.len() {
                 return Err(TokenizerError::decoding(
                     "perceptual",
@@ -434,8 +475,9 @@ impl PerceptualQuantizer {
             // Recover magnitudes (zero-phase reconstruction)
             for (j, &k) in bin_indices.iter().enumerate() {
                 let idx = tokens[cursor + j] as usize;
-                // Dequantize: centre of the mid-tread cell
-                let mag = (idx as f32 + 0.5) / levels as f32;
+                // Dequantize: centre of the mid-tread cell, rescaled back
+                // into the band's original magnitude range.
+                let mag = ((idx as f32 + 0.5) / levels as f32) * scale;
                 // Zero phase → purely real
                 freq_domain[k] = Complex32::new(mag, 0.0);
                 // Mirror for IFFT (Hermitian symmetry, real signal)
@@ -731,6 +773,74 @@ mod tests {
         );
     }
 
+    /// Regression: decoded amplitude must track the input amplitude.
+    ///
+    /// Before the fix, `decode_frame` reconstructed every band's magnitudes
+    /// as `(idx + 0.5) / levels` — a value confined to `[0, 1]` with no
+    /// reference to the band's actual magnitude scale — so a loud signal
+    /// and a quiet signal decoded to comparable energy. `encode_frame` now
+    /// transmits each band's magnitude scale (`max_mag + EPSILON`, bit-cast
+    /// to `u32`) so `decode_frame` can undo the normalisation.
+    #[test]
+    fn test_decode_amplitude_tracks_input_amplitude() {
+        let pq = PerceptualQuantizer::new(8000.0, 256, 1024).unwrap();
+        let loud: Array1<f32> =
+            Array1::from_vec((0..1024).map(|i| 0.9 * (i as f32 * 0.05).sin()).collect());
+        let quiet: Array1<f32> =
+            Array1::from_vec((0..1024).map(|i| 0.02 * (i as f32 * 0.05).sin()).collect());
+
+        let loud_tokens = pq.encode(&loud).unwrap();
+        let quiet_tokens = pq.encode(&quiet).unwrap();
+        let loud_decoded = pq.decode(&loud_tokens).unwrap();
+        let quiet_decoded = pq.decode(&quiet_tokens).unwrap();
+
+        let loud_energy: f32 = loud_decoded.iter().map(|x| x * x).sum();
+        let quiet_energy: f32 = quiet_decoded.iter().map(|x| x * x).sum();
+
+        assert!(
+            loud_energy > quiet_energy * 5.0,
+            "decoded energy should scale with input amplitude: loud={loud_energy}, quiet={quiet_energy}"
+        );
+    }
+
+    /// Regression: with the per-band scale now present in the token stream,
+    /// a single band's decoded magnitude should be within one quantization
+    /// step of the value that was actually encoded (not an arbitrary value
+    /// in `[0, 1]` unrelated to it).
+    #[test]
+    fn test_encode_frame_scale_roundtrips_through_decode_frame() {
+        let pq = PerceptualQuantizer::new(8000.0, 64, 512).unwrap();
+        let num_bins = pq.frame_size / 2 + 1;
+
+        // A single sinusoid concentrates energy in a narrow band, giving that
+        // band a large, easily-checked magnitude scale.
+        let frame: Vec<f32> = (0..pq.frame_size)
+            .map(|i| 5.0 * (i as f32 * 0.3).sin())
+            .collect();
+
+        let fft_plan = Plan::<f32>::dft_1d(pq.frame_size, Direction::Forward, Flags::MEASURE)
+            .expect("FFT plan");
+        let ifft_plan = Plan::<f32>::dft_1d(pq.frame_size, Direction::Backward, Flags::MEASURE)
+            .expect("IFFT plan");
+
+        let tokens = pq.encode_frame(&frame, &fft_plan, num_bins).unwrap();
+        let (decoded, consumed) = pq.decode_frame(&tokens, &ifft_plan, num_bins).unwrap();
+
+        assert_eq!(consumed, tokens.len());
+        assert_eq!(decoded.len(), pq.frame_size);
+
+        // The reconstructed frame's peak magnitude should be in the same
+        // order of magnitude as the input's (loosely bounded, since this is
+        // a lossy psychoacoustic codec) rather than confined to ~[0, 1]
+        // regardless of the input scale.
+        let input_peak = frame.iter().cloned().fold(0.0_f32, |a, b| a.max(b.abs()));
+        let decoded_peak = decoded.iter().cloned().fold(0.0_f32, |a, b| a.max(b.abs()));
+        assert!(
+            decoded_peak > input_peak * 0.1,
+            "decoded peak {decoded_peak} should track input peak {input_peak}, not collapse towards O(1)"
+        );
+    }
+
     #[test]
     fn test_bit_allocation_floor() {
         let sample_rate = 16000.0_f32;
@@ -777,5 +887,22 @@ mod tests {
             result.is_err(),
             "Expected Err for non-power-of-two frame_size, got Ok"
         );
+    }
+
+    /// Regression: `frame_size == 1` is a power of two but makes
+    /// `hop_size == 0`, which used to panic with "attempt to divide by
+    /// zero" inside `encode` (and produce a NaN Hann window even before
+    /// that). `new` must reject it instead.
+    #[test]
+    fn test_frame_size_one_is_rejected() {
+        assert!(
+            PerceptualQuantizer::new(16000.0, 1, 128).is_err(),
+            "frame_size = 1 must be rejected, not accepted and later panic in encode()"
+        );
+    }
+
+    #[test]
+    fn test_frame_size_two_is_the_smallest_accepted() {
+        assert!(PerceptualQuantizer::new(16000.0, 2, 128).is_ok());
     }
 }

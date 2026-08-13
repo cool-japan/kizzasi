@@ -70,8 +70,14 @@ fn test_all_required_ok() {
 fn test_all_required_missing_field_err() {
     let result = AllRequired::builder().a(1).build();
     assert!(result.is_err());
-    let msg = result.unwrap_err();
-    assert!(msg.contains('b'), "error should mention the missing field");
+    let err = result.unwrap_err();
+    // Regression for id188: `build()` now returns a typed error rather than
+    // a bare `String`, so callers can match on it programmatically.
+    assert_eq!(err, AllRequiredBuilderError::MissingField("b"));
+    assert!(
+        err.to_string().contains('b'),
+        "error should mention the missing field"
+    );
 }
 
 #[test]
@@ -120,7 +126,12 @@ fn test_validate_fails() {
         .name("bad".into())
         .build()
         .unwrap_err();
-    assert_eq!(err, "must be positive");
+    // Regression for id188: message now comes through `Display` on the
+    // typed `WithValidateBuilderError`, and includes the field name.
+    assert_eq!(
+        err.to_string(),
+        "validation failed for field `count`: must be positive"
+    );
 }
 
 #[test]
@@ -149,11 +160,135 @@ fn test_default_and_validate_compose() {
         .dim(100)
         .build()
         .unwrap_err();
-    assert_eq!(err, "must be divisible by 64");
+    assert_eq!(
+        err.to_string(),
+        "validation failed for field `dim`: must be divisible by 64"
+    );
     // Override with valid value -> Ok
     let c = WithValidateAndDefault::builder()
         .dim(128)
         .build()
         .expect("128 is divisible by 64");
     assert_eq!(c.dim, 128);
+}
+
+// ---------------------------------------------------------------------
+// id188: typed builder error composes with `?` in a `Result<_, String>`
+// function via the generated `impl From<BuilderError> for String`.
+// ---------------------------------------------------------------------
+
+fn build_all_required(a: Option<usize>) -> Result<AllRequired, String> {
+    let mut builder = AllRequired::builder().b("x".into());
+    if let Some(a) = a {
+        builder = builder.a(a);
+    }
+    let config = builder.build()?;
+    Ok(config)
+}
+
+#[test]
+fn test_builder_error_converts_to_string_via_from() {
+    assert!(build_all_required(Some(1)).is_ok());
+    let err = build_all_required(None).unwrap_err();
+    assert!(err.contains('a'));
+}
+
+// ---------------------------------------------------------------------
+// id179: `Option<T>` fields are implicitly optional in the builder.
+// ---------------------------------------------------------------------
+
+#[derive(KizzasiConfig, Debug)]
+struct WithOptionField {
+    name: String,
+    timeout: Option<u64>,
+}
+
+#[test]
+fn test_option_field_defaults_to_none_when_unset() {
+    let c = WithOptionField::builder()
+        .name("x".into())
+        .build()
+        .expect("should build even without setting `timeout`");
+    assert_eq!(c.name, "x");
+    assert_eq!(c.timeout, None);
+}
+
+#[test]
+fn test_option_field_setter_takes_unwrapped_value() {
+    // Note: `.timeout(30)`, not the old, unnatural `.timeout(Some(30))`.
+    let c = WithOptionField::builder()
+        .name("x".into())
+        .timeout(30)
+        .build()
+        .expect("should build");
+    assert_eq!(c.name, "x");
+    assert_eq!(c.timeout, Some(30));
+}
+
+// ---------------------------------------------------------------------
+// id185: generic structs (lifetimes and type parameters) are supported.
+// ---------------------------------------------------------------------
+
+#[derive(KizzasiConfig, Debug)]
+struct WithLifetime<'a> {
+    name: &'a str,
+    #[config(default = 10)]
+    retries: usize,
+}
+
+#[test]
+fn test_generic_lifetime_config_builds() {
+    let c = WithLifetime::builder()
+        .name("hello")
+        .build()
+        .expect("should build");
+    assert_eq!(c.name, "hello");
+    assert_eq!(c.retries, 10);
+}
+
+/// Deliberately does not implement `Default`, to prove the generated
+/// builder's hand-written `impl Default` (needed to keep working for
+/// generic structs — see id185/id186) does not impose an unnecessary
+/// `T: Default` bound the way a naive `#[derive(Default)]` would.
+#[derive(Debug, PartialEq)]
+struct NotDefault(i32);
+
+#[derive(KizzasiConfig, Debug)]
+struct WithTypeParam<T> {
+    value: T,
+}
+
+#[test]
+fn test_generic_type_param_without_default_builds() {
+    let c = WithTypeParam::builder()
+        .value(NotDefault(7))
+        .build()
+        .expect("should build");
+    assert_eq!(c.value, NotDefault(7));
+}
+
+// ---------------------------------------------------------------------
+// id176: the generated builder mirrors the config struct's own visibility
+// (module-private here, same as every other struct in this file) rather
+// than always being fully `pub`. This module boundary plus a successful
+// build is the behavioral proof; exact codegen is unit-tested in
+// `src/config.rs`.
+// ---------------------------------------------------------------------
+
+mod inner {
+    use kizzasi_macros::KizzasiConfig;
+
+    #[derive(KizzasiConfig, Debug)]
+    pub(crate) struct InnerConfig {
+        pub(crate) label: String,
+    }
+}
+
+#[test]
+fn test_pub_crate_visibility_config_builds_across_module() {
+    let c = inner::InnerConfig::builder()
+        .label("ok".into())
+        .build()
+        .expect("should build");
+    assert_eq!(c.label, "ok");
 }

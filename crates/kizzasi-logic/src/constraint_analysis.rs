@@ -32,9 +32,39 @@
 //! assert!(analysis.is_consistent);
 //! ```
 
+use crate::constraint::BoundInterval;
 use crate::{Constraint, LogicError, LogicResult};
 use scirs2_core::ndarray::Array1;
 use std::collections::{HashMap, HashSet};
+
+/// Split `constraints` into the feasible interval implied by the "global"
+/// (untagged, `dimension() == None`) constraints, and a map from each
+/// explicitly tagged dimension to the interval implied by the constraints
+/// tagged for it. A global constraint applies to *every* dimension, so a
+/// tagged dimension's true feasible interval is that map entry intersected
+/// with the global interval (not the map entry alone).
+///
+/// This is `O(constraints.len())` regardless of how large a `dimension()`
+/// tag is — no array sized by the tag is ever allocated — which is what
+/// lets [`ConstraintConsistencyChecker::analyze`] decide feasibility exactly
+/// instead of falling back to bounded random sampling.
+fn dimension_intervals(
+    constraints: &[Constraint],
+) -> (BoundInterval, HashMap<usize, BoundInterval>) {
+    let mut global = BoundInterval::UNBOUNDED;
+    let mut tagged: HashMap<usize, BoundInterval> = HashMap::new();
+    for c in constraints {
+        let interval = c.bound().interval();
+        match c.dimension() {
+            None => global = global.intersect(&interval),
+            Some(d) => {
+                let entry = tagged.entry(d).or_insert(BoundInterval::UNBOUNDED);
+                *entry = entry.intersect(&interval);
+            }
+        }
+    }
+    (global, tagged)
+}
 
 /// Result of constraint consistency analysis
 #[derive(Debug, Clone)]
@@ -199,57 +229,73 @@ impl ConstraintConsistencyChecker {
         (max_dim + 1).max(1).min(self.max_dimension)
     }
 
-    /// Find a point that satisfies all constraints using random sampling
+    /// Decide whether `constraints` is satisfiable, and if so, produce a
+    /// witness point.
+    ///
+    /// `Constraint` is 1-D interval arithmetic over a
+    /// [`BoundType`](crate::constraint::BoundType): this decides
+    /// satisfiability exactly,
+    /// by intersecting the per-dimension intervals every constraint implies
+    /// (see [`dimension_intervals`]), rather than drawing bounded random
+    /// samples from `self.search_bounds` and hoping one lands in the
+    /// feasible region. That removes two false-negative failure modes the
+    /// old sampling approach had: a feasible region entirely outside
+    /// `search_bounds` (e.g. a single `greater_eq(1000.0)` constraint with
+    /// the default `[-100, 100]` window), and a `dimension()` tag at or
+    /// beyond `self.max_dimension` (the verdict below never depends on that
+    /// cap; only the returned witness array's length is bounded by it, to
+    /// avoid materializing an array sized by a pathological tag).
     fn find_satisfying_point(
         &self,
         constraints: &[Constraint],
         dimension: usize,
     ) -> Option<Array1<f32>> {
-        use scirs2_core::random::thread_rng;
+        let (global, tagged) = dimension_intervals(constraints);
 
-        let mut rng = thread_rng();
-        let (lower, upper) = self.search_bounds;
-
-        // Try random sampling
-        for _ in 0..self.sample_count {
-            let point: Array1<f32> =
-                Array1::from_iter((0..dimension).map(|_| rng.gen_range(lower..upper)));
-
-            if self.satisfies_all(constraints, &point) {
-                return Some(point);
+        if global.is_empty() {
+            return None;
+        }
+        for interval in tagged.values() {
+            if interval.intersect(&global).is_empty() {
+                return None;
             }
         }
 
-        // Try origin
-        let origin = Array1::zeros(dimension);
-        if self.satisfies_all(constraints, &origin) {
-            return Some(origin);
-        }
+        // Feasible: build a concrete witness. Its length is capped by
+        // `self.max_dimension` purely to bound the allocation for a
+        // pathologically large dimension tag — the feasibility verdict
+        // above never depended on that cap.
+        let highest_tagged = tagged.keys().copied().max().map_or(0, |d| d + 1);
+        let out_dim = dimension
+            .max(highest_tagged)
+            .max(1)
+            .min(self.max_dimension.max(1));
 
-        // Try unit vectors
-        for i in 0..dimension {
-            let mut unit = Array1::zeros(dimension);
-            unit[i] = 1.0;
-            if self.satisfies_all(constraints, &unit) {
-                return Some(unit);
+        let mut point = Array1::<f32>::zeros(out_dim);
+        for d in 0..out_dim {
+            let interval = tagged.get(&d).map_or(global, |t| t.intersect(&global));
+            if let Some(slot) = point.get_mut(d) {
+                *slot = interval.witness().unwrap_or(0.0);
             }
         }
-
-        None
+        Some(point)
     }
 
-    /// Check if a point satisfies all constraints
+    /// Check if a point satisfies all constraints, treating a constraint as
+    /// satisfied whenever its violation is at most `self.tolerance` (not
+    /// only when it is exactly zero). This is what wires the `tolerance`
+    /// field into behavior — it was previously stored by `with_tolerance`
+    /// and read nowhere.
     fn satisfies_all(&self, constraints: &[Constraint], point: &Array1<f32>) -> bool {
         constraints.iter().all(|c| {
-            if let Some(dim) = c.dimension() {
-                if dim < point.len() {
-                    c.check(point[dim])
-                } else {
-                    false
-                }
-            } else {
-                // If no dimension specified, check against first element
-                c.check(point[0])
+            let value = match c.dimension() {
+                Some(dim) => point.get(dim).copied(),
+                // If no dimension specified, check against first element.
+                None => point.first().copied(),
+            };
+            match value {
+                Some(v) => c.violation(v) <= self.tolerance,
+                None => false,
             }
         })
     }
@@ -314,15 +360,11 @@ impl ConstraintConsistencyChecker {
 
             if satisfies_subset {
                 // Check if it also satisfies the constraint
-                let satisfies_constraint = if let Some(dim) = constraint.dimension() {
-                    if dim < point.len() {
-                        constraint.check(point[dim])
-                    } else {
-                        false
-                    }
-                } else {
-                    constraint.check(point[0])
+                let value = match constraint.dimension() {
+                    Some(dim) => point.get(dim).copied(),
+                    None => point.first().copied(),
                 };
+                let satisfies_constraint = value.is_some_and(|v| constraint.check(v));
 
                 if !satisfies_constraint {
                     // Found a counterexample: constraint is not implied
@@ -364,10 +406,33 @@ impl ConstraintConsistencyChecker {
         }
     }
 
-    /// Check if constraint i has a dependency on constraint j
-    fn has_dependency(&self, _i: usize, _j: usize, _constraints: &[Constraint]) -> bool {
-        // Simplified implementation: would need more sophisticated analysis
-        false
+    /// Check if constraint `i` has a dependency on constraint `j`.
+    ///
+    /// Two constraints are considered dependent when they can affect the
+    /// same value — they target the same explicit `dimension()`, or either
+    /// one is "global" (`dimension() == None`, so it applies to every
+    /// dimension including whichever the other one targets) — *and* their
+    /// [`BoundType`](crate::constraint::BoundType) feasible intervals
+    /// intersect. This is closed-form from each constraint's bound, unlike
+    /// the placeholder this replaced, which always returned `false`
+    /// regardless of its (unread) parameters.
+    fn has_dependency(&self, i: usize, j: usize, constraints: &[Constraint]) -> bool {
+        let (Some(ci), Some(cj)) = (constraints.get(i), constraints.get(j)) else {
+            return false;
+        };
+
+        let same_target = match (ci.dimension(), cj.dimension()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        if !same_target {
+            return false;
+        }
+
+        !ci.bound()
+            .interval()
+            .intersect(&cj.bound().interval())
+            .is_empty()
     }
 
     /// Find minimal unsatisfiable subset
@@ -556,5 +621,197 @@ mod tests {
             .unwrap();
 
         assert!(validate_constraint_set(&[c1, c2]).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression (finding 134): exact feasibility, not bounded sampling.
+    // -----------------------------------------------------------------------
+
+    /// The old bounded-sampling `find_satisfying_point` drew candidates only
+    /// from `search_bounds` (default `[-100, 100]`) — a feasible region
+    /// entirely outside that window, like `x >= 1000`, was reported
+    /// inconsistent even though it is trivially satisfiable.
+    #[test]
+    fn test_feasible_region_far_outside_default_search_bounds() {
+        let c = ConstraintBuilder::new()
+            .name("far")
+            .greater_eq(1000.0)
+            .build()
+            .unwrap();
+
+        let checker = ConstraintConsistencyChecker::new();
+        let analysis = checker.analyze(&[c]);
+
+        assert!(
+            analysis.is_consistent,
+            "x >= 1000 is trivially satisfiable and must not be reported inconsistent"
+        );
+        let point = analysis.sample_point.expect("witness point");
+        assert!(point[0] >= 1000.0);
+    }
+
+    /// A constraint dimension tag beyond `max_dimension` (default 100) used
+    /// to make `infer_dimension` truncate the candidate vector, so
+    /// `satisfies_all` always saw the tagged constraint as out of range and
+    /// failed it — reporting a perfectly satisfiable set as inconsistent.
+    #[test]
+    fn test_feasible_region_with_dimension_tag_beyond_default_cap() {
+        let c = ConstraintBuilder::new()
+            .name("late_dim")
+            .dimension(150)
+            .in_range(0.0, 10.0)
+            .build()
+            .unwrap();
+
+        let checker = ConstraintConsistencyChecker::new();
+        let analysis = checker.analyze(&[c]);
+
+        assert!(
+            analysis.is_consistent,
+            "a constraint tagged for dimension 150 is still satisfiable even though the \
+             default max_dimension is 100"
+        );
+    }
+
+    /// The exact interval intersection must still correctly report a
+    /// genuinely empty region as inconsistent (not just stop reporting
+    /// false negatives for the cases above).
+    #[test]
+    fn test_genuinely_inconsistent_region_on_the_same_dimension() {
+        let c1 = ConstraintBuilder::new()
+            .name("c1")
+            .dimension(0)
+            .greater_than(10.0)
+            .build()
+            .unwrap();
+        let c2 = ConstraintBuilder::new()
+            .name("c2")
+            .dimension(0)
+            .less_than(5.0)
+            .build()
+            .unwrap();
+
+        let checker = ConstraintConsistencyChecker::new();
+        let analysis = checker.analyze(&[c1, c2]);
+        assert!(!analysis.is_consistent);
+    }
+
+    /// A global (untagged) constraint intersected with a per-dimension tag
+    /// must be honored: `x <= 5` globally plus `dimension(3) >= 10` is
+    /// infeasible on dimension 3 even though dimension 3 has no bound of
+    /// its own besides the global one.
+    #[test]
+    fn test_global_constraint_intersects_with_tagged_dimension() {
+        let global = ConstraintBuilder::new()
+            .name("global")
+            .less_eq(5.0)
+            .build()
+            .unwrap();
+        let tagged = ConstraintBuilder::new()
+            .name("tagged")
+            .dimension(3)
+            .greater_eq(10.0)
+            .build()
+            .unwrap();
+
+        let checker = ConstraintConsistencyChecker::new();
+        let analysis = checker.analyze(&[global, tagged]);
+        assert!(!analysis.is_consistent);
+    }
+
+    /// `tolerance` used to be stored by `with_tolerance` and read nowhere.
+    /// It now relaxes `satisfies_all`'s (and therefore `is_implied`'s)
+    /// satisfaction check.
+    #[test]
+    fn test_tolerance_is_applied_in_redundancy_analysis() {
+        let checker = ConstraintConsistencyChecker::new().with_tolerance(0.5);
+        // A point exactly at the boundary of `less_eq(10.0)` plus a tiny
+        // violation (10.2) must be treated as satisfied within tolerance 0.5.
+        let c = ConstraintBuilder::new()
+            .name("c")
+            .less_eq(10.0)
+            .build()
+            .unwrap();
+        let point = Array1::from_vec(vec![10.2]);
+        assert!(checker.satisfies_all(&[c], &point));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression (finding 133): has_dependency is no longer hardcoded false.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dependencies_detected_for_overlapping_same_dimension_constraints() {
+        // Two constraints on the same dimension with overlapping feasible
+        // intervals: [0, 10] and [5, 15] overlap on [5, 10].
+        let c1 = ConstraintBuilder::new()
+            .name("c1")
+            .dimension(0)
+            .in_range(0.0, 10.0)
+            .build()
+            .unwrap();
+        let c2 = ConstraintBuilder::new()
+            .name("c2")
+            .dimension(0)
+            .in_range(5.0, 15.0)
+            .build()
+            .unwrap();
+
+        let checker = ConstraintConsistencyChecker::new();
+        let analysis = checker.analyze(&[c1, c2]);
+
+        assert!(analysis.is_consistent);
+        assert!(
+            !analysis.dependencies.is_empty(),
+            "overlapping same-dimension constraints must be reported as dependent, not an \
+             always-empty map"
+        );
+        assert_eq!(analysis.dependencies.get(&0), Some(&vec![1]));
+        assert_eq!(analysis.dependencies.get(&1), Some(&vec![0]));
+    }
+
+    #[test]
+    fn test_no_dependency_for_disjoint_dimensions() {
+        let c1 = ConstraintBuilder::new()
+            .name("c1")
+            .dimension(0)
+            .in_range(0.0, 10.0)
+            .build()
+            .unwrap();
+        let c2 = ConstraintBuilder::new()
+            .name("c2")
+            .dimension(1)
+            .in_range(0.0, 10.0)
+            .build()
+            .unwrap();
+
+        let checker = ConstraintConsistencyChecker::new();
+        let analysis = checker.analyze(&[c1, c2]);
+        assert!(analysis.is_consistent);
+        assert!(
+            analysis.dependencies.is_empty(),
+            "constraints on unrelated dimensions must not be reported as dependent"
+        );
+    }
+
+    #[test]
+    fn test_global_constraint_depends_on_every_tagged_dimension_it_overlaps() {
+        let global = ConstraintBuilder::new()
+            .name("global")
+            .less_eq(20.0)
+            .build()
+            .unwrap();
+        let tagged = ConstraintBuilder::new()
+            .name("tagged")
+            .dimension(5)
+            .greater_eq(0.0)
+            .build()
+            .unwrap();
+
+        let checker = ConstraintConsistencyChecker::new();
+        let analysis = checker.analyze(&[global, tagged]);
+        assert!(analysis.is_consistent);
+        assert_eq!(analysis.dependencies.get(&0), Some(&vec![1]));
+        assert_eq!(analysis.dependencies.get(&1), Some(&vec![0]));
     }
 }

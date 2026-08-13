@@ -1,0 +1,35 @@
+[package]
+name = "kizzasi-metal"
+description = "Apple Metal backend activation shim for Kizzasi AGSP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords = ["metal", "gpu", "apple", "candle", "acceleration"]
+categories = ["hardware-support", "science"]
+readme = "README.md"
+documentation = "https://docs.rs/kizzasi-metal"
+homepage = "https://github.com/cool-japan/kizzasi"
+
+[dependencies]
+# candle-core is declared once per target family rather than once globally,
+# and that split is the entire reason this crate exists. Cargo cannot make a
+# *feature* conditional on the target -- `metal = ["candle-core/metal"]` in
+# kizzasi-core fires on Linux too, and candle's Metal backend pulls
+# objc2/objc2-metal, which `compile_error!`s off Apple. A *dependency* can be
+# target-scoped, and under `resolver = "2"` the features requested by a
+# platform-specific dependency are ignored for targets that are not being
+# built. So Apple builds get `candle-core/metal`, every other target gets
+# plain candle, and `--all-features` stays buildable everywhere.
+#
+# NOTE: FFI. On Apple the Metal backend talks to the Metal framework through
+# objc2; that is Apple system FFI, which is why the whole path is opt-in
+# behind kizzasi-core's `metal` feature and the default build stays pure Rust.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+candle-core.workspace = true

@@ -184,14 +184,29 @@ impl PyTorchConverter {
         Ok(Array1::from_vec(data))
     }
 
-    /// Apply weight mappings to convert PyTorch names to Kizzasi names
+    /// Apply weight mappings to convert PyTorch names to Kizzasi names.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::WeightLoadError`] if two different source
+    /// tensors map to the same target name (a mapping-table or checkpoint
+    /// bug -- e.g. a bare-prefix pattern like `.mixer.dt_proj` matching both
+    /// `dt_proj.weight` and `dt_proj.bias`), instead of silently letting the
+    /// second insertion overwrite the first.
     pub fn apply_mappings(
         &self,
         weights: HashMap<String, Tensor>,
     ) -> CoreResult<HashMap<String, Tensor>> {
-        let mut mapped_weights = HashMap::new();
+        let mut mapped_weights: HashMap<String, Tensor> = HashMap::new();
 
-        for (source_name, tensor) in weights {
+        // Process source tensors in a deterministic (sorted) order.
+        // `HashMap` iteration order is randomised per process; without a
+        // fixed order, a collision (see below) would be reported
+        // non-deterministically depending on which of the two colliding
+        // sources happened to be visited last.
+        let mut entries: Vec<(String, Tensor)> = weights.into_iter().collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (source_name, tensor) in entries {
             // Try to find a matching mapping
             let mut mapped = false;
             for mapping in &self.mappings {
@@ -214,6 +229,17 @@ impl PyTorchConverter {
                             })?;
                     }
 
+                    if mapped_weights.contains_key(&mapping.target_name) {
+                        return Err(CoreError::WeightLoadError(format!(
+                            "apply_mappings: source '{}' maps to target '{}' (pattern '{}'), \
+                             which another source tensor already mapped to. Two source tensors \
+                             would silently overwrite each other under the old behaviour -- make \
+                             mapping patterns suffix-aware (e.g. distinguish '.weight' from \
+                             '.bias') to resolve the collision.",
+                            source_name, mapping.target_name, mapping.source_pattern
+                        )));
+                    }
+
                     mapped_weights.insert(mapping.target_name.clone(), target_tensor);
                     mapped = true;
                     break;
@@ -222,6 +248,12 @@ impl PyTorchConverter {
 
             // If no mapping found, keep original name
             if !mapped {
+                if mapped_weights.contains_key(&source_name) {
+                    return Err(CoreError::WeightLoadError(format!(
+                        "apply_mappings: unmapped source name '{}' collides with an existing target key",
+                        source_name
+                    )));
+                }
                 mapped_weights.insert(source_name, tensor);
             }
         }
@@ -229,7 +261,12 @@ impl PyTorchConverter {
         Ok(mapped_weights)
     }
 
-    /// Detect architecture from checkpoint
+    /// Detect architecture from checkpoint.
+    ///
+    /// Iterates weight names in a deterministic (sorted) order and keeps the
+    /// FIRST architecture match rather than the last, so the result is
+    /// stable across repeated calls on the same checkpoint regardless of
+    /// `HashMap` iteration order (which is randomised per process).
     pub fn detect_architecture(
         &self,
         weights: &HashMap<String, Tensor>,
@@ -241,27 +278,36 @@ impl PyTorchConverter {
         let mut d_model = None;
         let mut d_state = None;
 
+        // Sort so name-pattern matches (and therefore `architecture`,
+        // `d_model`, `hidden_dim`, `d_state`) are decided in a fixed,
+        // reproducible order instead of `HashMap`'s randomised per-process
+        // iteration order.
+        let mut names: Vec<&String> = weights.keys().collect();
+        names.sort();
+
         // Analyze weight names to detect architecture
-        for (name, tensor) in weights {
-            // Detect Mamba
-            if name.contains("mixer") || name.contains("ssm") {
-                architecture = "mamba".to_string();
-            }
-            // Detect Mamba-2
-            else if name.contains("ssd") || name.contains("mamba2") {
-                architecture = "mamba2".to_string();
-            }
-            // Detect S4/S4D
-            else if name.contains("s4") {
-                architecture = "s4d".to_string();
-            }
-            // Detect S5
-            else if name.contains("s5") || name.contains("block_diagonal") {
-                architecture = "s5".to_string();
-            }
-            // Detect RetNet
-            else if name.contains("retention") {
-                architecture = "retnet".to_string();
+        for name in names {
+            let tensor = &weights[name];
+
+            // Detect architecture: only the FIRST matching tensor (in
+            // sorted-name order) decides it. Without this guard, a
+            // checkpoint whose names match more than one detector (e.g. a
+            // Mamba-2 checkpoint contains both "mixer" and "ssd"/"mamba2")
+            // would have `architecture` overwritten by every subsequent
+            // match, so the final answer depended on `HashMap` iteration
+            // order rather than the checkpoint's actual content.
+            if architecture == "unknown" {
+                if name.contains("mixer") || name.contains("ssm") {
+                    architecture = "mamba".to_string();
+                } else if name.contains("ssd") || name.contains("mamba2") {
+                    architecture = "mamba2".to_string();
+                } else if name.contains("s4") {
+                    architecture = "s4d".to_string();
+                } else if name.contains("s5") || name.contains("block_diagonal") {
+                    architecture = "s5".to_string();
+                } else if name.contains("retention") {
+                    architecture = "retnet".to_string();
+                }
             }
 
             // Extract dimensions
@@ -276,10 +322,16 @@ impl PyTorchConverter {
                 }
             }
 
-            // Detect dimensions from tensor shapes
+            // Detect dimensions from tensor shapes. PyTorch `nn.Linear`
+            // weights are stored `[out_features, in_features]`, so
+            // `in_proj`'s d_model (its *input* dimension) is `dims()[1]`,
+            // not `dims()[0]` (which is `2 * d_inner` for Mamba's in_proj --
+            // typically several times larger than d_model). `nn.Embedding`
+            // weights are `[vocab_size, d_model]`, so `dims()[1]` is
+            // correct there too.
             let shape = tensor.shape();
             if (name.contains("in_proj") || name.contains("embedding")) && shape.rank() == 2 {
-                d_model = Some(shape.dims()[0]);
+                d_model = Some(shape.dims()[1]);
             }
             if (name.contains("dt_proj") || name.contains("ssm")) && shape.rank() == 2 {
                 hidden_dim = Some(shape.dims()[0]);
@@ -490,6 +542,94 @@ mod tests {
         let checkpoint = converter.detect_architecture(&weights).unwrap();
         assert_eq!(checkpoint.architecture, "mamba");
         assert_eq!(checkpoint.num_layers, Some(1));
+        // Regression: PyTorch `nn.Linear` weight shape is
+        // `[out_features, in_features]`; for Mamba's `in_proj`
+        // (`[2*d_inner, d_model]`), d_model is `dims()[1]` = 128, not
+        // `dims()[0]` = 256 (which is `2*d_inner`, not d_model at all).
+        assert_eq!(checkpoint.d_model, Some(128));
+    }
+
+    #[test]
+    fn test_detect_architecture_is_deterministic_across_repeated_calls() {
+        // Regression: `detect_architecture` used to overwrite `architecture`
+        // on EVERY matching tensor name while iterating a `HashMap` (whose
+        // order is randomised per process), so a checkpoint matching more
+        // than one detector could report a different architecture on
+        // different runs of the very same input. Build a checkpoint whose
+        // names match both the "mamba" and "mamba2" detectors and check the
+        // result is stable across many repeated calls in this process.
+        let converter = PyTorchConverter::new_cpu();
+        let mut weights = HashMap::new();
+        let tensor = Tensor::zeros((64, 32), DType::F32, &Device::Cpu).unwrap();
+        // "mixer" matches the mamba detector; "ssd"/"mamba2" match the
+        // mamba2 detector. Also throw in a few more names to widen the
+        // `HashMap`'s internal bucket spread.
+        weights.insert("layers.0.mixer.in_proj.weight".to_string(), tensor.clone());
+        weights.insert("layers.0.ssd.A_log".to_string(), tensor.clone());
+        weights.insert("layers.1.mamba2.dt_proj.weight".to_string(), tensor.clone());
+        weights.insert("layers.2.mixer.out_proj.weight".to_string(), tensor.clone());
+        weights.insert("embedding.weight".to_string(), tensor.clone());
+
+        let first = converter
+            .detect_architecture(&weights)
+            .unwrap()
+            .architecture;
+        for _ in 0..20 {
+            let repeated = converter
+                .detect_architecture(&weights)
+                .unwrap()
+                .architecture;
+            assert_eq!(
+                repeated, first,
+                "detect_architecture must be deterministic across repeated calls on the same input"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_mappings_rejects_target_name_collision() {
+        // Regression: a Mamba state_dict contains BOTH `dt_proj.weight` and
+        // `dt_proj.bias`; `create_mamba_mappings`'s pattern for `dt_proj` is
+        // a bare prefix (no `.weight`/`.bias` suffix), so both used to match
+        // and silently overwrite each other in the output HashMap depending
+        // on iteration order.
+        let mut converter = PyTorchConverter::new_cpu();
+        converter.create_mamba_mappings();
+
+        let mut weights = HashMap::new();
+        let weight_tensor = Tensor::zeros((16, 8), DType::F32, &Device::Cpu).unwrap();
+        let bias_tensor = Tensor::zeros(16, DType::F32, &Device::Cpu).unwrap();
+        weights.insert("layers.0.mixer.dt_proj.weight".to_string(), weight_tensor);
+        weights.insert("layers.0.mixer.dt_proj.bias".to_string(), bias_tensor);
+
+        let result = converter.apply_mappings(weights);
+        assert!(
+            result.is_err(),
+            "apply_mappings must error on a target-name collision instead of silently dropping one tensor"
+        );
+    }
+
+    #[test]
+    fn test_apply_mappings_no_collision_when_patterns_are_distinct() {
+        // Sanity check that the collision detection doesn't false-positive
+        // on genuinely distinct, non-colliding mappings.
+        let mut converter = PyTorchConverter::new_cpu();
+        converter.add_mapping("foo.weight", "target_foo_w", false);
+        converter.add_mapping("bar.weight", "target_bar_w", false);
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "foo.weight".to_string(),
+            Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap(),
+        );
+        weights.insert(
+            "bar.weight".to_string(),
+            Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap(),
+        );
+
+        let result = converter.apply_mappings(weights).unwrap();
+        assert!(result.contains_key("target_foo_w"));
+        assert!(result.contains_key("target_bar_w"));
     }
 
     #[test]

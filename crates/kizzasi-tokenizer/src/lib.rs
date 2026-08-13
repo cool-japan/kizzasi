@@ -108,6 +108,15 @@ pub use persistence::{load_config, save_config, ModelCheckpoint, ModelMetadata, 
 // Re-export PEAQ evaluator
 pub use self::peaq::{OdgGrade, PeaqConfig, PeaqEvaluator, PeaqMovs, PeaqResult};
 
+// Re-export the PEAQ neural network's weight-provenance flag at the crate
+// root: `PeaqResult::distortion_index`/`odg`/`grade` are not usable for
+// ranking signals by quality while this is `false` (see `peaq::nn`'s module
+// docs, or the more convenient `PeaqResult::is_certified()`). Previously
+// only reachable via the full path `peaq::nn::WEIGHTS_VERIFIED`, so a
+// consumer of `PeaqResult` who only imported the re-exported types above
+// could easily miss it.
+pub use self::peaq::nn::WEIGHTS_VERIFIED as PEAQ_WEIGHTS_VERIFIED;
+
 // Re-export perceptual quantizer types
 pub use self::perceptual::{
     absolute_threshold_db, frequency_to_bark, BarkBands, PerceptualQuantizer,

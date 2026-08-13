@@ -12,8 +12,9 @@
 //! - **Cache-Friendly**: Optimized memory access patterns
 //!
 //! ## Performance
-//! These operations leverage native BLAS libraries (OpenBLAS, Intel MKL, or Apple Accelerate)
-//! for peak performance on supported platforms.
+//! These operations are Pure Rust: every function delegates to
+//! `scirs2_linalg::simd_ops`'s portable SIMD kernels (no OpenBLAS/MKL/
+//! Accelerate FFI, matching this workspace's Pure Rust policy).
 
 use crate::error::{ModelError, ModelResult};
 use rayon::prelude::*;
@@ -21,13 +22,27 @@ use scirs2_core::ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use tracing::{debug, trace};
 
 /// Configuration for BLAS operations
+///
+/// Only [`Self::parallel_threshold`] and [`Self::num_threads`] currently
+/// change behavior, and only through the `*_with_config` variants below
+/// (e.g. [`batch_matmul_vec_with_config`]) — the plain functions
+/// (`matmul_vec`, `matmul_mat`, ...) always call straight through to
+/// `scirs2_linalg::simd_ops`, which does not accept a thread-count or
+/// parallel-threshold override. [`Self::enable_simd`] has no effect at all:
+/// `scirs2_linalg::simd_ops` is this module's only backend and is always
+/// vectorized, so there is no separate scalar kernel to fall back to.
 #[derive(Debug, Clone, Copy)]
 pub struct BlasConfig {
-    /// Use parallel implementation for matrices larger than this threshold
+    /// Use parallel implementation for batches larger than this threshold.
+    /// Honoured by [`batch_matmul_vec_with_config`].
     pub parallel_threshold: usize,
-    /// Number of threads for parallel operations (0 = auto)
+    /// Number of threads for parallel operations (0 = use rayon's global
+    /// pool). Honoured by [`batch_matmul_vec_with_config`], which builds a
+    /// scoped `rayon::ThreadPool` when this is non-zero.
     pub num_threads: usize,
-    /// Enable SIMD acceleration
+    /// Reserved: has no effect. `scirs2_linalg::simd_ops` (this module's
+    /// only backend) is always vectorized; there is no non-SIMD scalar
+    /// kernel to switch to.
     pub enable_simd: bool,
 }
 
@@ -246,7 +261,9 @@ pub fn batch_matmul_vec(
         ));
     }
 
-    // Process in parallel using rayon
+    // Process in parallel using rayon's global pool (unconditionally; see
+    // `batch_matmul_vec_with_config` for a version that honours
+    // `BlasConfig::parallel_threshold`/`num_threads`).
     let results: Result<Vec<_>, _> = matrices
         .par_iter()
         .zip(vectors.par_iter())
@@ -254,6 +271,75 @@ pub fn batch_matmul_vec(
         .collect();
 
     results
+}
+
+/// Batch matrix-vector multiplication, honouring [`BlasConfig`].
+///
+/// Unlike [`batch_matmul_vec`] (which always dispatches to rayon's global
+/// pool), this:
+/// - runs sequentially when `matrices.len() < config.parallel_threshold`
+///   (parallel dispatch overhead is not worth it for a handful of
+///   operations), and
+/// - when parallelizing with `config.num_threads != 0`, builds a scoped
+///   `rayon::ThreadPool` with exactly that many threads instead of using
+///   however many threads the global pool happens to have.
+///
+/// `config.enable_simd` has no effect — see the [`BlasConfig`] docs.
+///
+/// # Errors
+/// Returns [`ModelError::DimensionMismatch`] if `matrices`/`vectors` differ
+/// in length, or [`ModelError::LoadError`] if building a custom-sized
+/// thread pool fails.
+pub fn batch_matmul_vec_with_config(
+    matrices: &[ArrayView2<f32>],
+    vectors: &[ArrayView1<f32>],
+    config: &BlasConfig,
+) -> ModelResult<Vec<Array1<f32>>> {
+    debug!(
+        "BLAS batch_matmul_vec_with_config: {} operations, parallel_threshold={}, num_threads={}",
+        matrices.len(),
+        config.parallel_threshold,
+        config.num_threads
+    );
+
+    if matrices.len() != vectors.len() {
+        return Err(ModelError::dimension_mismatch(
+            "batch size",
+            matrices.len(),
+            vectors.len(),
+        ));
+    }
+
+    if matrices.len() < config.parallel_threshold {
+        return matrices
+            .iter()
+            .zip(vectors.iter())
+            .map(|(mat, vec)| matmul_vec(mat, vec))
+            .collect();
+    }
+
+    let run = || -> Result<Vec<_>, _> {
+        matrices
+            .par_iter()
+            .zip(vectors.par_iter())
+            .map(|(mat, vec)| matmul_vec(mat, vec))
+            .collect()
+    };
+
+    if config.num_threads == 0 {
+        run()
+    } else {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.num_threads)
+            .build()
+            .map_err(|e| {
+                ModelError::load_error(
+                    "batch_matmul_vec_with_config",
+                    format!("failed to build a {}-thread pool: {e}", config.num_threads),
+                )
+            })?;
+        pool.install(run)
+    }
 }
 
 #[cfg(test)]
@@ -380,5 +466,65 @@ mod tests {
         assert!((results[0][1] - 7.0).abs() < 1e-5);
         assert!((results[1][0] - 5.0).abs() < 1e-5);
         assert!((results[1][1] - 11.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_batch_matmul_vec_with_config_sequential_path() {
+        let mat1 = array![[1.0, 2.0], [3.0, 4.0]];
+        let mat2 = array![[2.0, 1.0], [4.0, 3.0]];
+        let vec1 = array![1.0, 1.0];
+        let vec2 = array![2.0, 1.0];
+        let matrices = vec![mat1.view(), mat2.view()];
+        let vectors = vec![vec1.view(), vec2.view()];
+
+        // parallel_threshold higher than the batch size forces the
+        // sequential branch; result must match the always-parallel version.
+        let config = BlasConfig {
+            parallel_threshold: 1000,
+            num_threads: 0,
+            enable_simd: true,
+        };
+        let results = batch_matmul_vec_with_config(&matrices, &vectors, &config)
+            .expect("batch_matmul_vec_with_config failed");
+        let expected = batch_matmul_vec(&matrices, &vectors).expect("batch_matmul_vec failed");
+        for (r, e) in results.iter().zip(expected.iter()) {
+            for (rv, ev) in r.iter().zip(e.iter()) {
+                assert!((rv - ev).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn test_batch_matmul_vec_with_config_custom_thread_count() {
+        let mat1 = array![[1.0, 2.0], [3.0, 4.0]];
+        let vec1 = array![1.0, 1.0];
+        let matrices = vec![mat1.view(); 4];
+        let vectors = vec![vec1.view(); 4];
+
+        // parallel_threshold of 0 forces the parallel branch, with an
+        // explicit (small) thread count so the scoped pool actually gets
+        // exercised.
+        let config = BlasConfig {
+            parallel_threshold: 0,
+            num_threads: 2,
+            enable_simd: true,
+        };
+        let results = batch_matmul_vec_with_config(&matrices, &vectors, &config)
+            .expect("batch_matmul_vec_with_config (custom thread count) failed");
+        assert_eq!(results.len(), 4);
+        for r in &results {
+            assert!((r[0] - 3.0).abs() < 1e-5);
+            assert!((r[1] - 7.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_batch_matmul_vec_with_config_dimension_mismatch() {
+        let mat1 = array![[1.0, 2.0], [3.0, 4.0]];
+        let vec1 = array![1.0, 1.0];
+        let matrices = vec![mat1.view()];
+        let vectors = vec![vec1.view(), vec1.view()];
+        let config = BlasConfig::default();
+        assert!(batch_matmul_vec_with_config(&matrices, &vectors, &config).is_err());
     }
 }

@@ -14,20 +14,49 @@ documentation = "https://docs.rs/kizzasi-model"
 homepage = "https://github.com/cool-japan/kizzasi"
 
 [features]
-default = ["std", "mamba"]
+default = ["std", "all-models"]
+# Reserved for a future no_std build of this crate; currently a no-op (the
+# crate always compiles against std regardless of this flag). Kept so a
+# downstream `default-features = false, features = [...]` Cargo.toml does not
+# need to change again once no_std support lands.
 std = []
-# GPU features (optional)
-# Note: cuda feature only works on Linux/Windows, ignored on macOS
-cuda = ["kizzasi-core/cuda"]
+# GPU acceleration (optional, off by default). Forwards candle's Metal
+# backend through `kizzasi-core/metal`, which is live on Apple targets and
+# inert -- but still buildable -- everywhere else, so `--all-features` works on
+# every host; the `kizzasi-metal` crate explains how that target gating is
+# done. There is no `cuda` counterpart -- see kizzasi-core's `[features]` for
+# why a CUDA flag cannot be offered without breaking every non-CUDA build.
 metal = ["kizzasi-core/metal"]
-# Model features
+# Model architecture features. Each one really gates compilation now -- the
+# modules below are `#[cfg(feature = ...)]` in lib.rs, and `factory.rs` /
+# `profiling.rs` gate their imports, constructors and match arms to match, so
+# turning one off removes that architecture from the build:
+#
+#   mamba       -> `mamba`, `mamba2`
+#   rwkv        -> `rwkv`, `rwkv5`, `rwkv7`
+#   s4          -> `s4`, `s5`
+#   transformer -> `transformer`
+#
+# Architectures with no feature of their own (`h3`, `hybrid`, `moe`,
+# `multimodal`, `neural_ode`, `spiking`, `temporal_multiscale`) are always
+# compiled; they do not depend on any of the gated modules.
+#
+# `default` keeps every architecture on, so an existing dependency does not
+# lose models by upgrading; opt out with `default-features = false`.
 mamba = []
 rwkv = []
 s4 = []
 transformer = []
 all-models = ["mamba", "rwkv", "s4", "transformer"]
-# HuggingFace Hub blocking HTTP client (reqwest + tokio already in workspace deps)
-hf-hub = []
+# HuggingFace Hub client (`huggingface::HuggingFaceHub`, `huggingface_loader`,
+# `hf_hub`).
+#
+# NOTE: FFI / not pure Rust. This pulls `reqwest` -> `rustls` -> `aws-lc-rs`,
+# whose `aws-lc-sys` crate compiles the AWS-LC C/assembly library. No
+# pure-Rust TLS provider exists today, so the download path is opt-in and the
+# default build links no C at all. `huggingface::ModelConfig` (the config
+# parsing used by `factory`) stays available without this feature.
+hf-hub = ["dep:reqwest"]
 
 [dependencies]
 # Internal crates
@@ -44,30 +73,27 @@ serde.workspace = true
 rayon.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
-reqwest.workspace = true
-tokio.workspace = true
+# Optional: only the `hf-hub` download path needs an HTTP client (see the
+# feature's note about aws-lc-sys).
+reqwest = { workspace = true, optional = true }
 sha2.workspace = true
 
 safetensors.workspace = true
 half.workspace = true
 kizzasi-logic.workspace = true
 
+# CPU-only by default; `metal` (above) forwards candle's Metal backend.
+candle-core.workspace = true
+candle-nn.workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
+# Only the async `#[tokio::test]` cases in `huggingface.rs` need a runtime;
+# the library itself has no tokio dependency.
+tokio.workspace = true
 kizzasi-tokenizer = { path = "../kizzasi-tokenizer" }
 kizzasi-logic = { path = "../kizzasi-logic" }
-
-# Platform-specific Candle dependencies
-# CUDA is only supported on Linux and Windows (not macOS)
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-candle-core = { version = "0.11.0", default-features = false, features = [] }
-candle-nn = { version = "0.11.0", default-features = false, features = [] }
-
-# macOS uses Metal (or CPU-only by default)
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.11.0", default-features = false, features = [] }
-candle-nn = { version = "0.11.0", default-features = false, features = [] }
 
 [[bench]]
 name = "model_bench"

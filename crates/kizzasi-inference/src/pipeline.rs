@@ -112,17 +112,19 @@ impl Pipeline {
 
     /// Apply constraints to the output
     ///
-    /// If guardrails are configured, enforces constraints by projecting
-    /// the output onto the constraint-satisfying manifold
+    /// Enforces constraints by projecting the output onto the
+    /// constraint-satisfying manifold. Called only when constraints are enabled;
+    /// enabled-without-guardrails is rejected at build time, and reaching this
+    /// function without a `GuardrailSet` is reported rather than passed through
+    /// unconstrained.
     fn apply_constraints(&self, output: &Array1<f32>) -> InferenceResult<Array1<f32>> {
-        if let Some(ref guardrails) = self.guardrails {
-            // Use guardrails to constrain the output
-            guardrails
+        match self.guardrails {
+            Some(ref guardrails) => guardrails
                 .constrain(output)
-                .map_err(|e| InferenceError::ConstraintError(e.to_string()))
-        } else {
-            // No guardrails configured, return unchanged
-            Ok(output.clone())
+                .map_err(|e| InferenceError::ConstraintError(e.to_string())),
+            None => Err(InferenceError::PipelineConfig(
+                "constraint enforcement is enabled but no GuardrailSet is configured".to_string(),
+            )),
         }
     }
 
@@ -295,10 +297,33 @@ impl PipelineBuilder {
     }
 
     /// Build the pipeline
+    ///
+    /// Constraint enforcement is enabled when either the builder was told to
+    /// (`with_constraints`/`guardrails`) or the [`EngineConfig::apply_constraints`]
+    /// flag is set — the two used to disagree silently, with the engine flag never
+    /// being read at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::PipelineConfig`] when constraint enforcement is
+    /// enabled but no [`GuardrailSet`] was supplied: a pipeline that claims to
+    /// enforce constraints while passing every output through unchanged is worse
+    /// than a build failure. Guardrails can also be attached after the fact with
+    /// [`Pipeline::set_guardrails`]; in that case do not request constraints here.
     pub fn build(self) -> InferenceResult<Pipeline> {
         let engine_config = self
             .engine_config
             .ok_or_else(|| InferenceError::PipelineConfig("engine_config not set".into()))?;
+
+        let constraints_enabled = self.constraints_enabled || engine_config.apply_constraints;
+        if constraints_enabled && self.guardrails.is_none() {
+            return Err(InferenceError::PipelineConfig(
+                "constraint enforcement was requested but no GuardrailSet was supplied; \
+                 call PipelineBuilder::guardrails(..), or attach them later with \
+                 Pipeline::set_guardrails and leave constraints disabled at build time"
+                    .to_string(),
+            ));
+        }
 
         let engine = if let Some(model) = self.model {
             InferenceEngine::with_model(engine_config, model)
@@ -310,7 +335,7 @@ impl PipelineBuilder {
             engine,
             tokenizer: self.tokenizer,
             use_tokenizer: self.use_tokenizer,
-            constraints_enabled: self.constraints_enabled,
+            constraints_enabled,
             guardrails: self.guardrails,
             preprocess_hooks: self.preprocess_hooks,
             postprocess_hooks: self.postprocess_hooks,
@@ -334,13 +359,52 @@ mod tests {
         let engine_config = EngineConfig::new(3, 3);
         let pipeline = PipelineBuilder::new()
             .engine_config(engine_config)
-            .with_constraints()
+            .guardrails(GuardrailSet::new())
             .build();
 
         assert!(pipeline.is_ok());
-        let p = pipeline.unwrap();
+        let p = pipeline.expect("pipeline with guardrails must build");
         assert!(p.has_constraints());
         assert!(!p.has_tokenizer());
+    }
+
+    /// Regression: `with_constraints()` without a `GuardrailSet` used to build a
+    /// pipeline whose "constraint enforcement" passed every output through
+    /// unchanged.
+    #[test]
+    fn test_pipeline_constraints_without_guardrails_is_rejected() {
+        let result = PipelineBuilder::new()
+            .engine_config(EngineConfig::new(3, 3))
+            .with_constraints()
+            .build();
+
+        assert!(matches!(result, Err(InferenceError::PipelineConfig(_))));
+    }
+
+    /// Regression: `EngineConfig::apply_constraints` was never read, so guardrails
+    /// requested through the engine configuration were silently disabled.
+    #[test]
+    fn test_engine_config_apply_constraints_is_honoured() {
+        // Requested through the engine config alone, without guardrails -> error.
+        let missing = PipelineBuilder::new()
+            .engine_config(EngineConfig::new(3, 3).apply_constraints(true))
+            .build();
+        assert!(matches!(missing, Err(InferenceError::PipelineConfig(_))));
+
+        // Requested through the engine config, with guardrails -> enabled.
+        let pipeline = PipelineBuilder::new()
+            .engine_config(EngineConfig::new(3, 3).apply_constraints(true))
+            .guardrails(GuardrailSet::new())
+            .build()
+            .expect("guardrails supplied, must build");
+        assert!(pipeline.has_constraints());
+
+        // Not requested anywhere -> disabled, and building needs no guardrails.
+        let plain = PipelineBuilder::new()
+            .engine_config(EngineConfig::new(3, 3))
+            .build()
+            .expect("plain pipeline must build");
+        assert!(!plain.has_constraints());
     }
 
     #[test]

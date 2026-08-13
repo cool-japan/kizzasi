@@ -12,8 +12,10 @@
 use crate::error::{IoError, IoResult};
 use crate::stream::{SignalStream, StreamConfig};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossbeam_queue::ArrayQueue;
 use scirs2_core::ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -131,30 +133,43 @@ impl AudioConfig {
     }
 }
 
+/// Look up a cpal host by name among the hosts this build actually offers.
+///
+/// Returns [`IoError::Unsupported`] (listing the hosts that *are* available)
+/// when the requested backend is absent, rather than quietly handing back some
+/// other host under the requested backend's name.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+fn host_by_name(name: &str, requirement: &str) -> IoResult<cpal::Host> {
+    let host_id = cpal::available_hosts()
+        .into_iter()
+        .find(|id| id.name().eq_ignore_ascii_case(name))
+        .ok_or_else(|| {
+            let available: Vec<&str> = cpal::available_hosts().iter().map(|id| id.name()).collect();
+            IoError::Unsupported(format!(
+                "The {name} audio backend is not available in this build \
+                 (ensure {requirement}). Available hosts: {}",
+                available.join(", ")
+            ))
+        })?;
+
+    cpal::host_from_id(host_id)
+        .map_err(|e| IoError::ConfigError(format!("Failed to open the {name} audio host: {e}")))
+}
+
 /// Get the appropriate audio host based on backend selection
 fn get_host(backend: AudioBackend) -> IoResult<cpal::Host> {
     match backend {
         AudioBackend::Default => Ok(cpal::default_host()),
         #[cfg(target_os = "windows")]
-        AudioBackend::Asio => {
-            // ASIO backend - iterate through available hosts
-            let available_hosts = cpal::available_hosts();
-            if available_hosts.contains(&cpal::HostId::Asio) {
-                Ok(cpal::host_from_id(cpal::HostId::Asio))
-            } else {
-                Err(IoError::ConfigError(
-                    "ASIO backend not available. Ensure ASIO drivers are installed.".into(),
-                ))
-            }
-        }
+        AudioBackend::Asio => host_by_name(
+            "ASIO",
+            "the ASIO drivers are installed and cpal was built with its `asio` feature",
+        ),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        AudioBackend::Jack => {
-            // JACK backend - for now, fall back to default as JACK support varies by cpal version
-            // In cpal 0.16, JACK may not be directly available via HostId
-            // Users can use JACK-enabled systems with the default host
-            info!("JACK support requested - using default host (ensure JACK is configured as default)");
-            Ok(cpal::default_host())
-        }
+        AudioBackend::Jack => host_by_name(
+            "JACK",
+            "the JACK server is running and cpal was built with its `jack` feature",
+        ),
     }
 }
 
@@ -269,7 +284,13 @@ impl AudioInput {
         Ok(())
     }
 
-    /// Read multi-channel data
+    /// Read multi-channel data.
+    ///
+    /// Follows the same read contract as [`SignalStream::read`]: the returned
+    /// array has one row per frame that was **actually captured** (never
+    /// zero-padded up to `buffer_size`), `Err(IoError::BufferEmpty)` when the
+    /// device has not delivered any frames yet, and `Err(IoError::EndOfStream)`
+    /// once the input has been stopped.
     pub fn read_channels(&mut self) -> IoResult<Array2<f32>> {
         let mut multi_buffer = self
             .multi_channel_buffer
@@ -284,11 +305,17 @@ impl AudioInput {
             .unwrap_or(0)
             .min(self.config.buffer_size);
 
-        if min_len == 0 {
-            return Ok(Array2::zeros((
-                self.config.buffer_size,
-                self.config.channels,
-            )));
+        if min_len == 0 || (min_len < self.config.buffer_size && self.active) {
+            // A previous version returned Ok(Array2::zeros((buffer_size,
+            // channels))) here, presenting a full block of fabricated silence
+            // as captured audio. Partial captures stay buffered while the
+            // device runs; the tail is delivered once it stops.
+            drop(multi_buffer);
+            return Err(if self.active {
+                IoError::BufferEmpty
+            } else {
+                IoError::EndOfStream
+            });
         }
 
         let mut result = Array2::zeros((min_len, self.config.channels));
@@ -333,16 +360,24 @@ impl SignalStream for AudioInput {
             .map_err(|_| IoError::StreamError("Buffer lock failed".into()))?;
 
         let size = self.config.buffer_size.min(buffer.len());
-        if size == 0 {
-            return Ok(Array1::zeros(self.config.buffer_size));
+        // Previously an empty or partial capture returned
+        // Ok(Array1::zeros(buffer_size)) -- a full block of fabricated
+        // silence indistinguishable from a genuinely silent microphone.
+        // Per the stream read contract: while the device is running, a
+        // partial block stays buffered and BufferEmpty is reported (nothing
+        // is consumed); once stopped, the remaining samples are delivered as
+        // one final short block, then EndOfStream.
+        if size == 0 || (size < self.config.buffer_size && self.active) {
+            drop(buffer);
+            return Err(if self.active {
+                IoError::BufferEmpty
+            } else {
+                IoError::EndOfStream
+            });
         }
 
         let data: Vec<f32> = buffer.drain(..size).collect();
-        let mut result = Array1::zeros(self.config.buffer_size);
-        for (i, val) in data.into_iter().enumerate() {
-            result[i] = val;
-        }
-        Ok(result)
+        Ok(Array1::from_vec(data))
     }
 
     fn is_active(&self) -> bool {
@@ -363,11 +398,16 @@ pub struct AudioOutput {
     #[allow(dead_code)]
     config: StreamConfig,
     audio_config: AudioConfig,
-    buffer: Arc<Mutex<Vec<f32>>>,
+    /// Lock-free SPSC-friendly ring buffer shared with the realtime cpal
+    /// callback. `ArrayQueue::push`/`pop` never block and never allocate,
+    /// which a `std::sync::Mutex<Vec<f32>>` with `Vec::remove(0)` could not
+    /// guarantee (O(n) per-sample shifting plus a blocking lock acquisition
+    /// on the OS audio thread).
+    buffer: Arc<ArrayQueue<f32>>,
     #[allow(dead_code)]
     stream: Option<cpal::Stream>,
     active: bool,
-    underrun_count: Arc<Mutex<usize>>,
+    underrun_count: Arc<AtomicUsize>,
 }
 
 impl AudioOutput {
@@ -380,13 +420,26 @@ impl AudioOutput {
             timeout: None,
         };
 
+        // Bound the queue generously (60s of audio at the configured rate)
+        // instead of growing an unbounded Vec forever. A single large
+        // `write()` call (e.g. `play_wav_file` queuing a whole file up
+        // front) should comfortably fit; callers that genuinely need more
+        // headroom get an honest `IoError::BufferFull` instead of silent
+        // unbounded growth.
+        let channels = (audio_config.channels as usize).max(1);
+        let queue_capacity = (audio_config.sample_rate as usize)
+            .saturating_mul(channels)
+            .saturating_mul(60)
+            .max(audio_config.buffer_size as usize)
+            .max(1);
+
         Ok(Self {
             config: stream_config,
             audio_config,
-            buffer: Arc::new(Mutex::new(Vec::new())),
+            buffer: Arc::new(ArrayQueue::new(queue_capacity)),
             stream: None,
             active: false,
-            underrun_count: Arc::new(Mutex::new(0)),
+            underrun_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -428,24 +481,24 @@ impl AudioOutput {
             .build_output_stream(
                 config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut buf = match buffer.lock() {
-                        Ok(b) => b,
-                        Err(_) => return,
-                    };
-
-                    if buf.len() >= data.len() {
-                        // Sufficient data available
-                        for sample in data.iter_mut() {
-                            *sample = buf.remove(0);
-                        }
-                    } else {
-                        // Buffer underrun - fill with zeros
-                        if let Ok(mut count) = underrun_count.lock() {
-                            *count += 1;
-                        }
-                        for sample in data.iter_mut() {
-                            *sample = 0.0;
-                        }
+                    // Lock-free, allocation-free: pop one sample at a time
+                    // instead of taking a std Mutex and shifting a Vec
+                    // (which was O(data.len() * queued_len) per callback
+                    // and risked priority inversion against the writer
+                    // thread). A per-sample underrun (queue empty) is
+                    // filled with silence and counted once per callback.
+                    let mut underran = false;
+                    for sample in data.iter_mut() {
+                        *sample = match buffer.pop() {
+                            Some(value) => value,
+                            None => {
+                                underran = true;
+                                0.0
+                            }
+                        };
+                    }
+                    if underran {
+                        underrun_count.fetch_add(1, Ordering::Relaxed);
                     }
                 },
                 |err| {
@@ -475,27 +528,25 @@ impl AudioOutput {
     }
 
     /// Write samples to playback buffer
+    ///
+    /// Returns `IoError::BufferFull` if the queue's bounded capacity would
+    /// be exceeded; samples already pushed before that point remain queued
+    /// (partial write), matching how a real hardware buffer would behave
+    /// under sustained overflow.
     pub fn write(&mut self, samples: &Array1<f32>) -> IoResult<()> {
-        let mut buffer = self
-            .buffer
-            .lock()
-            .map_err(|_| IoError::StreamError("Buffer lock failed".into()))?;
-
-        buffer.extend(samples.iter());
+        for &sample in samples.iter() {
+            self.buffer.push(sample).map_err(|_| IoError::BufferFull)?;
+        }
         debug!("Wrote {} samples to output buffer", samples.len());
         Ok(())
     }
 
     /// Write multi-channel samples (interleaved)
     pub fn write_channels(&mut self, samples: &Array2<f32>) -> IoResult<()> {
-        let mut buffer = self
-            .buffer
-            .lock()
-            .map_err(|_| IoError::StreamError("Buffer lock failed".into()))?;
-
-        // Interleave channels
         for row in samples.outer_iter() {
-            buffer.extend(row.iter());
+            for &sample in row.iter() {
+                self.buffer.push(sample).map_err(|_| IoError::BufferFull)?;
+            }
         }
 
         debug!(
@@ -508,22 +559,17 @@ impl AudioOutput {
 
     /// Get buffer level (number of samples queued)
     pub fn buffer_level(&self) -> usize {
-        self.buffer.lock().map(|b| b.len()).unwrap_or(0)
+        self.buffer.len()
     }
 
     /// Get underrun count
     pub fn underrun_count(&self) -> usize {
-        self.underrun_count.lock().map(|c| *c).unwrap_or(0)
+        self.underrun_count.load(Ordering::Relaxed)
     }
 
     /// Clear buffer
     pub fn clear_buffer(&mut self) -> IoResult<()> {
-        let mut buffer = self
-            .buffer
-            .lock()
-            .map_err(|_| IoError::StreamError("Buffer lock failed".into()))?;
-
-        buffer.clear();
+        while self.buffer.pop().is_some() {}
         Ok(())
     }
 
@@ -548,7 +594,7 @@ impl AudioOutput {
     /// Play a WAV file
     #[cfg(feature = "file")]
     pub async fn play_wav_file(&mut self, path: &str) -> IoResult<()> {
-        let reader = WavReader::open(path).await?;
+        let mut reader = WavReader::open(path).await?;
         let spec = reader.spec();
 
         // Check compatibility
@@ -616,5 +662,83 @@ mod tests {
     fn test_list_output_devices() {
         let result = AudioOutput::list_devices();
         assert!(result.is_ok());
+    }
+
+    // === Regression tests: lock-free bounded playback queue (high) ===
+    //
+    // These exercise `AudioOutput`'s buffer directly (no `start()`/cpal
+    // device needed, so they run without real audio hardware). They also
+    // stand in for the removed `Vec::remove(0)` O(n^2) behavior: with a
+    // bounded `ArrayQueue`, pushing/popping thousands of samples must
+    // complete quickly and the returned values must preserve FIFO order.
+
+    #[test]
+    fn test_audio_output_write_and_buffer_level() {
+        let mut output = AudioOutput::new(AudioConfig::new_output()).unwrap();
+        assert_eq!(output.buffer_level(), 0);
+
+        let samples = Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4]);
+        output.write(&samples).unwrap();
+
+        assert_eq!(output.buffer_level(), 4);
+    }
+
+    #[test]
+    fn test_audio_output_clear_buffer() {
+        let mut output = AudioOutput::new(AudioConfig::new_output()).unwrap();
+        output
+            .write(&Array1::from_vec(vec![1.0; 100]))
+            .expect("write should succeed within the default queue capacity");
+        assert_eq!(output.buffer_level(), 100);
+
+        output.clear_buffer().unwrap();
+        assert_eq!(output.buffer_level(), 0);
+    }
+
+    #[test]
+    fn test_audio_output_underrun_count_starts_zero() {
+        let output = AudioOutput::new(AudioConfig::new_output()).unwrap();
+        assert_eq!(output.underrun_count(), 0);
+    }
+
+    #[test]
+    fn test_audio_output_write_reports_buffer_full_instead_of_growing_unbounded() {
+        // Tiny sample_rate + buffer_size forces a small (60-sample) queue
+        // capacity, so overflow is reachable without allocating megabytes.
+        let config = AudioConfig::new_output().sample_rate(1).buffer_size(4);
+        let mut output = AudioOutput::new(config).unwrap();
+
+        let too_many = Array1::from_vec(vec![0.5; 10_000]);
+        let result = output.write(&too_many);
+
+        assert!(
+            matches!(result, Err(IoError::BufferFull)),
+            "expected BufferFull once the bounded queue's capacity is exceeded, got {result:?}"
+        );
+        // Whatever fit before overflow should still be queued (partial
+        // write), not silently dropped.
+        assert!(output.buffer_level() > 0);
+    }
+
+    #[test]
+    fn test_audio_output_write_many_samples_stays_fast_and_ordered() {
+        // Regression guard for the O(n^2) `Vec::remove(0)` pattern: pushing
+        // and draining a large number of samples through the public API
+        // must be fast (no per-sample O(n) shifting) and must preserve
+        // order via `ArrayQueue`'s FIFO semantics.
+        let config = AudioConfig::new_output().sample_rate(44_100).channels(1);
+        let mut output = AudioOutput::new(config).unwrap();
+
+        let n = 50_000;
+        let samples: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let start = std::time::Instant::now();
+        output.write(&Array1::from_vec(samples)).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(output.buffer_level(), n);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "writing {n} samples took {elapsed:?}, suggesting O(n^2) behavior regressed"
+        );
     }
 }

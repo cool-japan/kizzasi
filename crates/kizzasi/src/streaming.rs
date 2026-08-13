@@ -70,9 +70,9 @@ impl Stream for PredictionStream {
 
 /// Async predictor wrapper with channel-based I/O
 pub struct AsyncPredictor {
-    input_tx: mpsc::Sender<Array1<f32>>,
+    /// `None` once [`AsyncPredictor::close`] has dropped the sender.
+    input_tx: Option<mpsc::Sender<Array1<f32>>>,
     output_rx: mpsc::Receiver<KizzasiResult<Array1<f32>>>,
-    #[allow(dead_code)]
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -94,18 +94,28 @@ impl AsyncPredictor {
         });
 
         Self {
-            input_tx,
+            input_tx: Some(input_tx),
             output_rx,
             handle,
         }
     }
 
     /// Send an input for prediction
+    ///
+    /// Returns `SendError` once [`Self::close`] has been called.
     pub async fn send(
         &self,
         input: Array1<f32>,
     ) -> Result<(), mpsc::error::SendError<Array1<f32>>> {
-        self.input_tx.send(input).await
+        match self.input_tx.as_ref() {
+            Some(tx) => tx.send(input).await,
+            None => Err(mpsc::error::SendError(input)),
+        }
+    }
+
+    /// Whether the input channel is still open.
+    pub fn is_open(&self) -> bool {
+        self.input_tx.is_some()
     }
 
     /// Receive the next prediction
@@ -123,10 +133,24 @@ impl AsyncPredictor {
             .ok_or_else(|| crate::error::KizzasiError::Inference("Channel closed".into()))?
     }
 
-    /// Close the input channel (predictor will finish processing)
-    pub fn close(&self) {
-        // Dropping the sender reference doesn't close the channel
-        // The channel closes when all senders are dropped
+    /// Close the input channel; the worker drains what is queued and exits.
+    ///
+    /// This drops the only sender, which is what actually terminates the
+    /// background task. (It used to be an empty function body with a comment
+    /// explaining why dropping a *reference* would not work — so calling it
+    /// did nothing at all and leaked the task.) Subsequent [`Self::send`]
+    /// calls return `SendError`; queued outputs can still be drained with
+    /// [`Self::recv`].
+    pub fn close(&mut self) {
+        self.input_tx = None;
+    }
+
+    /// Close the input channel and wait for the worker task to finish.
+    pub async fn shutdown(mut self) -> Result<(), tokio::task::JoinError> {
+        self.close();
+        // Drop the output receiver so a worker blocked on `send` can finish.
+        drop(self.output_rx);
+        self.handle.await
     }
 }
 
@@ -173,6 +197,34 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_close_terminates_the_worker_task() {
+        // Regression: `close()` had an empty body, so the background task
+        // outlived every call to it.
+        let predictor = crate::KizzasiBuilder::lightweight_preset(2, 2)
+            .build()
+            .expect("build");
+        let mut async_predictor = AsyncPredictor::spawn(predictor, 4);
+
+        async_predictor
+            .predict(Array1::from_vec(vec![0.1, 0.2]))
+            .await
+            .expect("predict");
+
+        assert!(async_predictor.is_open());
+        async_predictor.close();
+        assert!(!async_predictor.is_open());
+
+        // Sending after close is an error, not a silent drop.
+        assert!(async_predictor
+            .send(Array1::from_vec(vec![0.3, 0.4]))
+            .await
+            .is_err());
+
+        // And the worker actually finishes.
+        async_predictor.shutdown().await.expect("worker joined");
+    }
     use crate::KizzasiBuilder;
     use futures::StreamExt;
     use kizzasi_core::ModelType;

@@ -49,14 +49,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
     );
     println!("\nOriginal signal shape: {}", signal.len());
-    println!("First 10 samples: {:?}", &signal.slice(s![..10]).to_vec());
+    println!("First 10 samples: {:?}", signal.slice(s![..10]).to_vec());
 
     // Encode the signal
     let encoded = tokenizer.encode(&signal)?;
     println!("\nEncoded embedding shape: {}", encoded.len());
     println!(
         "First 10 embedding values: {:?}",
-        &encoded.slice(s![..10]).to_vec()
+        encoded.slice(s![..10]).to_vec()
     );
 
     // Decode back
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nDecoded signal shape: {}", decoded.len());
     println!(
         "First 10 decoded samples: {:?}",
-        &decoded.slice(s![..10]).to_vec()
+        decoded.slice(s![..10]).to_vec()
     );
 
     // Compute reconstruction error
@@ -137,8 +137,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Example 4: EMA vs Non-EMA updates
-    println!("\n4. EMA vs Non-EMA Codebook Updates");
+    // Example 4: `use_ema: true` vs `use_ema: false` codebooks
+    //
+    // `use_ema` only gates whether `VectorQuantizer::update_ema` (the
+    // codebook *training* step) is allowed to run — it has no effect on
+    // `encode`/`decode` themselves, which is all this example calls. There
+    // is currently no gradient-based codebook update path in this crate, so
+    // `update_ema` on a `use_ema: false` quantizer returns an error rather
+    // than silently running the EMA update anyway (see
+    // `VectorQuantizer::update_ema`'s docs).
+    println!("\n4. use_ema: true vs use_ema: false");
     println!("-----------------------------------");
 
     let ema_config = VQConfig {
@@ -154,7 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         codebook_size: 256,
         embed_dim: 64,
         commitment_beta: 0.25,
-        ema_decay: 0.0, // Not used when use_ema is false
+        ema_decay: 0.99, // irrelevant while use_ema is false, but kept valid
         epsilon: 1e-5,
         use_ema: false,
     };
@@ -162,15 +170,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ema_tokenizer = VQVAETokenizer::new(input_dim, ema_config);
     let non_ema_tokenizer = VQVAETokenizer::new(input_dim, non_ema_config);
 
-    println!("EMA updates provide smoother codebook adaptation");
-    println!("Non-EMA updates allow faster adaptation to new data");
+    println!("Both configurations encode/decode identically; use_ema only");
+    println!("gates whether codebook *training* via update_ema is permitted.");
 
-    // Encode with both
+    // Encode with both — encode/decode themselves are unaffected by use_ema.
     let ema_encoded = ema_tokenizer.encode(&signal)?;
     let non_ema_encoded = non_ema_tokenizer.encode(&signal)?;
 
-    println!("\nEMA encoded shape: {}", ema_encoded.len());
-    println!("Non-EMA encoded shape: {}", non_ema_encoded.len());
+    println!("\nEMA-configured encoded shape: {}", ema_encoded.len());
+    println!(
+        "Non-EMA-configured encoded shape: {}",
+        non_ema_encoded.len()
+    );
 
     Ok(())
 }

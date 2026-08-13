@@ -69,7 +69,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 
 ---
 
-## In Progress
+## In Progress ✅
 
 ### Weight Loading
 - [x] RWKV weight loading from SafeTensors ✅
@@ -100,7 +100,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 
 ---
 
-## Planned Features
+## Planned Features (Completed)
 
 ### P1: High Priority
 
@@ -156,7 +156,7 @@ Model architectures for Kizzasi AGSP - Mamba, Mamba2, RWKV, S4, Transformer.
 
 #### Training Infrastructure
 - [x] Loss functions (MSE, CrossEntropy) ✅
-- [x] Optimizer integration (Adam, Lion) ✅
+- [x] Optimizer integration (SGD, SGD+Momentum, Adam, AdamW) ✅
 - [x] Learning rate schedulers ✅
 - [x] Distributed training ✅
 

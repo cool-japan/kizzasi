@@ -65,16 +65,30 @@ impl ContinuousEmbedding {
     }
 
     /// Apply layer normalization
+    ///
+    /// Computes the variance via a single allocation-free iterator sum
+    /// (rather than `input.mapv(...).sum()`, which allocated and immediately
+    /// dropped a whole extra `hidden_dim`-length array just to reduce it),
+    /// and normalizes with one reciprocal multiply per element instead of a
+    /// division. Called `num_layers + 1` times per recurrence step from
+    /// `SelectiveSSM::recurrence_step`, so this is on a genuinely hot path.
     pub fn layer_norm(input: &Array1<f32>, eps: f32) -> Array1<f32> {
         let n = input.len() as f32;
         let mean = if n > 0.0 { input.sum() / n } else { 0.0 };
         let var = if n > 0.0 {
-            input.mapv(|x| (x - mean).powi(2)).sum() / n
+            input
+                .iter()
+                .map(|&x| {
+                    let d = x - mean;
+                    d * d
+                })
+                .sum::<f32>()
+                / n
         } else {
             1.0
         };
-        let std = (var + eps).sqrt();
-        input.mapv(|x| (x - mean) / std)
+        let inv_std = 1.0 / (var + eps).sqrt();
+        input.mapv(|x| (x - mean) * inv_std)
     }
 }
 

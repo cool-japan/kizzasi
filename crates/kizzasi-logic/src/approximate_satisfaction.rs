@@ -94,10 +94,10 @@ impl<C: ViolationComputable + Clone> HierarchicalRelaxation<C> {
                 let mut improved = false;
 
                 for hc in &level_constraints {
-                    let current_slice = current.as_slice().unwrap_or(&[]);
-                    if !hc.constraint.check(current_slice) {
+                    let current_slice = crate::array_utils::contiguous(&current);
+                    if !hc.constraint.check(&current_slice) {
                         // Try to reduce violation via gradient descent
-                        let violation = hc.constraint.violation(current_slice);
+                        let violation = hc.constraint.violation(&current_slice);
                         if violation > self.tolerance {
                             // Simple gradient-based adjustment
                             for i in 0..current.len() {
@@ -105,8 +105,9 @@ impl<C: ViolationComputable + Clone> HierarchicalRelaxation<C> {
                                 let mut perturbed = current.clone();
                                 perturbed[i] += epsilon;
 
-                                let viol_plus =
-                                    hc.constraint.violation(perturbed.as_slice().unwrap_or(&[]));
+                                let viol_plus = hc
+                                    .constraint
+                                    .violation(&crate::array_utils::contiguous(&perturbed));
                                 let grad = (viol_plus - violation) / epsilon;
 
                                 if grad.abs() > 1e-6 {
@@ -125,11 +126,11 @@ impl<C: ViolationComputable + Clone> HierarchicalRelaxation<C> {
 
             // Count satisfied constraints at this level
             for hc in &level_constraints {
-                let current_slice = current.as_slice().unwrap_or(&[]);
-                if hc.constraint.check(current_slice) {
+                let current_slice = crate::array_utils::contiguous(&current);
+                if hc.constraint.check(&current_slice) {
                     satisfied_constraints += 1;
                 } else {
-                    total_violation += hc.constraint.violation(current_slice);
+                    total_violation += hc.constraint.violation(&current_slice);
                 }
             }
         }
@@ -191,8 +192,8 @@ impl<C: ViolationComputable + Clone> BoundedErrorSolver<C> {
 
             // Compute gradient of total violation
             for constraint in &self.constraints {
-                let current_slice = current.as_slice().unwrap_or(&[]);
-                let violation = constraint.violation(current_slice);
+                let current_slice = crate::array_utils::contiguous(&current);
+                let violation = constraint.violation(&current_slice);
 
                 if violation > self.error_bound {
                     any_violation = true;
@@ -204,7 +205,8 @@ impl<C: ViolationComputable + Clone> BoundedErrorSolver<C> {
                         let mut perturbed = current.clone();
                         perturbed[i] += epsilon;
 
-                        let viol_plus = constraint.violation(perturbed.as_slice().unwrap_or(&[]));
+                        let viol_plus =
+                            constraint.violation(&crate::array_utils::contiguous(&perturbed));
                         let grad = (viol_plus - violation) / epsilon;
 
                         current[i] -= self.step_size * grad;
@@ -226,8 +228,8 @@ impl<C: ViolationComputable + Clone> BoundedErrorSolver<C> {
         // Count satisfied constraints and compute final violation
         let mut satisfied = 0;
         for constraint in &self.constraints {
-            let current_slice = current.as_slice().unwrap_or(&[]);
-            let violation = constraint.violation(current_slice);
+            let current_slice = crate::array_utils::contiguous(&current);
+            let violation = constraint.violation(&current_slice);
             total_violation += violation;
             if violation <= self.error_bound {
                 satisfied += 1;
@@ -286,8 +288,8 @@ impl<C: ViolationComputable + Clone> AnytimeSolver<C> {
             // Compute current violation
             let mut total_violation = 0.0;
             for constraint in &self.constraints {
-                let current_slice = current.as_slice().unwrap_or(&[]);
-                total_violation += constraint.violation(current_slice).max(0.0);
+                let current_slice = crate::array_utils::contiguous(&current);
+                total_violation += constraint.violation(&current_slice).max(0.0);
             }
 
             // Update best if improved
@@ -298,8 +300,8 @@ impl<C: ViolationComputable + Clone> AnytimeSolver<C> {
 
             // Gradient descent step
             for constraint in &self.constraints {
-                let current_slice = current.as_slice().unwrap_or(&[]);
-                let violation = constraint.violation(current_slice);
+                let current_slice = crate::array_utils::contiguous(&current);
+                let violation = constraint.violation(&current_slice);
 
                 if violation > 0.0 {
                     for i in 0..current.len() {
@@ -307,7 +309,8 @@ impl<C: ViolationComputable + Clone> AnytimeSolver<C> {
                         let mut perturbed = current.clone();
                         perturbed[i] += epsilon;
 
-                        let viol_plus = constraint.violation(perturbed.as_slice().unwrap_or(&[]));
+                        let viol_plus =
+                            constraint.violation(&crate::array_utils::contiguous(&perturbed));
                         let grad = (viol_plus - violation) / epsilon;
 
                         current[i] -= self.step_size * grad;
@@ -329,8 +332,8 @@ impl<C: ViolationComputable + Clone> AnytimeSolver<C> {
         // Count satisfied constraints
         let mut satisfied = 0;
         for constraint in &self.constraints {
-            let sol_slice = solution.as_slice().unwrap_or(&[]);
-            if constraint.check(sol_slice) {
+            let sol_slice = crate::array_utils::contiguous(&solution);
+            if constraint.check(&sol_slice) {
                 satisfied += 1;
             }
         }
@@ -356,8 +359,8 @@ impl<C: ViolationComputable + Clone> AnytimeSolver<C> {
             // Compute current violation
             let mut total_violation = 0.0;
             for constraint in &self.constraints {
-                let current_slice = current.as_slice().unwrap_or(&[]);
-                total_violation += constraint.violation(current_slice).max(0.0);
+                let current_slice = crate::array_utils::contiguous(&current);
+                total_violation += constraint.violation(&current_slice).max(0.0);
             }
 
             // Update best if improved
@@ -368,8 +371,8 @@ impl<C: ViolationComputable + Clone> AnytimeSolver<C> {
 
             // Gradient descent step
             for constraint in &self.constraints {
-                let current_slice = current.as_slice().unwrap_or(&[]);
-                let violation = constraint.violation(current_slice);
+                let current_slice = crate::array_utils::contiguous(&current);
+                let violation = constraint.violation(&current_slice);
 
                 if violation > 0.0 {
                     for i in 0..current.len() {
@@ -377,7 +380,8 @@ impl<C: ViolationComputable + Clone> AnytimeSolver<C> {
                         let mut perturbed = current.clone();
                         perturbed[i] += epsilon;
 
-                        let viol_plus = constraint.violation(perturbed.as_slice().unwrap_or(&[]));
+                        let viol_plus =
+                            constraint.violation(&crate::array_utils::contiguous(&perturbed));
                         let grad = (viol_plus - violation) / epsilon;
 
                         current[i] -= self.step_size * grad;
@@ -393,8 +397,8 @@ impl<C: ViolationComputable + Clone> AnytimeSolver<C> {
 
         let mut satisfied = 0;
         for constraint in &self.constraints {
-            let sol_slice = solution.as_slice().unwrap_or(&[]);
-            if constraint.check(sol_slice) {
+            let sol_slice = crate::array_utils::contiguous(&solution);
+            if constraint.check(&sol_slice) {
                 satisfied += 1;
             }
         }

@@ -13,22 +13,32 @@
 //! - Fault recovery in control systems
 //! - Interactive constraint debugging
 
-use crate::constraint::{BoundType, Constraint};
+use crate::constraint::{BoundType, Constraint, ViolationComputable};
 use crate::error::{LogicError, LogicResult};
 use scirs2_core::ndarray::Array1;
 
+/// Maximum number of cyclic-projection sweeps used when moving a point.
+const PROJECTION_SWEEPS: usize = 200;
+
 /// Result of constraint repair operation
+///
+/// The exact meaning of the fields depends on the [`RepairStrategy`] used —
+/// see that enum for the per-strategy contract. In all cases the invariant is:
+/// when `success` is `true`, `repaired_point` holds a point that satisfies
+/// every constraint after the reported constraints are relaxed by the reported
+/// amounts. When `success` is `false`, `repaired_point` is `None` and no
+/// feasible (relaxed) configuration was found within `max_relaxation`.
 #[derive(Debug, Clone)]
 pub struct RepairResult {
     /// Indices of constraints that were relaxed
     pub relaxed_constraints: Vec<usize>,
-    /// Amount each constraint was relaxed
+    /// Amount each constraint was relaxed (parallel to `relaxed_constraints`)
     pub relaxation_amounts: Vec<f32>,
     /// Total cost of repair
     pub repair_cost: f32,
     /// Whether repair was successful
     pub success: bool,
-    /// Repaired point (if successful)
+    /// Repaired point (only present when `success`)
     pub repaired_point: Option<Array1<f32>>,
 }
 
@@ -45,15 +55,25 @@ impl RepairResult {
 }
 
 /// Strategy for repairing infeasible constraints
+///
+/// The first three strategies treat the *point* as the hard requirement and
+/// repair by relaxing constraints around it (the point is returned unchanged
+/// when the relaxation alone restores feasibility). `ElasticProgramming`
+/// instead treats the *constraints* as the requirement and moves the point.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RepairStrategy {
-    /// Relax all violated constraints equally
+    /// Relax all violated constraints by the same amount (the largest
+    /// violation, capped at `max_relaxation`)
     Uniform,
-    /// Relax constraints with lowest priority first
+    /// Relax constraints with lowest priority first; each violated constraint
+    /// is relaxed by its own violation and the report is ordered by ascending
+    /// priority
     PriorityBased,
-    /// Relax constraints to minimize total relaxation
+    /// Relax each violated constraint by exactly its own violation — the
+    /// smallest total relaxation that admits the point
     MinimalRelaxation,
-    /// Use elastic programming (soft constraints)
+    /// Use elastic programming: move the point onto the constraint set and
+    /// report the residual slack that could not be removed
     ElasticProgramming,
 }
 
@@ -91,13 +111,31 @@ impl ConstraintRepairer {
 
     /// Repair infeasible constraints at a given point
     ///
-    /// Returns a RepairResult with relaxation information
+    /// Every constraint is evaluated on the dimension it governs
+    /// (`Constraint::dimension()`); an untagged constraint applies to all
+    /// dimensions, matching the [`ViolationComputable`] implementation for
+    /// [`Constraint`].
+    ///
+    /// # Errors
+    ///
+    /// * [`LogicError::DimensionMismatch`] when a constraint names a dimension
+    ///   the point does not have. (This is deliberately stricter than the
+    ///   `ViolationComputable` implementation for `Constraint`, which reports
+    ///   such a constraint as satisfied: silently reporting an out-of-range
+    ///   constraint as feasible would hide exactly the infeasibility this
+    ///   module exists to diagnose.)
+    /// * [`LogicError::InvalidInput`] when the point is empty but constraints
+    ///   were supplied.
+    /// * [`LogicError::InfeasibleConstraint`] when the priority vector length
+    ///   does not match the constraint count.
     pub fn repair(
         &self,
         point: &[f32],
         constraints: &[Constraint],
         priorities: Option<&[f32]>,
     ) -> LogicResult<RepairResult> {
+        validate_point(point, constraints)?;
+
         match self.strategy {
             RepairStrategy::Uniform => self.repair_uniform(point, constraints),
             RepairStrategy::PriorityBased => {
@@ -108,39 +146,38 @@ impl ConstraintRepairer {
         }
     }
 
-    /// Uniform relaxation: relax all violated constraints equally
+    /// Uniform relaxation: relax every violated constraint by the same amount.
+    ///
+    /// The shared relaxation is the largest violation present, capped at
+    /// `max_relaxation`. When the cap bites, the point is additionally moved so
+    /// that the residual fits inside the reported relaxation.
     fn repair_uniform(
         &self,
         point: &[f32],
         constraints: &[Constraint],
     ) -> LogicResult<RepairResult> {
-        let mut relaxed = Vec::new();
-        let mut amounts = Vec::new();
-        let mut total_cost = 0.0;
+        let violations = self.violations(point, constraints);
+        let violated: Vec<usize> = self.violated_indices(&violations);
 
-        for (i, constraint) in constraints.iter().enumerate() {
-            let violation = if point.is_empty() {
-                0.0
-            } else {
-                constraint.violation(point[0])
-            };
-            if violation > self.tolerance {
-                relaxed.push(i);
-                amounts.push(violation);
-                total_cost += violation;
+        let largest = violated
+            .iter()
+            .filter_map(|&i| violations.get(i).copied())
+            .fold(0.0_f32, f32::max);
+        let shared = largest.min(self.max_relaxation);
+
+        let mut budgets = vec![0.0_f32; constraints.len()];
+        for &i in &violated {
+            if let Some(slot) = budgets.get_mut(i) {
+                *slot = shared;
             }
         }
 
-        Ok(RepairResult {
-            relaxed_constraints: relaxed,
-            relaxation_amounts: amounts,
-            repair_cost: total_cost,
-            success: true,
-            repaired_point: Some(Array1::from_vec(point.to_vec())),
-        })
+        let amounts = vec![shared; violated.len()];
+        let cost = shared * violated.len() as f32;
+        Ok(self.finalize(point, constraints, violated, amounts, cost, &budgets))
     }
 
-    /// Priority-based relaxation: relax low-priority constraints first
+    /// Priority-based relaxation: relax low-priority constraints first.
     fn repair_priority_based(
         &self,
         point: &[f32],
@@ -156,194 +193,299 @@ impl ConstraintRepairer {
             ));
         }
 
-        // Create (index, priority, violation) tuples
-        let mut violations: Vec<(usize, f32, f32)> = constraints
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let viol = if point.is_empty() {
-                    0.0
-                } else {
-                    c.violation(point[0])
-                };
-                (i, priorities[i], viol)
+        let violations = self.violations(point, constraints);
+
+        // (index, priority, violation) for every violated constraint
+        let mut ranked: Vec<(usize, f32, f32)> = self
+            .violated_indices(&violations)
+            .into_iter()
+            .map(|i| {
+                (
+                    i,
+                    priorities.get(i).copied().unwrap_or(1.0),
+                    violations.get(i).copied().unwrap_or(0.0),
+                )
             })
-            .filter(|(_, _, viol)| *viol > self.tolerance)
             .collect();
 
-        // Sort by priority (lowest first) then by violation (largest first)
-        violations.sort_by(|a, b| {
+        // Sort by priority (lowest first) then by violation (largest first):
+        // the cheapest constraints to give up come first.
+        ranked.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
         });
 
-        let relaxed: Vec<usize> = violations.iter().map(|(i, _, _)| *i).collect();
-        let amounts: Vec<f32> = violations.iter().map(|(_, _, v)| *v).collect();
-        let total_cost: f32 = violations
-            .iter()
-            .map(|(_, p, v)| p * v) // Weight by priority
-            .sum();
+        let mut budgets = vec![0.0_f32; constraints.len()];
+        let mut relaxed = Vec::with_capacity(ranked.len());
+        let mut amounts = Vec::with_capacity(ranked.len());
+        let mut cost = 0.0_f32;
 
-        Ok(RepairResult {
-            relaxed_constraints: relaxed,
-            relaxation_amounts: amounts,
-            repair_cost: total_cost,
-            success: true,
-            repaired_point: Some(Array1::from_vec(point.to_vec())),
-        })
+        for (index, priority, violation) in ranked {
+            let amount = violation.min(self.max_relaxation);
+            if let Some(slot) = budgets.get_mut(index) {
+                *slot = amount;
+            }
+            relaxed.push(index);
+            amounts.push(amount);
+            cost += priority * amount; // Weight by priority
+        }
+
+        Ok(self.finalize(point, constraints, relaxed, amounts, cost, &budgets))
     }
 
-    /// Minimal relaxation: find minimum set of constraints to relax
+    /// Minimal relaxation: relax each violated constraint by exactly its own
+    /// violation — the smallest total relaxation that admits the point.
     fn repair_minimal(
         &self,
         point: &[f32],
         constraints: &[Constraint],
     ) -> LogicResult<RepairResult> {
-        // Find minimal infeasible subset using greedy algorithm
-        let mut violated: Vec<(usize, f32)> = constraints
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| {
-                let viol = if point.is_empty() {
-                    0.0
-                } else {
-                    c.violation(point[0])
-                };
-                if viol > self.tolerance {
-                    Some((i, viol))
-                } else {
-                    None
-                }
-            })
+        let violations = self.violations(point, constraints);
+
+        let mut violated: Vec<(usize, f32)> = self
+            .violated_indices(&violations)
+            .into_iter()
+            .map(|i| (i, violations.get(i).copied().unwrap_or(0.0)))
             .collect();
 
         // Sort by violation (largest first for greedy selection)
         violated.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let relaxed: Vec<usize> = violated.iter().map(|(i, _)| *i).collect();
-        let amounts: Vec<f32> = violated.iter().map(|(_, v)| *v).collect();
-        let total_cost: f32 = amounts.iter().sum();
+        let mut budgets = vec![0.0_f32; constraints.len()];
+        let mut relaxed = Vec::with_capacity(violated.len());
+        let mut amounts = Vec::with_capacity(violated.len());
+        let mut cost = 0.0_f32;
 
-        let success = !relaxed.is_empty();
-        Ok(RepairResult {
-            relaxed_constraints: relaxed,
-            relaxation_amounts: amounts,
-            repair_cost: total_cost,
-            success,
-            repaired_point: Some(Array1::from_vec(point.to_vec())),
-        })
+        for (index, violation) in violated {
+            let amount = violation.min(self.max_relaxation);
+            if let Some(slot) = budgets.get_mut(index) {
+                *slot = amount;
+            }
+            relaxed.push(index);
+            amounts.push(amount);
+            cost += amount;
+        }
+
+        Ok(self.finalize(point, constraints, relaxed, amounts, cost, &budgets))
     }
 
     /// Elastic programming: solve with slack variables
+    ///
+    /// ```text
+    /// min Σ slackᵢ
+    /// s.t. cᵢ(x) <= slackᵢ,  slackᵢ >= 0
+    /// ```
+    ///
+    /// The point is moved onto the constraint set by cyclic projection, which
+    /// drives the slacks to zero whenever the constraints admit a common point.
+    /// Whatever violation survives is reported as the residual slack.
     fn repair_elastic(
         &self,
         point: &[f32],
         constraints: &[Constraint],
     ) -> LogicResult<RepairResult> {
-        // Elastic programming adds slack variables to violated constraints
-        // min Σ slack_i
-        // s.t. constraints[i](x) <= slack_i
-        //      slack_i >= 0
-        //
-        // This is a simplified version
+        // Target zero slack for every constraint and let the projection tell us
+        // what actually remains.
+        let zero_budgets = vec![0.0_f32; constraints.len()];
+        let repaired = self.compute_repaired_point(point, constraints, &zero_budgets);
 
-        let mut relaxed = Vec::new();
-        let mut slacks = Vec::new();
-        let mut total_slack = 0.0;
+        let residuals = self.violations(&repaired, constraints);
+        let violated = self.violated_indices(&residuals);
 
-        for (i, constraint) in constraints.iter().enumerate() {
-            // Use the dimension the constraint governs, clamped to a valid index.
-            let dim = constraint
-                .dimension()
-                .unwrap_or(0)
-                .min(point.len().saturating_sub(1));
-            let violation = if point.is_empty() {
-                0.0
-            } else {
-                constraint.violation(point[dim])
-            };
-            if violation > self.tolerance {
-                let slack = violation.min(self.max_relaxation);
-                relaxed.push(i);
-                slacks.push(slack);
-                total_slack += slack;
+        let mut relaxed = Vec::with_capacity(violated.len());
+        let mut slacks = Vec::with_capacity(violated.len());
+        let mut total_slack = 0.0_f32;
+        let mut success = true;
+
+        for index in violated {
+            let residual = residuals.get(index).copied().unwrap_or(0.0);
+            let slack = residual.min(self.max_relaxation);
+            if residual > slack + self.tolerance {
+                // The residual violation exceeds the configured relaxation cap,
+                // so no admissible elastic program exists at this point.
+                success = false;
             }
+            relaxed.push(index);
+            slacks.push(slack);
+            total_slack += slack;
         }
-
-        // Try to find a point that minimizes slacks (simplified)
-        let repaired = self.compute_repaired_point(point, constraints, &relaxed, &slacks)?;
 
         Ok(RepairResult {
             relaxed_constraints: relaxed,
             relaxation_amounts: slacks,
             repair_cost: total_slack,
-            success: true,
-            repaired_point: Some(repaired),
+            success,
+            repaired_point: if success {
+                Some(Array1::from_vec(repaired))
+            } else {
+                None
+            },
         })
     }
 
-    /// Compute repaired point through gradient descent
+    /// Violation of every constraint at `point`, honouring the dimension tag.
+    fn violations(&self, point: &[f32], constraints: &[Constraint]) -> Vec<f32> {
+        constraints
+            .iter()
+            .map(|c| ViolationComputable::violation(c, point))
+            .collect()
+    }
+
+    /// Indices whose violation exceeds the feasibility tolerance.
+    fn violated_indices(&self, violations: &[f32]) -> Vec<usize> {
+        violations
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v > self.tolerance)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Turn a relaxation plan into a [`RepairResult`], verifying that the plan
+    /// really does restore feasibility.
+    ///
+    /// `budgets` is indexed by constraint and holds the relaxation granted to
+    /// each one. If the original point already fits inside those budgets it is
+    /// returned unchanged; otherwise the point is moved by cyclic projection
+    /// onto the relaxed constraint set and the outcome is re-verified.
+    fn finalize(
+        &self,
+        point: &[f32],
+        constraints: &[Constraint],
+        relaxed: Vec<usize>,
+        amounts: Vec<f32>,
+        cost: f32,
+        budgets: &[f32],
+    ) -> RepairResult {
+        let mut candidate: Vec<f32> = point.to_vec();
+
+        if !self.fits_budgets(&candidate, constraints, budgets) {
+            candidate = self.compute_repaired_point(point, constraints, budgets);
+        }
+
+        let success = self.fits_budgets(&candidate, constraints, budgets);
+
+        RepairResult {
+            relaxed_constraints: relaxed,
+            relaxation_amounts: amounts,
+            repair_cost: cost,
+            success,
+            repaired_point: if success {
+                Some(Array1::from_vec(candidate))
+            } else {
+                None
+            },
+        }
+    }
+
+    /// `true` when every constraint's violation at `point` is inside its budget.
+    fn fits_budgets(&self, point: &[f32], constraints: &[Constraint], budgets: &[f32]) -> bool {
+        constraints.iter().enumerate().all(|(i, constraint)| {
+            let budget = budgets.get(i).copied().unwrap_or(0.0);
+            ViolationComputable::violation(constraint, point) <= budget + self.tolerance
+        })
+    }
+
+    /// Move `initial` onto the constraint set by cyclic projection (POCS).
+    ///
+    /// `budgets[i]` is the slack granted to constraint `i`: the projection
+    /// targets the budget-relaxed feasible region, so a constraint with a
+    /// generous budget does not pull the point further than necessary. For a
+    /// single constraint this is the exact Euclidean projection; when the
+    /// (relaxed) constraints have no common point the sweep stalls and the
+    /// caller's re-verification reports the failure.
     fn compute_repaired_point(
         &self,
         initial: &[f32],
         constraints: &[Constraint],
-        relaxed: &[usize],
-        slacks: &[f32],
-    ) -> LogicResult<Array1<f32>> {
-        let mut x = Array1::from_vec(initial.to_vec());
-        let step_size = 0.01;
-        let max_iter = 100;
+        budgets: &[f32],
+    ) -> Vec<f32> {
+        let mut x = initial.to_vec();
 
-        for _ in 0..max_iter {
-            let mut gradient = Array1::<f32>::zeros(x.len());
-            let mut improved = false;
+        for _ in 0..PROJECTION_SWEEPS {
+            let mut max_move = 0.0_f32;
 
-            // Compute gradient to reduce violations
-            for (&idx, &slack) in relaxed.iter().zip(slacks.iter()) {
-                let x_slice: Vec<f32> = x.iter().copied().collect();
-
-                // Determine which dimension this constraint governs.
-                // Fall back to 0 when no dimension is tagged, but clamp to
-                // the last valid index to guard against empty slices.
-                let dim = constraints[idx]
-                    .dimension()
-                    .unwrap_or(0)
-                    .min(x_slice.len().saturating_sub(1));
-
-                let violation = if x_slice.is_empty() {
-                    0.0
-                } else {
-                    constraints[idx].violation(x_slice[dim])
-                };
-
-                // Elastic programming seeks to drive violations toward zero
-                // even when the current violation is below the initial slack
-                // budget.  The slack represents the *allowed* soft-constraint
-                // headroom, but we still descend as long as any violation exists.
-                if violation > self.tolerance {
-                    // Numerical gradient – only dimension `dim` contributes a
-                    // nonzero finite difference for a scalar-indexed constraint.
-                    let eps = 1e-5;
-                    let mut x_plus = x_slice.clone();
-                    x_plus[dim] += eps;
-                    let viol_plus = constraints[idx].violation(x_plus[dim]);
-
-                    gradient[dim] += (viol_plus - violation) / eps;
-                    improved = true;
+            for (i, constraint) in constraints.iter().enumerate() {
+                let budget = budgets.get(i).copied().unwrap_or(0.0);
+                if ViolationComputable::violation(constraint, &x) <= budget + self.tolerance {
+                    continue;
                 }
-                let _ = slack; // slack is used by the caller to report relaxation amounts
+
+                match constraint.dimension() {
+                    Some(dim) => {
+                        if let Some(slot) = x.get_mut(dim) {
+                            let projected = project_relaxed(constraint.bound(), *slot, budget);
+                            max_move = max_move.max((projected - *slot).abs());
+                            *slot = projected;
+                        }
+                    }
+                    None => {
+                        for slot in x.iter_mut() {
+                            let projected = project_relaxed(constraint.bound(), *slot, budget);
+                            max_move = max_move.max((projected - *slot).abs());
+                            *slot = projected;
+                        }
+                    }
+                }
             }
 
-            if !improved {
+            if max_move <= self.tolerance {
                 break;
             }
-
-            // Gradient descent
-            x = &x - &(&gradient * step_size);
         }
 
-        Ok(x)
+        x
+    }
+}
+
+/// Reject inputs that cannot be evaluated consistently.
+fn validate_point(point: &[f32], constraints: &[Constraint]) -> LogicResult<()> {
+    if constraints.is_empty() {
+        return Ok(());
+    }
+    if point.is_empty() {
+        return Err(LogicError::InvalidInput(
+            "repair requires a non-empty point when constraints are supplied".to_string(),
+        ));
+    }
+    for constraint in constraints {
+        if let Some(dim) = constraint.dimension() {
+            if dim >= point.len() {
+                return Err(LogicError::DimensionMismatch {
+                    expected: dim + 1,
+                    got: point.len(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Project a scalar onto a bound that has been relaxed by `slack`.
+///
+/// Relaxing by `s` widens the feasible interval by `s` on every finite side,
+/// so the projection of an infeasible value lands exactly on the widened edge.
+fn project_relaxed(bound: &BoundType, value: f32, slack: f32) -> f32 {
+    let slack = slack.max(0.0);
+    match bound {
+        BoundType::LessThan(b) => value.min(b + slack - f32::EPSILON),
+        BoundType::LessEq(b) => value.min(b + slack),
+        BoundType::GreaterThan(b) => value.max(b - slack + f32::EPSILON),
+        BoundType::GreaterEq(b) => value.max(b - slack),
+        BoundType::Equal(target, tol) => {
+            let widened = tol + slack;
+            value.clamp(target - widened, target + widened)
+        }
+        BoundType::InRange(lo, hi) => {
+            let (low, high) = (lo - slack, hi + slack);
+            if low <= high {
+                value.clamp(low, high)
+            } else {
+                // Degenerate (empty) range: fall back to the midpoint.
+                0.5 * (low + high)
+            }
+        }
     }
 }
 
@@ -375,26 +517,23 @@ impl IISFinder {
 
     /// Find all minimal infeasible subsets
     ///
-    /// Uses deletion filter algorithm
+    /// Uses deletion filter algorithm. Constraints are evaluated on the
+    /// dimension they govern; see [`ConstraintRepairer::repair`] for the
+    /// validation rules and errors.
     pub fn find_all_iis(
         &self,
         point: &[f32],
         constraints: &[Constraint],
     ) -> LogicResult<Vec<Vec<usize>>> {
+        validate_point(point, constraints)?;
+
         let mut iis_sets = Vec::new();
 
         // Start with all violated constraints
         let violated: Vec<usize> = constraints
             .iter()
             .enumerate()
-            .filter(|(_, c)| {
-                let viol = if point.is_empty() {
-                    0.0
-                } else {
-                    c.violation(point[0])
-                };
-                viol > self.tolerance
-            })
+            .filter(|(_, c)| ViolationComputable::violation(*c, point) > self.tolerance)
             .map(|(i, _)| i)
             .collect();
 
@@ -447,12 +586,10 @@ impl IISFinder {
         subset: &[usize],
     ) -> bool {
         subset.iter().any(|&i| {
-            let viol = if point.is_empty() {
-                0.0
-            } else {
-                all_constraints[i].violation(point[0])
-            };
-            viol > self.tolerance
+            all_constraints
+                .get(i)
+                .map(|c| ViolationComputable::violation(c, point) > self.tolerance)
+                .unwrap_or(false)
         })
     }
 }
@@ -939,6 +1076,177 @@ mod tests {
         assert!(
             !conflicts.is_empty(),
             "strict boundary contradiction should be detected"
+        );
+    }
+
+    /// Regression (finding 127): every strategy must evaluate a constraint on
+    /// the dimension it governs, not on `point[0]`.
+    ///
+    /// Constraints `x0 <= 1` and `x3 <= 1` with the point `[0.5, 0, 0, 99]`:
+    /// only dimension 3 is violated. The old code computed both violations at
+    /// `point[0] = 0.5`, reported "no violation" and still claimed success.
+    #[test]
+    fn test_repair_uses_tagged_dimension_not_first_element() {
+        let c0 = ConstraintBuilder::new()
+            .name("x0")
+            .dimension(0)
+            .less_eq(1.0)
+            .build()
+            .expect("c0 builds");
+        let c3 = ConstraintBuilder::new()
+            .name("x3")
+            .dimension(3)
+            .less_eq(1.0)
+            .build()
+            .expect("c3 builds");
+
+        let point = vec![0.5_f32, 0.0, 0.0, 99.0];
+
+        for strategy in [
+            RepairStrategy::Uniform,
+            RepairStrategy::PriorityBased,
+            RepairStrategy::MinimalRelaxation,
+        ] {
+            let repairer = ConstraintRepairer::new(strategy);
+            let result = repairer
+                .repair(&point, &[c0.clone(), c3.clone()], None)
+                .unwrap_or_else(|e| panic!("{strategy:?} failed: {e}"));
+
+            assert_eq!(
+                result.relaxed_constraints,
+                vec![1],
+                "{strategy:?} must report the dim-3 constraint as violated"
+            );
+            let amount = result.relaxation_amounts[0];
+            assert!(
+                (amount - 98.0).abs() < 1e-3,
+                "{strategy:?} relaxation must equal the dim-3 violation (98), got {amount}"
+            );
+        }
+
+        // Elastic must move dimension 3 and leave the others alone.
+        let elastic = ConstraintRepairer::new(RepairStrategy::ElasticProgramming);
+        let result = elastic
+            .repair(&point, &[c0, c3], None)
+            .expect("elastic repair");
+        let repaired = result.repaired_point.expect("elastic point");
+        assert!(
+            (repaired[3] - 1.0).abs() < 1e-3,
+            "dim-3 must be projected onto its bound, got {}",
+            repaired[3]
+        );
+        assert!((repaired[0] - 0.5).abs() < 1e-5, "dim-0 must be untouched");
+    }
+
+    /// Regression (finding 127): `max_relaxation` must cap the reported
+    /// relaxation *and* be reflected in `success` for every strategy, not only
+    /// for elastic programming.
+    #[test]
+    fn test_repair_respects_max_relaxation_cap() {
+        let constraint = ConstraintBuilder::new()
+            .name("tight")
+            .less_eq(1.0)
+            .build()
+            .expect("constraint builds");
+
+        // Violation of 99 against a cap of 2.0.
+        let point = vec![100.0_f32];
+
+        for strategy in [
+            RepairStrategy::Uniform,
+            RepairStrategy::PriorityBased,
+            RepairStrategy::MinimalRelaxation,
+        ] {
+            let repairer = ConstraintRepairer::new(strategy).with_max_relaxation(2.0);
+            let result = repairer
+                .repair(&point, std::slice::from_ref(&constraint), None)
+                .unwrap_or_else(|e| panic!("{strategy:?} failed: {e}"));
+
+            assert!(
+                result.relaxation_amounts.iter().all(|&a| a <= 2.0 + 1e-6),
+                "{strategy:?} must not report a relaxation above max_relaxation: {:?}",
+                result.relaxation_amounts
+            );
+            // The point cannot stay where it is, so the repairer must move it
+            // into the 2.0-relaxed region (x <= 3.0) to claim success.
+            assert!(
+                result.success,
+                "{strategy:?} should repair by moving the point"
+            );
+            let repaired = result
+                .repaired_point
+                .unwrap_or_else(|| panic!("{strategy:?} must return a point on success"));
+            assert!(
+                repaired[0] <= 3.0 + 1e-3,
+                "{strategy:?} point must fit inside the capped relaxation, got {}",
+                repaired[0]
+            );
+        }
+    }
+
+    /// Regression (finding 127): a feasible point needs no repair, and
+    /// `MinimalRelaxation` must report that as success (it used to return
+    /// `success = !relaxed.is_empty()`, i.e. `false`).
+    #[test]
+    fn test_minimal_repair_success_on_feasible_point() {
+        let repairer = ConstraintRepairer::new(RepairStrategy::MinimalRelaxation);
+        let c = ConstraintBuilder::new()
+            .name("c")
+            .less_eq(5.0)
+            .build()
+            .expect("constraint builds");
+
+        let result = repairer.repair(&[1.0], &[c], None).expect("repair");
+        assert!(result.success, "a feasible point is trivially repaired");
+        assert!(result.relaxed_constraints.is_empty());
+        assert_eq!(result.repair_cost, 0.0);
+    }
+
+    /// Regression (finding 127): a constraint naming a dimension the point does
+    /// not have must be rejected rather than silently treated as satisfied.
+    #[test]
+    fn test_repair_rejects_out_of_range_dimension() {
+        let repairer = ConstraintRepairer::new(RepairStrategy::Uniform);
+        let c = ConstraintBuilder::new()
+            .name("x7")
+            .dimension(7)
+            .less_eq(1.0)
+            .build()
+            .expect("constraint builds");
+
+        let result = repairer.repair(&[0.0, 1.0], &[c], None);
+        assert!(
+            matches!(result, Err(LogicError::DimensionMismatch { .. })),
+            "out-of-range dimension must be a DimensionMismatch error"
+        );
+    }
+
+    /// Uniform relaxation must be uniform: both violated constraints get the
+    /// same relaxation (the largest violation).
+    #[test]
+    fn test_uniform_relaxation_is_equal_across_constraints() {
+        let repairer = ConstraintRepairer::new(RepairStrategy::Uniform);
+        let c1 = ConstraintBuilder::new()
+            .name("c1")
+            .less_eq(5.0)
+            .build()
+            .expect("c1");
+        let c2 = ConstraintBuilder::new()
+            .name("c2")
+            .less_eq(10.0)
+            .build()
+            .expect("c2");
+
+        // Violations are 7 and 2 → uniform relaxation of 7 for both.
+        let result = repairer.repair(&[12.0], &[c1, c2], None).expect("repair");
+        assert_eq!(result.num_relaxed(), 2);
+        assert!(
+            result
+                .relaxation_amounts
+                .iter()
+                .all(|&a| (a - 7.0).abs() < 1e-4),
+            "all amounts must equal the largest violation: {:?}",
+            result.relaxation_amounts
         );
     }
 

@@ -1,6 +1,31 @@
 //! Signal stream abstractions
+//!
+//! # Read contract
+//!
+//! Every [`SignalStream`] / [`AsyncSignalStream`] implementation in this crate
+//! obeys exactly these three outcomes, so a consumer can always distinguish
+//! "the sensor is silent", "the buffer is starved" and "the stream ended":
+//!
+//! 1. `Ok(buffer)` -- `buffer` contains **only samples that were actually
+//!    received**. It is never zero-padded, and
+//!    `1 <= buffer.len() <= config().buffer_size`. A live source only ever
+//!    returns a full `buffer_size` block; a finite source (a file, an
+//!    in-memory buffer, or a live source that has been closed) returns its
+//!    remaining samples as one final short block.
+//! 2. `Err(IoError::BufferEmpty)` -- a full block is not available yet and
+//!    more samples may still arrive. **Nothing was consumed**: the partial
+//!    data stays buffered, so retrying later is lossless.
+//! 3. `Err(IoError::EndOfStream)` -- the stream is permanently exhausted (or
+//!    was closed and fully drained). `is_active()` is `false` from then on.
+//!
+//! Any other `Err` is a genuine transport/protocol failure.
+//!
+//! Several implementations previously returned
+//! `Ok(Array1::zeros(buffer_size))` for cases 2 and 3, which presented
+//! fabricated silence as sensor data and silently corrupted every downstream
+//! RMS / SNR / spectrum computation. No implementation does that any more.
 
-use crate::error::IoResult;
+use crate::error::{IoError, IoResult};
 use scirs2_core::ndarray::Array1;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -65,7 +90,11 @@ impl StreamConfig {
 /// Note: Not all stream implementations are Send (e.g., AudioInput with cpal::Stream).
 /// Use `SendableSignalStream` when Send is required.
 pub trait SignalStream {
-    /// Read the next signal buffer
+    /// Read the next signal buffer.
+    ///
+    /// Returns only real samples (never zero-padded), `Err(IoError::BufferEmpty)`
+    /// when nothing is available yet, and `Err(IoError::EndOfStream)` once the
+    /// stream is permanently exhausted. See the module-level read contract.
     fn read(&mut self) -> IoResult<Array1<f32>>;
 
     /// Check if stream is still active
@@ -84,7 +113,11 @@ pub trait SignalStream {
 /// and better integration with async runtimes like Tokio.
 #[async_trait::async_trait]
 pub trait AsyncSignalStream: Send {
-    /// Read the next signal buffer asynchronously
+    /// Read the next signal buffer asynchronously.
+    ///
+    /// Returns only real samples (never zero-padded), `Err(IoError::BufferEmpty)`
+    /// when nothing is available yet, and `Err(IoError::EndOfStream)` once the
+    /// stream is permanently exhausted. See the module-level read contract.
     async fn read(&mut self) -> IoResult<Array1<f32>>;
 
     /// Check if stream is still active
@@ -127,15 +160,14 @@ impl SignalStream for MemoryStream {
     fn read(&mut self) -> IoResult<Array1<f32>> {
         if !self.active || self.position >= self.data.len() {
             self.active = false;
-            return Ok(Array1::zeros(self.config.buffer_size));
+            return Err(IoError::EndOfStream);
         }
 
         let end = (self.position + self.config.buffer_size).min(self.data.len());
-        let mut buffer = vec![0.0; self.config.buffer_size];
-
-        for (i, val) in self.data[self.position..end].iter().enumerate() {
-            buffer[i] = *val;
-        }
+        // The tail of the source is returned as a SHORT buffer rather than
+        // being zero-padded up to `buffer_size`: padding would present
+        // fabricated silence as data, and dropping it would lose samples.
+        let buffer = self.data[self.position..end].to_vec();
 
         self.position = end;
         Ok(Array1::from_vec(buffer))
@@ -509,15 +541,12 @@ impl AsyncSignalStream for AsyncMemoryStream {
 
         if !self.active || self.position >= self.data.len() {
             self.active = false;
-            return Ok(Array1::zeros(self.config.buffer_size));
+            return Err(IoError::EndOfStream);
         }
 
         let end = (self.position + self.config.buffer_size).min(self.data.len());
-        let mut buffer = vec![0.0; self.config.buffer_size];
-
-        for (i, val) in self.data[self.position..end].iter().enumerate() {
-            buffer[i] = *val;
-        }
+        // Short (never zero-padded) tail read -- see the module read contract.
+        let buffer = self.data[self.position..end].to_vec();
 
         self.position = end;
         Ok(Array1::from_vec(buffer))
@@ -539,10 +568,16 @@ impl AsyncSignalStream for AsyncMemoryStream {
 
 /// Async channel-based stream adapter
 ///
-/// Wraps a tokio channel receiver to provide async stream interface
+/// Wraps a tokio channel receiver to provide async stream interface.
+///
+/// Producer chunks are re-blocked to `config.buffer_size`: samples that do not
+/// fit in the current block are carried over to the next `read()` instead of
+/// being discarded (a previous version truncated every chunk to `buffer_size`
+/// and zero-padded short ones).
 pub struct ChannelStream {
     config: StreamConfig,
     receiver: tokio::sync::mpsc::Receiver<Vec<f32>>,
+    pending: std::collections::VecDeque<f32>,
     active: bool,
 }
 
@@ -552,30 +587,48 @@ impl ChannelStream {
         Self {
             config,
             receiver,
+            pending: std::collections::VecDeque::new(),
             active: true,
         }
+    }
+
+    /// Number of samples carried over from previous chunks
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 }
 
 #[async_trait::async_trait]
 impl AsyncSignalStream for ChannelStream {
     async fn read(&mut self) -> IoResult<Array1<f32>> {
-        if !self.active {
-            return Ok(Array1::zeros(self.config.buffer_size));
+        let block = self.config.buffer_size.max(1);
+
+        if self.active {
+            // Accumulate producer chunks until a full block is available.
+            while self.pending.len() < block {
+                match self.receiver.recv().await {
+                    Some(data) => self.pending.extend(data),
+                    None => {
+                        self.active = false;
+                        break;
+                    }
+                }
+            }
         }
 
-        match self.receiver.recv().await {
-            Some(data) => {
-                let mut buffer = vec![0.0; self.config.buffer_size];
-                let copy_len = data.len().min(self.config.buffer_size);
-                buffer[..copy_len].copy_from_slice(&data[..copy_len]);
-                Ok(Array1::from_vec(buffer))
-            }
-            None => {
-                self.active = false;
-                Ok(Array1::zeros(self.config.buffer_size))
-            }
+        if self.pending.is_empty() {
+            return Err(if self.active {
+                IoError::BufferEmpty
+            } else {
+                IoError::EndOfStream
+            });
         }
+
+        // Either a full block, or (once the channel closed) the final short
+        // block of genuinely received samples -- never zero-padded.
+        let take = block.min(self.pending.len());
+        let data: Vec<f32> = self.pending.drain(..take).collect();
+        Ok(Array1::from_vec(data))
     }
 
     fn is_active(&self) -> bool {
@@ -613,6 +666,97 @@ mod tests {
         assert_eq!(buf2[0], 5.0);
 
         assert!(!stream.is_active());
+    }
+
+    // === Read contract: no fabricated zero-fill (id=40) ===
+
+    #[test]
+    fn test_memory_stream_reports_end_of_stream_instead_of_zeros() {
+        // Regression: a previous version returned
+        // Ok(Array1::zeros(buffer_size)) forever once exhausted, which is
+        // indistinguishable from a genuinely silent source.
+        let config = StreamConfig::new().buffer_size(4);
+        let mut stream = MemoryStream::new(vec![1.0, 2.0, 3.0, 4.0], config);
+
+        let first = stream.read().expect("first read should succeed");
+        assert_eq!(first.len(), 4);
+
+        for _ in 0..3 {
+            assert!(
+                matches!(stream.read(), Err(IoError::EndOfStream)),
+                "an exhausted MemoryStream must report EndOfStream, never zeros"
+            );
+        }
+        assert!(!stream.is_active());
+    }
+
+    #[test]
+    fn test_memory_stream_returns_short_tail_without_padding() {
+        // 6 samples with buffer_size 4 -> one full read and one 2-sample
+        // read. The tail must NOT be padded out to 4 with fake zeros, and no
+        // sample may be dropped.
+        let config = StreamConfig::new().buffer_size(4);
+        let mut stream = MemoryStream::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], config);
+
+        let first = stream.read().expect("first read should succeed");
+        assert_eq!(first.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
+
+        let tail = stream.read().expect("tail read should succeed");
+        assert_eq!(
+            tail.to_vec(),
+            vec![5.0, 6.0],
+            "the tail must be returned short, not zero-padded"
+        );
+
+        assert!(matches!(stream.read(), Err(IoError::EndOfStream)));
+    }
+
+    #[test]
+    fn test_memory_stream_empty_source_is_end_of_stream() {
+        let config = StreamConfig::new().buffer_size(8);
+        let mut stream = MemoryStream::new(Vec::new(), config);
+        assert!(matches!(stream.read(), Err(IoError::EndOfStream)));
+    }
+
+    #[tokio::test]
+    async fn test_async_memory_stream_reports_end_of_stream() {
+        let config = StreamConfig::new().buffer_size(4);
+        let mut stream = AsyncMemoryStream::new(vec![1.0, 2.0, 3.0, 4.0, 5.0], config);
+
+        let first = stream.read().await.expect("first read should succeed");
+        assert_eq!(first.len(), 4);
+        let tail = stream.read().await.expect("tail read should succeed");
+        assert_eq!(tail.to_vec(), vec![5.0]);
+        assert!(matches!(stream.read().await, Err(IoError::EndOfStream)));
+    }
+
+    #[tokio::test]
+    async fn test_channel_stream_reblocks_and_reports_end_of_stream() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let config = StreamConfig::new().buffer_size(4);
+        let mut stream = ChannelStream::new(config, rx);
+
+        // Producer chunks that do not line up with buffer_size: a previous
+        // version truncated the 6-sample chunk to 4 and dropped the rest.
+        tx.send(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .await
+            .expect("send should succeed");
+        tx.send(vec![7.0]).await.expect("send should succeed");
+        drop(tx);
+
+        let first = stream.read().await.expect("first block");
+        assert_eq!(first.to_vec(), vec![1.0, 2.0, 3.0, 4.0]);
+
+        let second = stream.read().await.expect("carried-over block");
+        assert_eq!(
+            second.to_vec(),
+            vec![5.0, 6.0, 7.0],
+            "carried-over samples must survive and must not be zero-padded"
+        );
+
+        assert!(matches!(stream.read().await, Err(IoError::EndOfStream)));
+        assert!(!stream.is_active());
+        assert!(matches!(stream.read().await, Err(IoError::EndOfStream)));
     }
 
     #[test]

@@ -16,15 +16,30 @@ homepage = "https://github.com/cool-japan/kizzasi"
 [features]
 default = ["std", "full"]
 std = []
-full = ["io", "logic", "mqtt", "audio", "async", "config-files", "macros"]
-# GPU features (optional - propagate to kizzasi-core)
-cuda = ["kizzasi-core/cuda"]
+# `full` is "everything that is pure Rust". `audio` is deliberately NOT in it:
+# live audio devices go through cpal, which links the platform audio C API
+# (libasound on Linux), and the default build must stay C-free. Enable
+# `--features audio` (or `kizzasi-io/audio`) to opt in; WAV *files* need no
+# device and are available through `kizzasi-io`'s pure-Rust `file` feature.
+full = ["io", "logic", "mqtt", "async", "config-files", "macros"]
+# GPU acceleration (optional, off by default). Forwards candle's Metal
+# backend through `kizzasi-core/metal`, which is live on Apple targets and
+# inert -- but still buildable -- everywhere else, so `--all-features` works on
+# every host; the `kizzasi-metal` crate explains how that target gating is
+# done. There is no `cuda` counterpart -- see kizzasi-core's `[features]` for
+# why a CUDA flag cannot be offered without breaking every non-CUDA build.
 metal = ["kizzasi-core/metal"]
 # Component features
 io = ["dep:kizzasi-io"]
 logic = ["dep:kizzasi-logic"]
 mqtt = ["io", "kizzasi-io/mqtt"]
+# NOT pure Rust and therefore not part of `full` -- see the note above.
 audio = ["io", "kizzasi-io/audio"]
+# GPU SSM scan through `kizzasi-webgpu` (wgpu: Metal / Vulkan / DX12).
+# Off by default; `ssm_backend::select_ssm_backend()` returns the GPU-backed
+# `SsmBackend` when this is on and an adapter is reachable, and the CPU
+# backend otherwise.
+webgpu = ["dep:kizzasi-webgpu", "kizzasi-webgpu/webgpu"]
 async = ["dep:tokio", "dep:futures", "dep:async-trait", "dep:num_cpus"]
 config-files = ["dep:toml", "dep:serde_yaml"]
 macros = ["dep:kizzasi-macros"]
@@ -32,9 +47,19 @@ macros = ["dep:kizzasi-macros"]
 [dependencies]
 # Internal crates
 kizzasi-core.workspace = true
+# Model architectures behind `ModelType` dispatch (Mamba / S4D / RWKV).
+# Non-optional on purpose: making it a feature would reintroduce a build in
+# which `ModelType` selection is silently inert. The three architecture
+# features are requested explicitly because `backend.rs` names those modules
+# directly -- they are on by kizzasi-model's defaults too, but relying on that
+# would break the moment a downstream sets `default-features = false`.
+kizzasi-model = { workspace = true, features = ["mamba", "rwkv", "s4"] }
 kizzasi-logic = { workspace = true, optional = true }
 kizzasi-io = { workspace = true, optional = true }
 kizzasi-macros = { workspace = true, optional = true }
+# GPU scan backend (see the `webgpu` feature). Optional: wgpu pulls a large
+# graphics stack that a CPU-only deployment should not pay for.
+kizzasi-webgpu = { workspace = true, optional = true }
 
 # COOLJAPAN Ecosystem (following KIZZASI_POLICY.md)
 scirs2-core.workspace = true
@@ -58,7 +83,6 @@ toml = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 
 [dev-dependencies]
-kizzasi-model = { path = "../kizzasi-model" }
 kizzasi-tokenizer = { path = "../kizzasi-tokenizer" }
 kizzasi-inference = { path = "../kizzasi-inference", features = ["streaming"] }
 proptest.workspace = true

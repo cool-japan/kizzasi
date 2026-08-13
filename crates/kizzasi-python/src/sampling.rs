@@ -32,7 +32,7 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use scirs2_numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use scirs2_numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2};
 
 use kizzasi_inference::{Sampler, SamplingConfig, SamplingStrategy};
 use scirs2_core::ndarray::{Array1, Array2};
@@ -146,25 +146,35 @@ impl PySamplingConfig {
     }
 
     /// Configured softmax temperature.
-    #[getter]
+    ///
+    /// Named `get_temperature` (not the bare `temperature`, which is
+    /// already the builder-style setter method above) — without an
+    /// explicit `#[getter(name)]` override, PyO3 auto-strips the `get_`
+    /// prefix from a `#[getter]` method's Rust name, which would silently
+    /// collide with and be shadowed by that setter (Python classes cannot
+    /// have a plain method and a property share one name; whichever
+    /// `#[pymethods]` registers last wins, leaving the other completely
+    /// unreachable). Every getter below has the same explicit-name fix for
+    /// the same reason.
+    #[getter(get_temperature)]
     pub fn get_temperature(&self) -> f32 {
         self.inner.temperature
     }
 
     /// Configured top-k value (or `None` if unset).
-    #[getter]
+    #[getter(get_top_k)]
     pub fn get_top_k(&self) -> Option<usize> {
         self.inner.top_k
     }
 
     /// Configured top-p value (or `None` if unset).
-    #[getter]
+    #[getter(get_top_p)]
     pub fn get_top_p(&self) -> Option<f32> {
         self.inner.top_p
     }
 
     /// Configured random seed (or `None` if unset).
-    #[getter]
+    #[getter(get_seed)]
     pub fn get_seed(&self) -> Option<u64> {
         self.inner.seed
     }
@@ -198,7 +208,7 @@ impl Default for PySamplingConfig {
 /// across calls, so repeated `sample` invocations with the same logits and
 /// the same seed will produce a deterministic *sequence* (but each call
 /// returns a different value).
-#[pyclass(name = "Sampler", unsendable)]
+#[pyclass(name = "Sampler")]
 pub struct PySampler {
     inner: Sampler,
 }
@@ -208,11 +218,32 @@ impl PySampler {
     /// Construct a sampler from a [`PySamplingConfig`]. The config is cloned
     /// into the sampler, so later mutations to the Python `SamplingConfig`
     /// object will *not* be reflected here.
+    ///
+    /// Rejects a config whose `strategy` is `"top_k"`/`"top_p"` but whose
+    /// matching value was never set: previously `config.strategy("top_k")`
+    /// without a following `config.top_k(k)` silently sampled with the
+    /// engine's internal default (`k=10`, or `p=0.9` for `"top_p"|`), with
+    /// no indication anywhere that the value was never configured.
     #[new]
-    pub fn new(config: &PySamplingConfig) -> Self {
-        Self {
-            inner: Sampler::new(config.inner.clone()),
+    pub fn new(config: &PySamplingConfig) -> PyResult<Self> {
+        match config.inner.strategy {
+            SamplingStrategy::TopK if config.inner.top_k.is_none() => {
+                return Err(PyValueError::new_err(
+                    "SamplingConfig strategy is 'top_k' but top_k(k) was never called; \
+                     call config.top_k(k) before constructing a Sampler",
+                ));
+            }
+            SamplingStrategy::TopP if config.inner.top_p.is_none() => {
+                return Err(PyValueError::new_err(
+                    "SamplingConfig strategy is 'top_p' but top_p(p) was never called; \
+                     call config.top_p(p) before constructing a Sampler",
+                ));
+            }
+            _ => {}
         }
+        Ok(Self {
+            inner: Sampler::new(config.inner.clone()),
+        })
     }
 
     /// Sample a single value from a 1-D logits vector.
@@ -220,22 +251,27 @@ impl PySampler {
     /// Returns a single `f32` — the sampled value. For greedy / top-k /
     /// top-p sampling this is the index of the chosen logit cast to `f32`;
     /// the actual numeric meaning depends on the inference pipeline.
-    pub fn sample(&mut self, logits: PyReadonlyArray1<'_, f32>) -> PyResult<f32> {
+    ///
+    /// Runs with the GIL released (`Python::detach`).
+    pub fn sample(&mut self, py: Python<'_>, logits: PyReadonlyArray1<'_, f32>) -> PyResult<f32> {
         let arr: Array1<f32> = logits.as_array().to_owned();
-        self.inner.sample(&arr).map_err(to_py_err)
+        let inner = &mut self.inner;
+        py.detach(|| inner.sample(&arr)).map_err(to_py_err)
     }
 
     /// Sample a batch of values from a `[batch, vocab]` logits matrix.
     ///
-    /// Returns a 1-D float32 NumPy array of length `batch`.
+    /// Returns a 1-D float32 NumPy array of length `batch`. Runs with the
+    /// GIL released (`Python::detach`).
     pub fn sample_batch<'py>(
         &mut self,
         py: Python<'py>,
         logits: PyReadonlyArray2<'_, f32>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let arr: Array2<f32> = logits.as_array().to_owned();
-        let out = self.inner.sample_batch(&arr).map_err(to_py_err)?;
-        Ok(out.to_pyarray(py))
+        let inner = &mut self.inner;
+        let out = py.detach(|| inner.sample_batch(&arr)).map_err(to_py_err)?;
+        Ok(out.into_pyarray(py))
     }
 
     /// Canonical name of the active strategy.
@@ -338,7 +374,7 @@ mod tests {
     fn test_sampler_greedy() {
         let mut cfg = PySamplingConfig::new();
         cfg.strategy("greedy").expect("strategy");
-        let mut sampler = PySampler::new(&cfg);
+        let mut sampler = PySampler::new(&cfg).expect("sampler");
 
         // Sample directly via the inner Sampler (avoids needing the GIL).
         let logits = Array1::from_vec(vec![1.0_f32, 3.0, 2.0]);
@@ -354,7 +390,7 @@ mod tests {
         cfg.strategy("temperature").expect("strategy");
         cfg.temperature(1.0).expect("temperature");
         cfg.seed(42);
-        let mut sampler = PySampler::new(&cfg);
+        let mut sampler = PySampler::new(&cfg).expect("sampler");
 
         let logits = Array1::from_vec(vec![0.1_f32, 0.5, 0.3, 0.8, 0.2]);
         let v = sampler.inner.sample(&logits).expect("temp sample");
@@ -368,7 +404,7 @@ mod tests {
         let mut cfg = PySamplingConfig::new();
         cfg.top_k(2).expect("top_k");
         cfg.seed(7);
-        let mut sampler = PySampler::new(&cfg);
+        let mut sampler = PySampler::new(&cfg).expect("sampler");
 
         let logits = Array1::from_vec(vec![0.1_f32, 0.5, 0.3, 0.8, 0.2]);
         let v = sampler.inner.sample(&logits).expect("top_k sample");
@@ -388,7 +424,7 @@ mod tests {
         let mut cfg = PySamplingConfig::new();
         cfg.top_p(0.9).expect("top_p");
         cfg.seed(13);
-        let mut sampler = PySampler::new(&cfg);
+        let mut sampler = PySampler::new(&cfg).expect("sampler");
 
         let logits = Array1::from_vec(vec![0.1_f32, 0.5, 0.3, 0.8, 0.2]);
         let v = sampler.inner.sample(&logits).expect("top_p sample");
@@ -396,11 +432,62 @@ mod tests {
         assert!((0.0..5.0).contains(&v));
     }
 
+    // Regression: without an explicit `#[getter(get_temperature)]` name,
+    // PyO3 auto-strips the `get_` prefix, so `get_temperature` would be
+    // exposed to Python as the property `temperature` — colliding with,
+    // and being silently shadowed by, the builder-style method also named
+    // `temperature` (a Python class cannot have a plain method and a
+    // property share one attribute name). This must be visible as a real,
+    // independently-named Python attribute, not just callable from Rust.
+    #[test]
+    fn test_sampling_config_getters_do_not_collide_with_setters_in_python() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut cfg = PySamplingConfig::new();
+            cfg.temperature(0.7).expect("temperature");
+            cfg.top_k(5).expect("top_k");
+            cfg.seed(42);
+
+            let py_cfg = Py::new(py, cfg).expect("py object").into_bound(py);
+            // `temperature` must remain the *callable* setter, not a float.
+            let temperature_attr = py_cfg.getattr("temperature").expect("temperature attr");
+            assert!(
+                temperature_attr.is_callable(),
+                "`temperature` must stay the builder-style setter method"
+            );
+            // `get_temperature` must be present and be a plain float value,
+            // not a method.
+            let get_temperature_attr = py_cfg
+                .getattr("get_temperature")
+                .expect("get_temperature attr must exist");
+            assert!(
+                !get_temperature_attr.is_callable(),
+                "`get_temperature` must be a property value, not a method"
+            );
+            let value: f32 = get_temperature_attr.extract().expect("extract f32");
+            assert!((value - 0.7).abs() < 1e-5);
+
+            let get_top_k: Option<usize> = py_cfg
+                .getattr("get_top_k")
+                .expect("get_top_k attr")
+                .extract()
+                .expect("extract");
+            assert_eq!(get_top_k, Some(5));
+
+            let get_seed: Option<u64> = py_cfg
+                .getattr("get_seed")
+                .expect("get_seed attr")
+                .extract()
+                .expect("extract");
+            assert_eq!(get_seed, Some(42));
+        });
+    }
+
     #[test]
     fn test_sampler_batch_greedy() {
         let mut cfg = PySamplingConfig::new();
         cfg.strategy("greedy").expect("strategy");
-        let mut sampler = PySampler::new(&cfg);
+        let mut sampler = PySampler::new(&cfg).expect("sampler");
 
         let logits = Array2::from_shape_vec(
             (3, 4),
@@ -436,7 +523,7 @@ mod tests {
     fn test_sampler_repr() {
         let mut cfg = PySamplingConfig::new();
         cfg.strategy("greedy").expect("strategy");
-        let sampler = PySampler::new(&cfg);
+        let sampler = PySampler::new(&cfg).expect("sampler");
         let r = sampler.__repr__();
         assert!(r.contains("Sampler("));
         assert!(r.contains("greedy"));
@@ -450,5 +537,88 @@ mod tests {
         let r = cfg.__repr__();
         assert!(r.contains("SamplingConfig("));
         assert!(r.contains("top_p"));
+    }
+
+    // Regression for the medium bug where `strategy("top_k")` without a
+    // following `top_k(k)` call silently sampled with the engine's internal
+    // default (k=10) — same for `strategy("top_p")` without `top_p(p)`
+    // (default p=0.9) — with no error and no documented default anywhere.
+    #[test]
+    fn test_sampler_new_rejects_top_k_without_value() {
+        let mut cfg = PySamplingConfig::new();
+        cfg.strategy("top_k").expect("strategy");
+        // top_k(k) deliberately not called.
+        assert!(PySampler::new(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_sampler_new_rejects_top_p_without_value() {
+        let mut cfg = PySamplingConfig::new();
+        cfg.strategy("top_p").expect("strategy");
+        // top_p(p) deliberately not called.
+        assert!(PySampler::new(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_sampler_new_accepts_top_k_with_value() {
+        let mut cfg = PySamplingConfig::new();
+        cfg.top_k(3).expect("top_k"); // also flips strategy to TopK
+        assert!(PySampler::new(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_sampler_sample_crosses_pyo3_boundary() {
+        use scirs2_numpy::{PyArray1, PyArrayMethods};
+        Python::initialize();
+        Python::attach(|py| {
+            let mut cfg = PySamplingConfig::new();
+            cfg.strategy("greedy").expect("strategy");
+            let mut sampler = PySampler::new(&cfg).expect("sampler");
+            let py_arr = PyArray1::from_vec(py, vec![1.0_f32, 3.0, 2.0]);
+            let v = sampler
+                .sample(py, py_arr.readonly())
+                .expect("sample via pymethod");
+            assert!((v - 1.0).abs() < 1e-6, "expected index 1, got {}", v);
+        });
+    }
+
+    #[test]
+    fn test_sampler_sample_batch_crosses_pyo3_boundary() {
+        use scirs2_numpy::{PyArray2, PyArrayMethods};
+        Python::initialize();
+        Python::attach(|py| {
+            let mut cfg = PySamplingConfig::new();
+            cfg.strategy("greedy").expect("strategy");
+            let mut sampler = PySampler::new(&cfg).expect("sampler");
+            let py_arr = PyArray2::from_vec2(
+                py,
+                &[
+                    vec![0.1_f32, 0.5, 0.3, 0.2],
+                    vec![0.8, 0.2, 0.1, 0.3],
+                    vec![0.2, 0.3, 0.9, 0.1],
+                ],
+            )
+            .expect("logits shape");
+            let out = sampler
+                .sample_batch(py, py_arr.readonly())
+                .expect("sample_batch via pymethod");
+            let out_ro = out.readonly();
+            let view = out_ro.as_array();
+            assert_eq!(view.len(), 3);
+            assert!((view[0] - 1.0).abs() < 1e-6);
+            assert!((view[1] - 0.0).abs() < 1e-6);
+            assert!((view[2] - 2.0).abs() < 1e-6);
+        });
+    }
+
+    /// `Sampler` must stay `Send` for `Python::detach` (used by `sample`/
+    /// `sample_batch`) to compile, and for `unsendable` to be safely
+    /// removable from `#[pyclass(name = "Sampler")]` — unlike `Kizzasi`,
+    /// `Sampler` holds no `PluginManager`, so it is expected to be both
+    /// `Send` and `Sync`.
+    #[test]
+    fn test_sampler_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Sampler>();
     }
 }

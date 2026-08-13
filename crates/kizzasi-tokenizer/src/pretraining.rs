@@ -313,6 +313,13 @@ impl MaskedSignalModeling {
             embedding[j] = sum.max(0.0); // ReLU
         }
 
+        // Snapshot the decoder *before* updating it. Backpropagation needs
+        // the hidden error computed from the pre-update weights W, not from
+        // W - lr*grad(W) — reading `self.decoder` after the update below
+        // would follow a perturbed direction whose deviation from the true
+        // gradient grows with `learning_rate` (user-controlled, unbounded).
+        let decoder_before_update = self.decoder.clone();
+
         // Update decoder weights
         for j in 0..self.config.embed_dim {
             for i in 0..self.config.signal_dim {
@@ -321,12 +328,12 @@ impl MaskedSignalModeling {
             }
         }
 
-        // Compute hidden error
+        // Compute hidden error using the pre-update decoder weights.
         let mut hidden_error = Array1::zeros(self.config.embed_dim);
         for j in 0..self.config.embed_dim {
             let mut sum = 0.0;
             for i in 0..self.config.signal_dim {
-                sum += output_error[i] * self.decoder[[j, i]];
+                sum += output_error[i] * decoder_before_update[[j, i]];
             }
             // ReLU derivative (0 if embedding[j] <= 0, else 1)
             hidden_error[j] = if embedding[j] > 0.0 { sum } else { 0.0 };
@@ -440,8 +447,25 @@ impl ContrastiveLearning {
         embedding
     }
 
-    /// Compute cosine similarity
+    /// Cosine similarity between two embeddings.
+    ///
+    /// Computed as a plain dot product, which equals the cosine only because
+    /// every argument is an [`Self::encode`] output and `encode` L2-normalizes
+    /// before returning. Passing an un-normalized vector here yields a dot
+    /// product, not a cosine — this is a private helper precisely so that
+    /// precondition stays enforceable by inspection of its two call sites in
+    /// [`Self::contrastive_loss`].
+    ///
+    /// A zero embedding (which `encode` returns when the pre-normalization
+    /// norm is 0) similarity-scores as 0 rather than NaN, so a degenerate
+    /// signal cannot poison the NT-Xent softmax.
     fn cosine_similarity(&self, a: &Array1<f32>, b: &Array1<f32>) -> f32 {
+        debug_assert_eq!(
+            a.len(),
+            b.len(),
+            "cosine_similarity operands must share embed_dim; `zip` would \
+             otherwise silently truncate to the shorter one"
+        );
         a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
     }
 
@@ -712,6 +736,45 @@ mod tests {
 
         // Loss should generally decrease
         assert!(losses[4] <= losses[0] * 1.5); // Allow some variance
+    }
+
+    /// Regression: `update_weights` used to compute the hidden-layer error
+    /// from the *already-updated* decoder weights (W - lr*grad) instead of
+    /// the pre-update weights W that backpropagation requires, biasing the
+    /// encoder update by an amount that grows with `learning_rate`. Uses a
+    /// larger learning rate than `test_msm_pretrain` (which passes even
+    /// with the bug, since its default `0.001` rate keeps the deviation
+    /// tiny) so a wrong-direction encoder update would show up as loss
+    /// failing to decrease.
+    #[test]
+    fn test_msm_pretrain_loss_decreases_with_larger_learning_rate() {
+        let config = MSMConfig {
+            signal_dim: 16,
+            embed_dim: 8,
+            mask_ratio: 0.5,
+            mask_length: 4,
+            learning_rate: 0.1,
+            epochs: 20,
+            ..Default::default()
+        };
+        let mut msm = MaskedSignalModeling::new(config).unwrap();
+
+        // A simple, easily-reconstructable synthetic dataset: repeated
+        // linear ramps.
+        let signals: Vec<Array1<f32>> = (0..8).map(|_| Array1::linspace(0.0, 1.0, 16)).collect();
+
+        let losses = msm.pretrain(&signals, 20).unwrap();
+        assert_eq!(losses.len(), 20);
+        assert!(losses.iter().all(|l| l.is_finite()));
+
+        // The loss trend (comparing the mean of the first few epochs to the
+        // mean of the last few) must be downward, not just "not much worse".
+        let early: f32 = losses[..5].iter().sum::<f32>() / 5.0;
+        let late: f32 = losses[15..].iter().sum::<f32>() / 5.0;
+        assert!(
+            late < early,
+            "loss should trend downward over training: early={early}, late={late}, losses={losses:?}"
+        );
     }
 
     #[test]

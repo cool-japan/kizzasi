@@ -212,6 +212,27 @@ impl MultiModalPipeline {
         }
     }
 
+    /// Modalities present in `inputs`, ordered deterministically by
+    /// [`ModalityType::name`].
+    ///
+    /// `HashMap` iteration order is randomised per process, so every fusion
+    /// strategy that concatenates or aligns per-modality segments must
+    /// iterate through this helper rather than the map directly —
+    /// otherwise two fusion strategies invoked in the same call (as
+    /// [`MultiModalPipeline::hierarchical_fusion`] does with
+    /// [`MultiModalPipeline::early_fusion`] and
+    /// [`MultiModalPipeline::weighted_fusion`]) can lay modalities out in
+    /// different orders and silently average one modality's samples with
+    /// another's.
+    fn sorted_modality_keys(inputs: &HashMap<ModalityType, Array1<f32>>) -> Vec<ModalityType> {
+        let mut keys: Vec<ModalityType> = inputs.keys().copied().collect();
+        // `sort_by` rather than `sort_by_key`: `ModalityType::name`'s elided
+        // signature ties its `&str` return to `&self`'s borrow, which
+        // `sort_by_key` cannot thread through its `K: Ord` extraction.
+        keys.sort_by(|a, b| a.name().cmp(b.name()));
+        keys
+    }
+
     /// Early fusion: concatenate all modalities
     fn early_fusion(
         &self,
@@ -219,12 +240,8 @@ impl MultiModalPipeline {
     ) -> InferenceResult<Array1<f32>> {
         let mut result = Vec::new();
 
-        // Concatenate in a deterministic order (by modality name)
-        let mut sorted_modalities: Vec<_> = inputs.keys().collect();
-        sorted_modalities.sort_by_key(|m| m.name());
-
-        for modality in sorted_modalities {
-            let input = &inputs[modality];
+        for modality in Self::sorted_modality_keys(inputs) {
+            let input = &inputs[&modality];
             let slice = input.as_slice().ok_or_else(|| {
                 InferenceError::ForwardError(
                     "Array data not contiguous in early fusion".to_string(),
@@ -251,10 +268,13 @@ impl MultiModalPipeline {
             ));
         }
 
-        // Group modalities by dimension
+        // Group modalities by dimension, inserting in deterministic
+        // (name-sorted) order so groups sharing a dimension have a stable
+        // internal layout too.
         let mut by_dim: std::collections::HashMap<usize, Vec<Array1<f32>>> =
             std::collections::HashMap::new();
-        for input in inputs.values() {
+        for modality in Self::sorted_modality_keys(inputs) {
+            let input = &inputs[&modality];
             by_dim.entry(input.len()).or_default().push(input.clone());
         }
 
@@ -287,9 +307,15 @@ impl MultiModalPipeline {
         let mut result = Vec::new();
         let mut total_weight = 0.0;
 
-        // Weighted concatenation
-        for (modality, input) in inputs {
-            let config = &self.modalities[modality];
+        // Weighted concatenation, in the same deterministic (name-sorted)
+        // order as every other fusion strategy — `HashMap` iteration order
+        // is randomised per process, so iterating `inputs` directly used to
+        // lay this strategy's output out differently from `early_fusion`'s
+        // on every other run, silently mixing modalities together wherever
+        // `hierarchical_fusion` averages the two element-wise.
+        for modality in Self::sorted_modality_keys(inputs) {
+            let input = &inputs[&modality];
+            let config = &self.modalities[&modality];
             let weight = config.fusion_weight;
             total_weight += weight;
 
@@ -318,10 +344,11 @@ impl MultiModalPipeline {
             ));
         }
 
-        // Group modalities by dimension
+        // Group modalities by dimension, in deterministic (name-sorted) order.
         let mut by_dim: std::collections::HashMap<usize, Vec<Array1<f32>>> =
             std::collections::HashMap::new();
-        for input in inputs.values() {
+        for modality in Self::sorted_modality_keys(inputs) {
+            let input = &inputs[&modality];
             by_dim.entry(input.len()).or_default().push(input.clone());
         }
 
@@ -382,10 +409,11 @@ impl MultiModalPipeline {
             return Ok(single_input.clone());
         }
 
-        // Group modalities by dimension
+        // Group modalities by dimension, in deterministic (name-sorted) order.
         let mut by_dim: std::collections::HashMap<usize, Vec<Array1<f32>>> =
             std::collections::HashMap::new();
-        for input in inputs.values() {
+        for modality in Self::sorted_modality_keys(inputs) {
+            let input = &inputs[&modality];
             by_dim.entry(input.len()).or_default().push(input.clone());
         }
 
@@ -773,6 +801,78 @@ mod tests {
         let result = pipeline.forward(&[(ModalityType::Audio, audio), (ModalityType::Text, text)]);
 
         result.unwrap(); // Show error
+    }
+
+    /// Regression: `weighted_fusion` iterated the `HashMap` directly, so its
+    /// segment order (and therefore which numbers ended up in which
+    /// position of the output) depended on hash-bucket layout instead of
+    /// modality name — unlike `early_fusion`, which already sorted.
+    #[test]
+    fn test_weighted_fusion_matches_name_sorted_order() {
+        let engine_config = EngineConfig::new(5, 5);
+        let mut pipeline = MultiModalPipeline::builder()
+            .engine_config(engine_config)
+            .modality(ModalityType::Audio, 2)
+            .modality(ModalityType::Video, 3)
+            .fusion_strategy(FusionStrategy::WeightedFusion)
+            .build()
+            .unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert(ModalityType::Audio, Array1::from_vec(vec![10.0, 10.0]));
+        inputs.insert(
+            ModalityType::Video,
+            Array1::from_vec(vec![20.0, 20.0, 20.0]),
+        );
+
+        // "audio" < "video" alphabetically, so audio's (equal-weight,
+        // normalized) segment must come first, deterministically.
+        let fused = pipeline
+            .fuse(&inputs)
+            .expect("weighted fusion must succeed");
+        assert_eq!(fused.to_vec(), vec![5.0, 5.0, 10.0, 10.0, 10.0]);
+    }
+
+    /// Regression: `hierarchical_fusion` averages `early_fusion` (sorted by
+    /// name) element-wise with `weighted_fusion` (previously unsorted). When
+    /// the two fusions disagreed on ordering, this silently averaged one
+    /// modality's samples with a *different* modality's — e.g. audio
+    /// samples with video samples — rather than each modality with itself.
+    #[test]
+    fn test_hierarchical_fusion_segments_align_per_modality() {
+        let engine_config = EngineConfig::new(5, 5);
+        let mut pipeline = MultiModalPipeline::builder()
+            .engine_config(engine_config)
+            .modality(ModalityType::Audio, 2)
+            .modality(ModalityType::Video, 3)
+            .fusion_strategy(FusionStrategy::Hierarchical)
+            .build()
+            .unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert(ModalityType::Audio, Array1::from_vec(vec![10.0, 10.0]));
+        inputs.insert(
+            ModalityType::Video,
+            Array1::from_vec(vec![20.0, 20.0, 20.0]),
+        );
+
+        // early = [10,10,20,20,20]; weighted (equal weights) = [5,5,10,10,10];
+        // hierarchical = (early + weighted) / 2 = [7.5,7.5,15,15,15].
+        // A misaligned implementation that placed video first in `weighted`
+        // would instead sum audio's early segment with video's weighted
+        // segment (and vice versa), producing a different result.
+        let fused = pipeline
+            .fuse(&inputs)
+            .expect("hierarchical fusion must succeed");
+        let expected = [7.5_f32, 7.5, 15.0, 15.0, 15.0];
+        for (got, want) in fused.iter().zip(expected.iter()) {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "hierarchical fusion segments must align per modality: got {:?}, want {:?}",
+                fused.to_vec(),
+                expected
+            );
+        }
     }
 
     #[test]

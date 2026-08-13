@@ -1,16 +1,23 @@
 //! Fixed-point Q16.16 inference for FPU-less ARM Cortex-M (M0, M0+, M3).
 //!
-//! This example shows how to convert `f32` inputs to [`Q16`] fixed-point,
-//! perform a dot product, run a Q16-based exponential approximation, and
-//! convert the result back. It is gated on the `fixed-point` feature, which
-//! enables the [`kizzasi_embedded::fixed_point`] module.
+//! This example runs a complete Mamba selective-SSM recurrence
+//! ([`MambaStepQ16`](kizzasi_embedded::MambaStepQ16)) entirely in Q16.16
+//! integer arithmetic — no `f32` operation is executed inside the loop, so an
+//! M0+ never touches its soft-float library — and cross-checks it against the
+//! `f32` kernel. It is gated on the `fixed-point` feature.
 //!
-//! Memory footprint on a `d_state = 8` SSM is roughly:
+//! Memory footprint of the `d_state = 8` configuration below (all `Q16` is a
+//! single `i32` word, and none of it is heap-allocated):
 //!
-//! * Recurrent state `h`     : 8 × 4 B = 32 B (Q16 reuses i32 storage)
-//! * Inner buffer `prev_x`   : 16 × 4 B = 64 B
-//! * Weight diagonals (×4)   : 4 × 32 B = 128 B
-//! * Total state RAM         : ~ 224 B (well under the 2 KB target)
+//! * Recurrent state `h`          : 8 × 4 B  =  32 B
+//! * Weight diagonals `a_log`/`B`/`C` : 3 × 8 × 4 B  =  96 B
+//! * Input frame `x`              : 8 × 4 B  =  32 B
+//! * Total                        : 160 B, all in `.bss`/stack
+//!
+//! (The `f32` [`SsmState`](kizzasi_embedded::SsmState) also carries a
+//! `d_inner`-long `prev_x` convolution history — `d_inner * 4` bytes, e.g.
+//! 256 B at the `rp2040` preset. The Q16 path has no convolution stage, so it
+//! carries only `h`.)
 //!
 //! Build with:
 //!
@@ -31,58 +38,68 @@
 #[cfg(feature = "fixed-point")]
 fn main() {
     use kizzasi_embedded::fixed_point::{fixed_dot, fixed_exp_approx, Q16};
+    use kizzasi_embedded::math::ln_approx;
+    use kizzasi_embedded::{MambaStep, MambaStepQ16};
+
+    const D_STATE: usize = 8;
 
     // ---- Step 1: ingest f32 inputs from the analog/sensor frontend -----
-    let inputs_f32 = [0.10_f32, 0.20, 0.30, 0.40, -0.10, -0.20, 0.05, 0.15];
-    let weights_f32 = [1.00_f32, 0.50, -0.25, 0.75, 0.10, 0.20, -0.30, 0.40];
+    let x_f32 = [0.10_f32, 0.20, 0.30, 0.40, -0.10, -0.20, 0.05, 0.15];
+    // `a_log` is log-space: the effective state matrix is `A = -exp(a_log)`,
+    // so checkpoint values are non-negative (HiPPO: ln(1), ln(2), ...).
+    let a_log_f32: [f32; D_STATE] = core::array::from_fn(|n| ln_approx((n + 1) as f32));
+    let b_f32 = [0.50_f32, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20, 0.15];
+    let c_f32 = [1.00_f32, 0.90, 0.80, 0.70, 0.60, 0.50, 0.40, 0.30];
+    let delta_f32 = 0.10_f32;
 
     // ---- Step 2: convert to Q16.16 fixed-point ---------------------------
-    // On a real Cortex-M0 target this conversion is a single `vcvt`-free
-    // multiply-then-truncate sequence and adds <= 1 cycle per element.
-    let mut inputs_q = [Q16::ZERO; 8];
-    let mut weights_q = [Q16::ZERO; 8];
-    for i in 0..inputs_f32.len() {
-        inputs_q[i] = Q16::from_f32(inputs_f32[i]);
-        weights_q[i] = Q16::from_f32(weights_f32[i]);
+    // On a real Cortex-M0 target this conversion happens once, at model load,
+    // and the hot loop below never sees an `f32` again.
+    let mut x_q = [Q16::ZERO; D_STATE];
+    let mut a_log_q = [Q16::ZERO; D_STATE];
+    let mut b_q = [Q16::ZERO; D_STATE];
+    let mut c_q = [Q16::ZERO; D_STATE];
+    for i in 0..D_STATE {
+        x_q[i] = Q16::from_f32(x_f32[i]);
+        a_log_q[i] = Q16::from_f32(a_log_f32[i]);
+        b_q[i] = Q16::from_f32(b_f32[i]);
+        c_q[i] = Q16::from_f32(c_f32[i]);
+    }
+    let delta_q = Q16::from_f32(delta_f32);
+
+    // ---- Step 3: run the recurrence in both precisions --------------------
+    // The Q16 state is a plain array: no allocator is involved anywhere.
+    let mut h_q = [Q16::ZERO; D_STATE];
+    let mut h_f32 = [0.0_f32; D_STATE];
+
+    let mut worst_err = 0.0_f32;
+    let mut last = (0.0_f32, 0.0_f32);
+    for _ in 0..32 {
+        let y_q =
+            MambaStepQ16::step_slice(&mut h_q, &x_q, &a_log_q, &b_q, &c_q, delta_q, Q16::ZERO)
+                .expect("dimensions match");
+        let y_f = MambaStep::step_slice(
+            &mut h_f32, &x_f32, &a_log_f32, &b_f32, &c_f32, delta_f32, 0.0,
+        )
+        .expect("dimensions match");
+        worst_err = worst_err.max((y_q.to_f32() - y_f).abs());
+        last = (y_q.to_f32(), y_f);
     }
 
-    // ---- Step 3: dot product entirely in fixed-point ---------------------
-    let dot = fixed_dot(&inputs_q, &weights_q);
+    // ---- Step 4: standalone Q16 primitives --------------------------------
+    let dot = fixed_dot(&x_q, &b_q).expect("equal lengths");
+    // `fixed_exp_approx` now range-reduces properly, so it is safe over the
+    // whole Q16.16 range and never rises above 1 for a negative argument —
+    // no call-site clamp required.
+    let decay = fixed_exp_approx(dot.saturating_neg());
 
-    // ---- Step 4: Taylor-series exp for the SSM `A_bar` decay -------------
-    // `fixed_exp_approx` is accurate to ~1 % for |x| < 0.5; clamp the
-    // argument first to stay within that range.
-    let arg = if dot.to_f32().abs() > 0.5 {
-        // Saturate to ±0.5 so the Taylor series stays accurate.
-        if dot.is_negative() {
-            Q16::from_f32(-0.5)
-        } else {
-            Q16::from_f32(0.5)
-        }
-    } else {
-        dot
-    };
-    let decay = fixed_exp_approx(arg);
-
-    // ---- Step 5: convert back to f32 for host-side reporting -------------
-    let dot_f32 = dot.to_f32();
-    let decay_f32 = decay.to_f32();
-
-    // Cross-check against the host f32 implementation to bound quantisation
-    // error. On Cortex-M0 the host comparison is omitted; here we keep it
-    // to demonstrate that the Q16 path stays within ~ 1 % of f32.
-    let dot_ref: f32 = inputs_f32
-        .iter()
-        .zip(weights_f32.iter())
-        .map(|(x, w)| x * w)
-        .sum();
-    let err = (dot_f32 - dot_ref).abs();
-
-    println!("fixed_point_cortex_m:");
-    println!("  Q16 dot           = {dot_f32:.6}");
-    println!("  f32 dot reference = {dot_ref:.6}");
-    println!("  |Q16 - f32| error = {err:.2e}");
-    println!("  Q16 exp(dot.clamp(±0.5)) = {decay_f32:.6}");
+    println!("fixed_point_cortex_m ({D_STATE}-state Mamba, 32 steps):");
+    println!("  Q16 y (last step)      = {:.6}", last.0);
+    println!("  f32 y (last step)      = {:.6}", last.1);
+    println!("  worst |Q16 - f32|      = {worst_err:.3e}");
+    println!("  Q16 dot(x, B)          = {:.6}", dot.to_f32());
+    println!("  Q16 exp(-dot)          = {:.6}", decay.to_f32());
+    println!("  state RAM (Q16 h)      = {} B", D_STATE * 4);
 }
 
 #[cfg(not(feature = "fixed-point"))]

@@ -289,6 +289,7 @@ impl UdpSocketStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_socket_config_defaults() {
@@ -333,5 +334,121 @@ mod tests {
 
         let socket = UdpSocketStream::bind(config).await.unwrap();
         assert!(socket.local_addr().is_ok());
+    }
+
+    // === Loopback data-path tests (test-gap, id=49) ===
+    //
+    // The suite previously only constructed config structs and checked that
+    // a socket could bind; nothing exercised send/recv, so a broken data
+    // path would have passed.
+
+    #[tokio::test]
+    async fn test_tcp_loopback_round_trip() {
+        let server = TcpServerStream::bind(SocketConfig {
+            address: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let address = server.local_addr().unwrap().to_string();
+
+        let accept = tokio::spawn(async move {
+            let mut accepted = server.accept().await.unwrap();
+            let received = accepted.recv().await.unwrap().expect("client sent data");
+            // Echo it straight back.
+            accepted.send(&received).await.unwrap();
+            received
+        });
+
+        let mut client = TcpClientStream::connect(SocketConfig {
+            address: address.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(client.peer_addr().unwrap().to_string(), address);
+
+        let payload = b"kizzasi-io tcp loopback";
+        client.send(payload).await.unwrap();
+
+        let echoed = client.recv().await.unwrap().expect("server echoed data");
+        assert_eq!(echoed.as_ref(), payload);
+        assert_eq!(accept.await.unwrap().as_ref(), payload);
+
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tcp_recv_reports_closed_connection() {
+        let server = TcpServerStream::bind(SocketConfig {
+            address: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let address = server.local_addr().unwrap().to_string();
+
+        let accept = tokio::spawn(async move {
+            let mut accepted = server.accept().await.unwrap();
+            accepted.shutdown().await.unwrap();
+        });
+
+        let mut client = TcpClientStream::connect(SocketConfig {
+            address,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // A clean close is reported as `Ok(None)`, not as an error.
+        assert!(client.recv().await.unwrap().is_none());
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_udp_loopback_round_trip() {
+        let mut receiver = UdpSocketStream::bind(SocketConfig {
+            address: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let address = receiver.local_addr().unwrap().to_string();
+
+        let sender = UdpSocketStream::connect(SocketConfig {
+            address: address.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let payload = b"kizzasi-io udp loopback";
+        sender.send(payload).await.unwrap();
+
+        let (data, from) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("UDP receive timed out")
+            .unwrap();
+        assert_eq!(data.as_ref(), payload);
+        // The sender binds to the wildcard address, so only the port is
+        // comparable against its own `local_addr`.
+        assert_eq!(from.port(), sender.local_addr().unwrap().port());
+
+        // `send_to` targets an explicit address, so it needs an *unconnected*
+        // socket: a socket created with `connect()` rejects it (EISCONN).
+        let unconnected = UdpSocketStream::bind(SocketConfig {
+            address: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        unconnected.send_to(b"second", &address).await.unwrap();
+
+        let (data, from) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("UDP receive timed out")
+            .unwrap();
+        assert_eq!(data.as_ref(), b"second");
+        assert_eq!(from, unconnected.local_addr().unwrap());
     }
 }

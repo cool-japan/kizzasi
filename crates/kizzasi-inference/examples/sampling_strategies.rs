@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create model registry
     let mut registry = ModelRegistry::new();
-    let model_config = ModelBuilder::rwkv().dims(1, 64, 10).layers(2).build();
+    let model_config = ModelBuilder::rwkv().dims(1, 64, 1).layers(2).build(); // RWKV has no output-projection layer: output_dim == input_dim
     registry.register("rwkv_model", model_config);
 
     let input = Array1::from_vec(vec![0.5]);
@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Greedy Sampling
     println!("=== Greedy Sampling (deterministic) ===");
     let sampling = SamplingConfig::new().strategy(SamplingStrategy::Greedy);
-    let config = EngineConfig::new(1, 10)
+    let config = EngineConfig::new(1, 1)
         .sampling(sampling)
         .use_embeddings(true);
     let mut engine =
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .temperature(*temp)
             .seed(42);
 
-        let config = EngineConfig::new(1, 10)
+        let config = EngineConfig::new(1, 1)
             .sampling(sampling)
             .use_embeddings(true);
         let mut engine = InferenceEngine::with_model(config, registry.create_model("rwkv_model")?);
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for k in &[1, 3, 5] {
         let sampling = SamplingConfig::new().top_k(*k).seed(42);
 
-        let config = EngineConfig::new(1, 10)
+        let config = EngineConfig::new(1, 1)
             .sampling(sampling)
             .use_embeddings(true);
         let mut engine = InferenceEngine::with_model(config, registry.create_model("rwkv_model")?);
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for p in &[0.7, 0.9, 0.95] {
         let sampling = SamplingConfig::new().top_p(*p).seed(42);
 
-        let config = EngineConfig::new(1, 10)
+        let config = EngineConfig::new(1, 1)
             .sampling(sampling)
             .use_embeddings(true);
         let mut engine = InferenceEngine::with_model(config, registry.create_model("rwkv_model")?);

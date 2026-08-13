@@ -124,9 +124,18 @@ impl LoraAdapter {
         self.lora_b.nrows()
     }
 
-    /// Apply the LoRA adapter to an input
+    /// Apply the LoRA adapter to an input, returning the scaled low-rank
+    /// delta `scaling * (input @ A^T @ B^T)`.
     ///
-    /// Computes: output = input + scaling * (input @ A^T @ B^T)
+    /// This is a *delta*, not a full layer output: LoRA's defining property
+    /// is that it augments a frozen base layer (`W0 x + scaling * B A x`), so
+    /// adding the base layer's own output is the caller's responsibility.
+    /// The returned array always has [`LoraAdapter::out_features`] elements —
+    /// unconditionally, regardless of `input`'s length, with no
+    /// shape-dependent branching. Use [`LoraAdapter::apply_with_base`] when
+    /// you have the base layer's output on hand and want the full
+    /// `base + delta` sum, with a dimension check instead of a silently
+    /// different formula.
     pub fn apply(&self, input: &Array1<f32>) -> InferenceResult<Array1<f32>> {
         if input.len() != self.in_features() {
             return Err(InferenceError::DimensionMismatch {
@@ -147,32 +156,62 @@ impl LoraAdapter {
             output[i] = hidden.dot(&self.lora_b.row(i));
         }
 
-        // Scale and add to original input (identity residual)
-        // For dimension matching, we assume output has same dim as input for residual
-        // In practice, output dimension might differ - this is simplified
-        if output.len() == input.len() {
-            output = &output * self.scaling + input;
-        } else {
-            output = &output * self.scaling;
-        }
+        Ok(&output * self.scaling)
+    }
 
-        Ok(output)
+    /// Apply the adapter to `input` and add the result to `base_output`.
+    ///
+    /// Computes the full LoRA composition `base_output + scaling * B A x`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::DimensionMismatch`] when `base_output.len()`
+    /// does not equal [`LoraAdapter::out_features`], instead of silently
+    /// falling back to the bare delta.
+    pub fn apply_with_base(
+        &self,
+        input: &Array1<f32>,
+        base_output: &Array1<f32>,
+    ) -> InferenceResult<Array1<f32>> {
+        let delta = self.apply(input)?;
+        if base_output.len() != delta.len() {
+            return Err(InferenceError::DimensionMismatch {
+                expected: delta.len(),
+                got: base_output.len(),
+            });
+        }
+        Ok(&delta + base_output)
     }
 
     /// Apply the LoRA adapter to a batch of inputs
+    ///
+    /// An empty batch yields an empty `(0, out_features)` array; the row width is
+    /// taken from the adapter rather than from the first output row, which does not
+    /// exist in that case.
     pub fn apply_batch(&self, inputs: &Array2<f32>) -> InferenceResult<Array2<f32>> {
         let batch_size = inputs.nrows();
-        let mut outputs = Vec::with_capacity(batch_size);
+
+        // An `Array2<f32>` with zero rows is legally constructible; indexing
+        // `outputs[0]` for the row width would panic on it.
+        if batch_size == 0 {
+            return Ok(Array2::zeros((0, self.out_features())));
+        }
+
+        if inputs.ncols() != self.in_features() {
+            return Err(InferenceError::DimensionMismatch {
+                expected: self.in_features(),
+                got: inputs.ncols(),
+            });
+        }
+
+        let out_dim = self.out_features();
+        let mut flat: Vec<f32> = Vec::with_capacity(batch_size * out_dim);
 
         for i in 0..batch_size {
             let input_row = inputs.row(i).to_owned();
             let output_row = self.apply(&input_row)?;
-            outputs.push(output_row);
+            flat.extend(output_row.iter().copied());
         }
-
-        // Stack outputs into a 2D array
-        let out_dim = outputs[0].len();
-        let flat: Vec<f32> = outputs.into_iter().flat_map(|x| x.to_vec()).collect();
 
         Array2::from_shape_vec((batch_size, out_dim), flat).map_err(|e| {
             InferenceError::ForwardError(format!("Failed to stack LoRA outputs: {}", e))
@@ -231,13 +270,15 @@ impl LoraAdapterManager {
             .and_then(|name| self.adapters.get(name))
     }
 
-    /// Apply the active adapter (if any) to input
-    pub fn apply(&self, input: &Array1<f32>) -> InferenceResult<Array1<f32>> {
+    /// Apply the active adapter (if any) to `base_output`, adding its scaled
+    /// delta on top via [`LoraAdapter::apply_with_base`]. Returns
+    /// `base_output` unchanged when no adapter is active.
+    pub fn apply(&self, base_output: &Array1<f32>) -> InferenceResult<Array1<f32>> {
         if let Some(adapter) = self.active_adapter() {
-            adapter.apply(input)
+            adapter.apply_with_base(base_output, base_output)
         } else {
             // No active adapter, return input unchanged
-            Ok(input.clone())
+            Ok(base_output.clone())
         }
     }
 
@@ -556,6 +597,42 @@ impl LoraAdapterLoader {
 mod tests {
     use super::*;
 
+    /// Regression: `apply_batch` read `outputs[0]` for the row width, which panics
+    /// on the legally constructible zero-row input.
+    #[test]
+    fn test_apply_batch_empty_input() {
+        let adapter = LoraAdapter::new(
+            Array2::from_elem((2, 4), 0.1),
+            Array2::from_elem((3, 2), 0.1),
+            1.0,
+            "empty",
+        )
+        .expect("adapter construction must succeed");
+
+        let empty = Array2::<f32>::zeros((0, 4));
+        let out = adapter
+            .apply_batch(&empty)
+            .expect("empty batch must be accepted");
+        assert_eq!(out.shape(), &[0, 3]);
+    }
+
+    #[test]
+    fn test_apply_batch_rejects_wrong_width() {
+        let adapter = LoraAdapter::new(
+            Array2::from_elem((2, 4), 0.1),
+            Array2::from_elem((3, 2), 0.1),
+            1.0,
+            "narrow",
+        )
+        .expect("adapter construction must succeed");
+
+        let wrong = Array2::<f32>::zeros((2, 5));
+        assert!(matches!(
+            adapter.apply_batch(&wrong),
+            Err(InferenceError::DimensionMismatch { .. })
+        ));
+    }
+
     #[test]
     fn test_lora_config() {
         let config = LoraConfig::new().rank(16).alpha(32.0);
@@ -602,6 +679,66 @@ mod tests {
 
         assert_eq!(output.len(), out_features);
         // Output should be input + LoRA modification
+    }
+
+    /// Regression: `apply()` used to silently add an identity residual only
+    /// when `out_features == in_features`, so the *same* adapter's `apply()`
+    /// had a different formula depending on shape. It must now always
+    /// return just the scaled delta, and `apply_with_base` must be the
+    /// (dimension-checked) way to add a base output on top.
+    #[test]
+    fn test_apply_is_pure_delta_regardless_of_shape() {
+        // Square case: previously this silently added `input` to the result.
+        let square = LoraAdapter::new(
+            Array2::from_elem((2, 4), 0.1),
+            Array2::from_elem((4, 2), 0.2),
+            1.0,
+            "square",
+        )
+        .unwrap();
+        let input = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+        let delta = square.apply(&input).unwrap();
+
+        // Manually compute the expected low-rank delta (no residual): both
+        // A rows are uniform 0.1, so hidden[i] = 0.1 * input.sum() for each
+        // of the 2 rank dimensions; both B rows are uniform 0.2, so each
+        // output element = 0.2 * hidden.sum().
+        let hidden_sum: f32 = 2.0 * (input.sum() * 0.1);
+        let expected_each = hidden_sum * 0.2;
+        for got in delta.iter() {
+            assert!(
+                (got - expected_each).abs() < 1e-5,
+                "square-shaped apply() must not add an identity residual: got {got}, want {expected_each}"
+            );
+        }
+
+        // apply_with_base explicitly composes base + delta.
+        let base = Array1::from_vec(vec![10.0, 20.0, 30.0, 40.0]);
+        let composed = square.apply_with_base(&input, &base).unwrap();
+        for (c, (b, d)) in composed.iter().zip(base.iter().zip(delta.iter())) {
+            assert!((c - (b + d)).abs() < 1e-6);
+        }
+
+        // Rectangular case: in_features != out_features. `apply` must still
+        // succeed and return exactly `out_features` elements unconditionally
+        // — no shape-dependent branching.
+        let rect = LoraAdapter::new(
+            Array2::from_elem((2, 4), 0.1),
+            Array2::from_elem((6, 2), 0.2),
+            1.0,
+            "rect",
+        )
+        .unwrap();
+        let rect_delta = rect.apply(&input).unwrap();
+        assert_eq!(rect_delta.len(), 6);
+
+        // apply_with_base must reject a base whose length doesn't match
+        // out_features, rather than silently choosing a different formula.
+        let mismatched_base = Array1::from_vec(vec![0.0; 4]);
+        assert!(matches!(
+            rect.apply_with_base(&input, &mismatched_base),
+            Err(InferenceError::DimensionMismatch { .. })
+        ));
     }
 
     #[test]

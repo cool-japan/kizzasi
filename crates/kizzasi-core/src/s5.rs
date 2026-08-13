@@ -119,6 +119,27 @@ impl S5Config {
         if self.dt <= 0.0 {
             return Err(CoreError::InvalidConfig("dt must be > 0".into()));
         }
+        if self.use_complex {
+            // `use_complex` is accepted by the config/builder but no
+            // complex-diagonal state-space path exists anywhere in this
+            // file: `S5Layer`/`S5Model` use `Array1<f32>`/`Array2<f32>`
+            // throughout, including `zoh_discretize` on real values. The
+            // module doc cites Smith et al. 2023's "Simplified State Space
+            // Layers", whose defining construction IS a complex-diagonal
+            // HiPPO-derived state matrix -- so silently ignoring this flag
+            // would claim the paper's parameterization while delivering a
+            // different, real-valued approximation. Reject explicitly
+            // instead. Implementing the real thing needs a complex λ with
+            // conjugate-symmetric pairs and a real-part output projection;
+            // until that lands, this crate is the real-valued S5 variant.
+            return Err(CoreError::InvalidConfig(
+                "S5Config::use_complex is not implemented: this S5 layer is a real-valued \
+                 variant (Array1<f32>/Array2<f32> state throughout), not the complex-diagonal \
+                 parameterization from Smith et al. 2023. Leave use_complex at its default \
+                 (false)."
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -491,6 +512,29 @@ mod tests {
         let mut config = S5Config::new(10, 256, 64);
         config.dt = -0.1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_s5_use_complex_is_rejected_not_silently_ignored() {
+        // Regression: `use_complex` used to be accepted by the
+        // config/builder and then read nowhere -- `S5Layer`/`S5Model`
+        // silently ran the real-valued path regardless, contradicting the
+        // module's Smith et al. 2023 (complex-diagonal) citation.
+        let config = S5Config::new(10, 256, 64).with_complex(true);
+        assert!(
+            config.validate().is_err(),
+            "use_complex: true must be rejected by validate() instead of silently ignored"
+        );
+
+        // Both entry points that construct a layer go through validate(),
+        // so both must now honestly fail.
+        assert!(S5Layer::new(config.clone()).is_err());
+        assert!(S5Model::new(config, 2).is_err());
+
+        // The default (false) must be unaffected.
+        let default_config = S5Config::new(10, 256, 64);
+        assert!(default_config.validate().is_ok());
+        assert!(S5Layer::new(default_config).is_ok());
     }
 
     #[test]

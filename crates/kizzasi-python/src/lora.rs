@@ -28,7 +28,7 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use scirs2_numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use scirs2_numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2};
 
 use kizzasi_core::lora::{LoRAAdapter, LoRAConfig, LoRALayer};
 use scirs2_core::ndarray::{Array1, Array2};
@@ -43,10 +43,18 @@ use crate::predictor::to_py_err;
 /// registered module name.
 ///
 /// Predictions go through [`forward`], which applies the LoRA correction
-/// on top of the base weight (`y = W x + alpha/r * B (A x)`). Calling
+/// on top of the base weight (`y = W x + alpha/r * B (A x)`, or
+/// `y = W x + alpha/r * B (A dropout(x))` while the adapter is in training
+/// mode -- see [`train`](Self::train) -- and `dropout > 0`; adapters start
+/// in evaluation mode, where `dropout` is always a no-op). Calling
 /// [`merge_all`] folds every LoRA contribution into the base weights so
 /// later `forward` calls become pure matrix multiplications;
-/// [`unmerge_all`] reverses the operation.
+/// [`unmerge_all`] reverses the operation. Merging is a static transform of
+/// the trained weights, not a forward pass, so it is never subject to
+/// dropout regardless of training mode -- and once merged, `forward` no
+/// longer has a separate LoRA path to apply dropout to at all. Calling
+/// `train()` and then `merge_all()` followed by `forward()` is therefore
+/// deterministic; this is correct (not a sign dropout stopped working).
 #[pyclass(name = "LoRAAdapter")]
 pub struct PyLoRAAdapter {
     inner: LoRAAdapter,
@@ -61,6 +69,10 @@ impl PyLoRAAdapter {
     /// - `rank`: low-rank dimension; must be `> 0`.
     /// - `alpha`: scaling factor; must be `> 0` (effective scale = `alpha / rank`).
     /// - `dropout`: per-layer dropout probability in `[0, 1)`; default `0.0`.
+    ///   Inert until [`train`](Self::train) is called -- the adapter (and
+    ///   every layer it holds) starts in evaluation mode, where `forward`
+    ///   ignores `dropout` entirely and stays fully deterministic no matter
+    ///   what it is set to.
     #[new]
     #[pyo3(signature = (name, rank, alpha, dropout = 0.0))]
     pub fn new(name: String, rank: usize, alpha: f32, dropout: f32) -> PyResult<Self> {
@@ -103,7 +115,7 @@ impl PyLoRAAdapter {
             })?;
         let x: Array1<f32> = input.as_array().to_owned();
         let y = layer.forward(&x).map_err(to_py_err)?;
-        Ok(y.to_pyarray(py))
+        Ok(y.into_pyarray(py))
     }
 
     /// Fold every LoRA correction into the base weights in-place.
@@ -114,6 +126,35 @@ impl PyLoRAAdapter {
     /// Reverse [`merge_all`]: subtract every LoRA correction back out.
     pub fn unmerge_all(&mut self) -> PyResult<()> {
         self.inner.unmerge_all().map_err(to_py_err)
+    }
+
+    /// Switch every registered layer -- and any layer added afterwards --
+    /// into training mode: `forward` will stochastically zero elements of
+    /// the LoRA input path with probability `dropout` (rescaling survivors
+    /// by `1 / (1 - dropout)`), so consecutive calls with the same input
+    /// can now return different results wherever `dropout > 0`. Adapters
+    /// start in evaluation mode (see [`eval`](Self::eval)).
+    pub fn train(&mut self) {
+        self.inner.train();
+    }
+
+    /// Switch every registered layer back into evaluation mode: `forward`
+    /// becomes fully deterministic again and ignores `dropout` entirely.
+    /// This is the default mode for a freshly constructed adapter.
+    ///
+    /// (This is the standard ML train/eval mode toggle -- mirroring e.g.
+    /// PyTorch's `Module.eval()` -- not the `eval`/code-execution builtin
+    /// found in dynamic languages; it flips a flag and runs no code.)
+    pub fn eval(&mut self) {
+        self.inner.eval();
+    }
+
+    /// Whether [`train`](Self::train) was called more recently than
+    /// [`eval`](Self::eval). Adapters start in evaluation mode, so this is
+    /// `False` until `train()` is called.
+    #[getter]
+    pub fn is_training(&self) -> bool {
+        self.inner.is_training()
     }
 
     /// Total number of trainable LoRA parameters across all registered modules.
@@ -151,7 +192,8 @@ impl PyLoRAAdapter {
         self.inner.config.alpha
     }
 
-    /// Dropout probability used when initialising layers.
+    /// Dropout probability used when initialising layers. Inert unless
+    /// [`train`](Self::train) has been called -- see [`is_training`](Self::is_training).
     #[getter]
     pub fn dropout(&self) -> f32 {
         self.inner.config.dropout
@@ -291,6 +333,138 @@ mod tests {
         assert!(res.is_err(), "dropout=1.0 should be rejected");
         let res = PyLoRAAdapter::new("bad".to_string(), 4, 8.0, -0.1);
         assert!(res.is_err(), "dropout<0 should be rejected");
+    }
+
+    #[test]
+    fn test_lora_train_eval_plumbing() {
+        let mut adapter = PyLoRAAdapter::new("plumbing".to_string(), 2, 4.0, 0.3).expect("adapter");
+        assert!(!adapter.is_training());
+
+        adapter.train();
+        assert!(adapter.is_training());
+
+        adapter.eval();
+        assert!(!adapter.is_training());
+    }
+
+    // Regression for the medium bug where `dropout` was accepted, validated,
+    // and exposed as a property (`PyLoRAAdapter::dropout`) but never
+    // consulted by `forward`: `dropout=0.3` and `dropout=0.0` produced
+    // byte-identical output regardless of training/evaluation mode. As in
+    // `kizzasi-core`'s equivalent tests, a freshly added layer's `lora_b`
+    // starts at all zeros (see `LoRALayer::new`), which would make the LoRA
+    // path -- and therefore any dropout applied to its input -- invisible
+    // in `forward`'s output no matter how dropout is wired up. `set_lora_b`
+    // is used first so these tests actually exercise the dropout-masked
+    // path instead of passing vacuously.
+    //
+    // `lora_a` is deliberately left at its natural random initialisation
+    // (never overridden) and the input is 64-wide at `dropout=0.5`:
+    // `dropout=0.5` minimises the chance that two independent Bernoulli
+    // masks coincide per element (`keep_prob^2 + (1-keep_prob)^2` is
+    // minimised at `keep_prob=0.5`, unlike e.g. `dropout=0.9` where masks
+    // mostly agree on "everything dropped"); at 64 independent elements the
+    // chance two draws' masks coincide exactly is `0.5^64`, and a random
+    // (not hand-picked) `lora_a` makes any *other* collision astronomically
+    // unlikely too.
+    fn lora_dropout_test_layer(dropout: f32) -> LoRALayer {
+        let rank = 4;
+        let out_features = 6;
+        let in_features = 64;
+        let config = LoRAConfig::new(rank, 8.0).with_dropout(dropout);
+        let base = Array2::<f32>::from_shape_fn((out_features, in_features), |(i, j)| {
+            (i as f32 + j as f32) * 0.001
+        });
+        let mut layer = LoRALayer::new(config, base).expect("layer");
+        layer
+            .set_lora_b(Array2::<f32>::from_shape_fn(
+                (out_features, rank),
+                |(i, j)| 0.1 + 0.03 * (i as f32) - 0.017 * (j as f32),
+            ))
+            .expect("set_lora_b");
+        layer
+    }
+
+    #[test]
+    fn test_lora_dropout_inactive_in_eval_mode() {
+        let mut adapter =
+            PyLoRAAdapter::new("eval_dropout".to_string(), 4, 8.0, 0.5).expect("adapter");
+        let layer = lora_dropout_test_layer(0.5);
+        adapter.inner.add_layer("m".to_string(), layer);
+        assert!(!adapter.is_training());
+
+        let x = Array1::<f32>::from_shape_fn(64, |i| (i as f32) * 0.01 + 0.1);
+        let first = adapter
+            .inner
+            .layers
+            .get("m")
+            .expect("layer present")
+            .forward(&x)
+            .expect("forward");
+        for _ in 0..20 {
+            let repeat = adapter
+                .inner
+                .layers
+                .get("m")
+                .expect("layer present")
+                .forward(&x)
+                .expect("forward");
+            assert_eq!(first, repeat, "eval-mode forward must be deterministic");
+        }
+    }
+
+    #[test]
+    fn test_lora_dropout_active_in_training_mode() {
+        let mut adapter =
+            PyLoRAAdapter::new("train_dropout".to_string(), 4, 8.0, 0.5).expect("adapter");
+        let layer = lora_dropout_test_layer(0.5);
+        adapter.inner.add_layer("m".to_string(), layer);
+
+        adapter.train();
+        assert!(adapter.is_training());
+        assert!(adapter.inner.layers["m"].is_training());
+
+        let x = Array1::<f32>::from_elem(64, 1.0);
+        let first = adapter
+            .inner
+            .layers
+            .get("m")
+            .expect("layer present")
+            .forward(&x)
+            .expect("forward");
+        let mut saw_difference = false;
+        for _ in 0..20 {
+            let repeat = adapter
+                .inner
+                .layers
+                .get("m")
+                .expect("layer present")
+                .forward(&x)
+                .expect("forward");
+            if repeat != first {
+                saw_difference = true;
+                break;
+            }
+        }
+        assert!(
+            saw_difference,
+            "training-mode dropout should make forward stochastic once B is nonzero"
+        );
+    }
+
+    #[test]
+    fn test_lora_add_layer_after_train_starts_training() {
+        let mut adapter = PyLoRAAdapter::new("late_add".to_string(), 2, 4.0, 0.5).expect("adapter");
+        adapter.train();
+
+        let base = Array2::<f32>::from_elem((4, 4), 0.1);
+        let layer = LoRALayer::new(adapter.inner.config.clone(), base).expect("layer");
+        adapter.inner.add_layer("late".to_string(), layer);
+
+        assert!(
+            adapter.inner.layers["late"].is_training(),
+            "a layer added after train() must also start in training mode"
+        );
     }
 
     #[test]

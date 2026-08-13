@@ -1,25 +1,38 @@
-//! SIMD-Optimized Operations for Model Inference
+//! Array-oriented Operations for Model Inference
 //!
-//! Provides vectorized implementations of common operations used in SSMs:
+//! Provides `Array1`/`Array2`-oriented implementations of common operations
+//! used in SSMs:
 //! - Element-wise arithmetic (add, mul, fused multiply-add)
 //! - State update kernels
 //! - Activation functions (SiLU, Swish, etc.)
 //!
 //! # Performance
 //!
-//! These operations are optimized for modern CPUs with SIMD support.
-//! Falls back to scalar operations when SIMD is not available.
+//! These are auto-vectorization-friendly scalar kernels: element-wise
+//! functions are written as `ndarray::Zip::for_each` loops (which the
+//! compiler can often auto-vectorize) rather than hand-written SIMD
+//! intrinsics. There is no explicit `std::simd`/`std::arch` code in this
+//! module and no runtime CPU-feature dispatch.
+//!
+//! This crate's actual explicit-SIMD kernels (with real AVX-512/AVX2/NEON
+//! runtime dispatch) live in [`kizzasi_core::simd`] — see that module for a
+//! `dot_product`/`matvec`/`ssm_state_update` with genuine per-architecture
+//! vector code. Prefer those in a new hot path; the kernels here exist for
+//! callers that want a convenient `Array1`-returning (rather than
+//! `&mut [f32]`-writing) signature.
 //!
 //! # Design
 //!
-//! Uses portable SIMD via scirs2-core when available, with scalar fallbacks.
+//! Every function here is a plain, portable scalar implementation over
+//! `scirs2_core::ndarray` arrays — no `#[cfg]`-gated fallback exists because
+//! there is only one code path.
 
 use scirs2_core::ndarray::{Array1, Array2, Zip};
 
 /// Fused multiply-add: out = a * b + c
 ///
-/// Optimized for element-wise operations on large arrays.
-/// Uses SIMD when available via scirs2-core.
+/// Element-wise `ndarray::Zip::for_each` loop over large arrays. Not an
+/// explicit-SIMD kernel — see the module docs.
 ///
 /// # Arguments
 ///
@@ -73,7 +86,8 @@ pub fn fused_mul_scalar_add(a: &Array1<f32>, scalar: f32, b: &Array1<f32>) -> Ar
 
 /// Element-wise exponential: `out[i] = exp(a[i])`
 ///
-/// Optimized implementation using vectorized exp when available
+/// A thin `Array1::mapv` wrapper around `f32::exp` — no vectorized `exp` is
+/// implemented here.
 #[inline]
 pub fn exp_array(a: &Array1<f32>) -> Array1<f32> {
     a.mapv(f32::exp)
@@ -87,7 +101,8 @@ pub fn ln_array(a: &Array1<f32>) -> Array1<f32> {
 
 /// SiLU activation: `out[i] = x[i] * sigmoid(x[i])`
 ///
-/// Also known as Swish activation. Uses optimized sigmoid approximation.
+/// Also known as Swish activation. Computes the exact sigmoid formula
+/// (`1 / (1 + exp(-x))`), not an approximation.
 #[inline]
 pub fn silu(x: &Array1<f32>) -> Array1<f32> {
     x.mapv(|v| {
@@ -96,9 +111,10 @@ pub fn silu(x: &Array1<f32>) -> Array1<f32> {
     })
 }
 
-/// Fast sigmoid approximation: 1 / (1 + exp(-x))
+/// Sigmoid: `1 / (1 + exp(-x))`
 ///
-/// Uses optimized implementation for better SIMD performance
+/// The exact formula, computed element-wise via `Array1::mapv` — not a
+/// SIMD kernel or an approximation.
 #[inline]
 pub fn sigmoid(x: &Array1<f32>) -> Array1<f32> {
     x.mapv(|v| 1.0 / (1.0 + (-v).exp()))
@@ -130,7 +146,9 @@ pub fn gelu(x: &Array1<f32>) -> Array1<f32> {
     })
 }
 
-/// Optimized SSM state update kernel
+/// SSM state update kernel (`Array1`-returning; see also
+/// [`kizzasi_core::simd::ssm_state_update`] for the crate's explicit-SIMD,
+/// in-place equivalent)
 ///
 /// Performs the recurrent state update: `h[t] = a * h[t-1] + b * x[t]`
 ///
@@ -170,7 +188,7 @@ pub fn ssm_state_update(
     h_new
 }
 
-/// Optimized diagonal SSM state update with scalar input
+/// Diagonal SSM state update with scalar input
 ///
 /// For models with diagonal state matrices and scalar inputs
 ///
@@ -207,9 +225,17 @@ pub fn diagonal_ssm_update(
     new_state
 }
 
-/// Optimized matrix-vector product with batch processing
+/// Matrix-vector product: y = A * x
 ///
-/// Computes y = A * x for multiple rows efficiently
+/// Row-major traversal (each row is contiguous, matching `Array2`'s default
+/// layout) with a 4-way unrolled accumulator per row so the four partial
+/// sums have no data dependency on each other — a single running
+/// accumulator (`sum = row[j].mul_add(x[j], sum)`) forces the compiler to
+/// serialize every multiply-add in the row, which is exactly what blocks
+/// auto-vectorization / instruction-level parallelism. This mirrors
+/// [`kizzasi_core::simd::dot_product_scalar`]'s accumulator pattern; prefer
+/// [`kizzasi_core::simd::matvec`] in a new hot path for genuine
+/// AVX-512/AVX2/NEON dispatch.
 ///
 /// # Arguments
 ///
@@ -223,19 +249,33 @@ pub fn diagonal_ssm_update(
 pub fn matvec(matrix: &Array2<f32>, vector: &Array1<f32>) -> Array1<f32> {
     let (m, n) = matrix.dim();
     debug_assert_eq!(vector.len(), n);
+    let n = n.min(vector.len());
 
     let mut result = Array1::zeros(m);
 
     for i in 0..m {
         let row = matrix.row(i);
-        let mut sum = 0.0;
+        let chunks = n / 4;
+        let remainder = n % 4;
 
-        // Manual loop for better auto-vectorization
-        for j in 0..n {
-            sum = row[j].mul_add(vector[j], sum);
+        let mut sum0 = 0.0f32;
+        let mut sum1 = 0.0f32;
+        let mut sum2 = 0.0f32;
+        let mut sum3 = 0.0f32;
+
+        let mut j = 0;
+        for _ in 0..chunks {
+            sum0 = row[j].mul_add(vector[j], sum0);
+            sum1 = row[j + 1].mul_add(vector[j + 1], sum1);
+            sum2 = row[j + 2].mul_add(vector[j + 2], sum2);
+            sum3 = row[j + 3].mul_add(vector[j + 3], sum3);
+            j += 4;
+        }
+        for k in 0..remainder {
+            sum0 = row[j + k].mul_add(vector[j + k], sum0);
         }
 
-        result[i] = sum;
+        result[i] = sum0 + sum1 + sum2 + sum3;
     }
 
     result

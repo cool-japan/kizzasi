@@ -47,3 +47,59 @@ fn test_full_coverage_preset_no_struct_update() {
     assert_eq!(c.x, 1);
     assert_eq!(c.y, 2);
 }
+
+// ---------------------------------------------------------------------
+// id185: generic structs (lifetimes and type parameters) are supported.
+// ---------------------------------------------------------------------
+
+#[derive(Preset, Debug, PartialEq)]
+#[preset(name = "named", label = "x")]
+struct WithLifetime<'a> {
+    label: &'a str,
+}
+
+#[test]
+fn test_lifetime_generic_preset() {
+    // Full coverage (the only field is set), so no `Default` bound needed —
+    // `WithLifetime` deliberately does not derive `Default`.
+    let c = WithLifetime::named_preset();
+    assert_eq!(c.label, "x");
+}
+
+/// Deliberately does not implement `Default`, to prove a full-coverage
+/// preset does not force an unnecessary `Self: Default` bound (the
+/// type-parameter case for this same point is exercised at the codegen
+/// level by `full_coverage_preset_on_generic_struct_needs_no_default_bound`
+/// in `src/preset.rs`, since a preset field's value expression cannot itself
+/// be generic over an unconstrained `T`).
+#[derive(Debug, PartialEq)]
+struct NotDefaultValue(i32);
+
+#[derive(Preset, Debug, PartialEq)]
+#[preset(name = "full", value = NotDefaultValue(5))]
+struct FullCoverageNoDefault {
+    value: NotDefaultValue,
+}
+
+#[test]
+fn test_full_coverage_preset_does_not_require_default() {
+    // The point of this test is that it compiles at all: a full-coverage
+    // preset must not force a `Self: Default` bound the way an unconditional
+    // one would — `FullCoverageNoDefault` never derives `Default`.
+    let c = FullCoverageNoDefault::full_preset();
+    assert_eq!(c.value, NotDefaultValue(5));
+}
+
+#[derive(Preset, Default, Debug, PartialEq)]
+#[preset(name = "partial", value = 5_i32)]
+struct WithTypeParamPartialCoverage<T> {
+    value: i32,
+    extra: T,
+}
+
+#[test]
+fn test_type_param_partial_coverage_preset_uses_default_for_rest() {
+    let c = WithTypeParamPartialCoverage::<u8>::partial_preset();
+    assert_eq!(c.value, 5);
+    assert_eq!(c.extra, 0u8);
+}

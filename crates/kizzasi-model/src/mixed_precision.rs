@@ -282,6 +282,29 @@ impl GradientScaler {
         }
     }
 
+    /// Create a gradient scaler with a custom initial loss scale, keeping
+    /// the default growth/backoff schedule.
+    pub fn with_initial_scale(initial_scale: f32) -> Self {
+        Self {
+            scale: initial_scale,
+            ..Self::new()
+        }
+    }
+
+    /// Build a scaler from a [`MixedPrecisionConfig`], honouring
+    /// `use_gradient_scaling` and `loss_scale`.
+    ///
+    /// Returns `None` when `config.use_gradient_scaling` is `false` — the
+    /// caller should then skip scaling entirely rather than construct a
+    /// scaler whose `scale` factor is never meant to be applied.
+    pub fn from_config(config: &MixedPrecisionConfig) -> Option<Self> {
+        if config.use_gradient_scaling {
+            Some(Self::with_initial_scale(config.loss_scale))
+        } else {
+            None
+        }
+    }
+
     /// Get current scale
     pub fn get_scale(&self) -> f32 {
         self.scale
@@ -463,6 +486,29 @@ mod tests {
 
         // Update without overflow
         scaler.update(false);
+    }
+
+    #[test]
+    fn test_gradient_scaler_from_config_honours_use_gradient_scaling() {
+        // Disabled: `from_config` must return `None`, not a scaler whose
+        // factor is silently never applied.
+        let disabled = MixedPrecisionConfig {
+            mode: PrecisionMode::FP32,
+            use_gradient_scaling: false,
+            loss_scale: 4096.0,
+        };
+        assert!(GradientScaler::from_config(&disabled).is_none());
+
+        // Enabled: the scaler must actually start from `loss_scale`, not the
+        // struct's own hardcoded default.
+        let enabled = MixedPrecisionConfig {
+            mode: PrecisionMode::FP32,
+            use_gradient_scaling: true,
+            loss_scale: 4096.0,
+        };
+        let scaler =
+            GradientScaler::from_config(&enabled).expect("scaling is enabled in this config");
+        assert!((scaler.get_scale() - 4096.0).abs() < 1e-6);
     }
 
     #[test]

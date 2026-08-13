@@ -9,6 +9,11 @@ description = "no_std SSM inference for embedded/edge devices"
 keywords = ["embedded", "no-std", "ssm", "mamba", "signal"]
 categories = ["embedded", "no-std"]
 readme = "README.md"
+# Not published to crates.io: this crate ships inside the kizzasi repository
+# and is consumed as a path dependency. Its API is still being shaped around
+# real bare-metal targets (allocator-free slice kernels, Q16.16 recurrence),
+# so it is deliberately kept out of the semver-stable release set for now.
+# Consumers add it as `kizzasi-embedded = { path = "crates/kizzasi-embedded" }`.
 publish = false
 
 [features]
@@ -19,10 +24,11 @@ std = ["alloc"]
 alloc = []
 # `libm` provides f32 math shims (sqrt, round, ...) for `no_std` targets.
 libm = ["dep:libm"]
-# `fixed-point` enables Q16.16 fixed-point arithmetic.
+# `fixed-point` enables Q16.16 fixed-point arithmetic and the fully integer
+# SSM recurrence in `ssm_fixed`.
 fixed-point = []
 
 [dependencies]
-libm = { version = "0.2", optional = true }
-
-[dev-dependencies]
+# Pure-Rust `no_std` float math shims (musl libm port); version pinned in
+# [workspace.dependencies] at the repo root.
+libm = { workspace = true, optional = true }

@@ -159,6 +159,156 @@ pub enum BoundType {
     InRange(f32, f32),
 }
 
+/// A numeric interval derived from a single [`BoundType`]: the (possibly
+/// open, possibly one-sided) endpoints implied by that bound, ignoring any
+/// `dimension` tag.
+///
+/// Used for exact (non-sampling) feasibility and dependency analysis in
+/// [`crate::constraint_analysis`], and to validate a bound at construction
+/// time in [`ConstraintBuilder::build`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BoundInterval {
+    pub(crate) lo: f32,
+    pub(crate) lo_inclusive: bool,
+    pub(crate) hi: f32,
+    pub(crate) hi_inclusive: bool,
+}
+
+impl BoundInterval {
+    pub(crate) const UNBOUNDED: Self = Self {
+        lo: f32::NEG_INFINITY,
+        lo_inclusive: false,
+        hi: f32::INFINITY,
+        hi_inclusive: false,
+    };
+
+    /// True when no real number satisfies both endpoints.
+    pub(crate) fn is_empty(&self) -> bool {
+        if self.lo > self.hi {
+            return true;
+        }
+        if self.lo == self.hi {
+            return !(self.lo_inclusive && self.hi_inclusive);
+        }
+        false
+    }
+
+    /// Intersection of two intervals: the tighter bound wins on each side;
+    /// on a tie, the side is inclusive only if both operands are.
+    pub(crate) fn intersect(&self, other: &Self) -> Self {
+        let (lo, lo_inclusive) = match self.lo.partial_cmp(&other.lo) {
+            Some(std::cmp::Ordering::Greater) => (self.lo, self.lo_inclusive),
+            Some(std::cmp::Ordering::Less) => (other.lo, other.lo_inclusive),
+            _ => (self.lo, self.lo_inclusive && other.lo_inclusive),
+        };
+        let (hi, hi_inclusive) = match self.hi.partial_cmp(&other.hi) {
+            Some(std::cmp::Ordering::Less) => (self.hi, self.hi_inclusive),
+            Some(std::cmp::Ordering::Greater) => (other.hi, other.hi_inclusive),
+            _ => (self.hi, self.hi_inclusive && other.hi_inclusive),
+        };
+        Self {
+            lo,
+            lo_inclusive,
+            hi,
+            hi_inclusive,
+        }
+    }
+
+    /// A representative point comfortably inside the interval, or `None`
+    /// when the interval is empty. Uses a magnitude-scaled step off an
+    /// open/one-sided endpoint instead of a fixed offset, avoiding the
+    /// "epsilon rounds back to the bound itself" failure this module's
+    /// `project` had (see `Constraint::project`).
+    pub(crate) fn witness(&self) -> Option<f32> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(match (self.lo.is_finite(), self.hi.is_finite()) {
+            (true, true) => {
+                if self.lo >= self.hi {
+                    self.lo
+                } else {
+                    0.5 * (self.lo + self.hi)
+                }
+            }
+            (true, false) => self.lo + (self.lo.abs() * 1e-3).max(1.0),
+            (false, true) => self.hi - (self.hi.abs() * 1e-3).max(1.0),
+            (false, false) => 0.0,
+        })
+    }
+}
+
+impl BoundType {
+    /// The feasible interval implied by this bound (see [`BoundInterval`]).
+    pub(crate) fn interval(&self) -> BoundInterval {
+        match self {
+            BoundType::LessThan(b) => BoundInterval {
+                hi: *b,
+                hi_inclusive: false,
+                ..BoundInterval::UNBOUNDED
+            },
+            BoundType::LessEq(b) => BoundInterval {
+                hi: *b,
+                hi_inclusive: true,
+                ..BoundInterval::UNBOUNDED
+            },
+            BoundType::GreaterThan(b) => BoundInterval {
+                lo: *b,
+                lo_inclusive: false,
+                ..BoundInterval::UNBOUNDED
+            },
+            BoundType::GreaterEq(b) => BoundInterval {
+                lo: *b,
+                lo_inclusive: true,
+                ..BoundInterval::UNBOUNDED
+            },
+            BoundType::Equal(target, tol) => BoundInterval {
+                lo: target - tol,
+                lo_inclusive: true,
+                hi: target + tol,
+                hi_inclusive: true,
+            },
+            BoundType::InRange(lo, hi) => BoundInterval {
+                lo: *lo,
+                lo_inclusive: true,
+                hi: *hi,
+                hi_inclusive: true,
+            },
+        }
+    }
+}
+
+/// Validate that `bound` is well-formed: every numeric field is finite, any
+/// tolerance is non-negative, and the implied interval is non-empty.
+///
+/// Without this check e.g. `ConstraintBuilder::new().name("x").in_range(5.0,
+/// 1.0).build()` used to succeed and only fail later — and not with a
+/// recoverable error, but a panic inside `f32::clamp` the first time
+/// `Constraint::project` ran (`clamp` asserts `min <= max`). A NaN bound is
+/// even quieter: every `check`/`violation` call silently disagrees with a
+/// human's expectation without ever erroring.
+fn validate_bound(bound: &BoundType) -> LogicResult<()> {
+    let all_finite = match bound {
+        BoundType::LessThan(b)
+        | BoundType::LessEq(b)
+        | BoundType::GreaterThan(b)
+        | BoundType::GreaterEq(b) => b.is_finite(),
+        BoundType::Equal(target, tol) => target.is_finite() && tol.is_finite() && *tol >= 0.0,
+        BoundType::InRange(lo, hi) => lo.is_finite() && hi.is_finite(),
+    };
+    if !all_finite {
+        return Err(LogicError::InvalidConstraint(format!(
+            "bound has a non-finite value or a negative tolerance: {bound:?}"
+        )));
+    }
+    if bound.interval().is_empty() {
+        return Err(LogicError::InvalidConstraint(format!(
+            "bound describes an empty feasible region: {bound:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// A single constraint on signal values
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Constraint {
@@ -200,14 +350,39 @@ impl Constraint {
     }
 
     /// Project a value onto the valid region
+    ///
+    /// For strict bounds (`LessThan`/`GreaterThan`) the projected value is
+    /// nudged by exactly one representable `f32` step using
+    /// [`f32::next_down`]/[`f32::next_up`], not a fixed `f32::EPSILON`
+    /// offset. `f32::EPSILON` is the gap between `1.0` and the next
+    /// representable float; once a bound's own ULP exceeds that (any
+    /// `|b| >= 2.0`), `b - f32::EPSILON` rounds back to exactly `b`, so the
+    /// projected point would still fail `Constraint::check`. `next_down`/
+    /// `next_up` compute the true adjacent representable value regardless of
+    /// magnitude, and pass NaN/±∞ through unchanged rather than panicking,
+    /// so a bound built from untrusted data (`BoundType` derives
+    /// `Deserialize` and so bypasses `ConstraintBuilder`'s validation) can
+    /// never make this function panic.
     pub fn project(&self, value: f32) -> f32 {
         match &self.bound {
-            BoundType::LessThan(b) => value.min(*b - f32::EPSILON),
+            BoundType::LessThan(b) => value.min(b.next_down()),
             BoundType::LessEq(b) => value.min(*b),
-            BoundType::GreaterThan(b) => value.max(*b + f32::EPSILON),
+            BoundType::GreaterThan(b) => value.max(b.next_up()),
             BoundType::GreaterEq(b) => value.max(*b),
             BoundType::Equal(target, _) => *target,
-            BoundType::InRange(lo, hi) => value.clamp(*lo, *hi),
+            BoundType::InRange(lo, hi) => {
+                // `f32::clamp` panics if `lo > hi` or either is NaN.
+                // `ConstraintBuilder::build` rejects that combination, but
+                // `BoundType` itself derives `Deserialize` and can still
+                // reach here with a degenerate range from untrusted data;
+                // there is no meaningful region to project onto in that
+                // case, so return `value` unchanged rather than panicking.
+                if lo.is_finite() && hi.is_finite() && lo <= hi {
+                    value.clamp(*lo, *hi)
+                } else {
+                    value
+                }
+            }
         }
     }
 
@@ -647,6 +822,7 @@ impl ConstraintBuilder {
         let bound = self
             .bound
             .ok_or_else(|| LogicError::InvalidConstraint("bound is required".into()))?;
+        validate_bound(&bound)?;
 
         Ok(Constraint {
             name,
@@ -654,5 +830,167 @@ impl ConstraintBuilder {
             bound,
             weight: self.weight,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (finding 124): `Constraint::project` on a strict bound
+    /// must return a point `Constraint::check` actually accepts. The old
+    /// `b - f32::EPSILON` / `b + f32::EPSILON` nudge silently became a no-op
+    /// once `b`'s own ULP exceeded `f32::EPSILON` (any `|b| >= 2.0`).
+    #[test]
+    fn test_project_strict_bound_is_accepted_by_check() {
+        let bounds = [
+            1e-3_f32, 1.0, 2.0, 10.0, 1e3, 1e6, 1e9, -1e-3, -1.0, -10.0, -1e6, -1e9,
+        ];
+        for &b in &bounds {
+            let lt = ConstraintBuilder::new()
+                .name("lt")
+                .less_than(b)
+                .build()
+                .expect("valid less_than bound");
+            let projected = lt.project(b + 5.0);
+            assert!(
+                lt.check(projected),
+                "project(b+5)={projected} not accepted by check() for LessThan({b})"
+            );
+            assert!(
+                projected < b,
+                "projected {projected} should stay below bound {b}"
+            );
+
+            let gt = ConstraintBuilder::new()
+                .name("gt")
+                .greater_than(b)
+                .build()
+                .expect("valid greater_than bound");
+            let projected = gt.project(b - 5.0);
+            assert!(
+                gt.check(projected),
+                "project(b-5)={projected} not accepted by check() for GreaterThan({b})"
+            );
+            assert!(
+                projected > b,
+                "projected {projected} should stay above bound {b}"
+            );
+        }
+    }
+
+    /// `project` must not panic even on a non-finite bound smuggled in past
+    /// the builder (`BoundType` derives `Deserialize`, so a serde round trip
+    /// can construct one directly).
+    #[test]
+    fn test_project_does_not_panic_on_nonfinite_bound() {
+        for &b in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let lt = Constraint {
+                name: "lt".to_string(),
+                dimension: None,
+                bound: BoundType::LessThan(b),
+                weight: 1.0,
+            };
+            let _ = lt.project(0.0); // must return, not panic
+
+            let gt = Constraint {
+                name: "gt".to_string(),
+                dimension: None,
+                bound: BoundType::GreaterThan(b),
+                weight: 1.0,
+            };
+            let _ = gt.project(0.0);
+
+            let range = Constraint {
+                name: "range".to_string(),
+                dimension: None,
+                bound: BoundType::InRange(b, b),
+                weight: 1.0,
+            };
+            let _ = range.project(0.0);
+        }
+    }
+
+    /// Regression (finding 136): an inverted range must be rejected at
+    /// `build()` time, not accepted and then panic later inside
+    /// `Constraint::project`'s `f32::clamp` call.
+    #[test]
+    fn test_build_rejects_inverted_range() {
+        let err = ConstraintBuilder::new()
+            .name("bad")
+            .in_range(5.0, 1.0)
+            .build();
+        assert!(matches!(err, Err(LogicError::InvalidConstraint(_))));
+    }
+
+    #[test]
+    fn test_build_rejects_negative_tolerance() {
+        let err = ConstraintBuilder::new()
+            .name("bad")
+            .equal(0.0, -1.0)
+            .build();
+        assert!(matches!(err, Err(LogicError::InvalidConstraint(_))));
+    }
+
+    #[test]
+    fn test_build_rejects_nan_bound() {
+        let err = ConstraintBuilder::new()
+            .name("bad")
+            .less_than(f32::NAN)
+            .build();
+        assert!(matches!(err, Err(LogicError::InvalidConstraint(_))));
+
+        let err = ConstraintBuilder::new()
+            .name("bad")
+            .in_range(f32::NAN, 1.0)
+            .build();
+        assert!(matches!(err, Err(LogicError::InvalidConstraint(_))));
+
+        let err = ConstraintBuilder::new()
+            .name("bad")
+            .equal(f32::NAN, 1.0)
+            .build();
+        assert!(matches!(err, Err(LogicError::InvalidConstraint(_))));
+    }
+
+    #[test]
+    fn test_build_rejects_infinite_bound() {
+        let err = ConstraintBuilder::new()
+            .name("bad")
+            .less_than(f32::INFINITY)
+            .build();
+        assert!(matches!(err, Err(LogicError::InvalidConstraint(_))));
+
+        let err = ConstraintBuilder::new()
+            .name("bad")
+            .in_range(f32::NEG_INFINITY, 1.0)
+            .build();
+        assert!(matches!(err, Err(LogicError::InvalidConstraint(_))));
+    }
+
+    #[test]
+    fn test_build_accepts_valid_bounds() {
+        assert!(ConstraintBuilder::new()
+            .name("ok")
+            .in_range(1.0, 5.0)
+            .build()
+            .is_ok());
+        // A zero-tolerance equality is a valid single-point interval.
+        assert!(ConstraintBuilder::new()
+            .name("ok")
+            .equal(2.0, 0.0)
+            .build()
+            .is_ok());
+        assert!(ConstraintBuilder::new()
+            .name("ok")
+            .less_than(10.0)
+            .build()
+            .is_ok());
+        // A degenerate but *closed* single-point range remains valid.
+        assert!(ConstraintBuilder::new()
+            .name("ok")
+            .in_range(3.0, 3.0)
+            .build()
+            .is_ok());
     }
 }

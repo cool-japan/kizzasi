@@ -14,23 +14,82 @@ documentation = "https://docs.rs/kizzasi-io"
 homepage = "https://github.com/cool-japan/kizzasi"
 
 [features]
-default = ["std", "mqtt", "audio"]
+# Only std/mqtt are on by default; everything else below is opt-in and its
+# module (and re-exported types) does not exist in the crate without the
+# matching feature. See README.md's "Cargo Feature Flags" table for the full
+# default/opt-in breakdown and which types each feature enables.
+default = ["std", "mqtt"]
 std = []
-# GPU features (optional - propagate to kizzasi-core)
-cuda = ["kizzasi-core/cuda"]
+# GPU acceleration (optional, off by default). Forwards candle's Metal
+# backend through `kizzasi-core/metal`, which is live on Apple targets and
+# inert -- but still buildable -- everywhere else, so `--all-features` works on
+# every host; the `kizzasi-metal` crate explains how that target gating is
+# done. There is no `cuda` counterpart -- see kizzasi-core's `[features]` for
+# why a CUDA flag cannot be offered without breaking every non-CUDA build.
 metal = ["kizzasi-core/metal"]
-# IO features
-mqtt = ["dep:rumqttc"]
-audio = ["dep:cpal", "dep:hound"]
+
+# --- Pure-Rust integrations -------------------------------------------------
+# Nothing below compiles or links C/C++/Fortran, so the default build (and any
+# combination of these) satisfies the Pure Rust policy.
+mqtt = ["dep:rumqttc"] # default-on: MQTT over plain TCP (TLS is `mqtt-tls`)
+# `mqtt-tls`: TLS transport for the MQTT client. No C is compiled: rustls's
+#   `ClientConfig` is built explicitly (see `mqtt.rs`) with the pure-Rust
+#   RustCrypto crypto provider (`oxitls-rustcrypto-provider`) injected
+#   directly, instead of resolving rustls's process-global default provider
+#   (which would otherwise be aws-lc-rs / `aws-lc-sys`, a C library).
+#   rumqttc's `use-rustls-no-provider` feature does hard-include
+#   `rustls-native-certs`, which on Apple/Windows links the OS
+#   certificate-store framework (Security.framework / schannel) -- that is a
+#   link against an OS-provided library, not a C compilation, and kizzasi
+#   itself never calls `load_native_certs`.
+mqtt-tls = ["mqtt", "rumqttc/use-rustls-no-provider", "dep:rustls", "dep:rustls-pki-types", "dep:oxitls-rustcrypto-provider"]
 websocket = ["dep:tokio-tungstenite"]
 serial = ["dep:tokio-serial"]
-file = ["dep:csv", "dep:hdf5", "dep:hound"]
+# WAV (hound) + CSV readers/writers. HDF5 used to live here; it moved to its
+# own `hdf5` feature so that `file` stays pure Rust.
+file = ["dep:csv", "dep:hound"]
+# HDF5 dataset I/O via OxiH5 (pure Rust -- no libhdf5 install). Formerly bound
+# the libhdf5 C library through the `hdf5` crate; it stays a separate feature
+# (rather than folding into `file`) only because HDF5 support is optional.
+hdf5 = ["file", "dep:oxih5"]
 network = []
 osc = ["dep:rosc"]
-zeromq = ["dep:tmq"]
-ros2 = ["dep:r2r"]
-video = ["dep:ffmpeg-next"]
+zeromq = ["dep:zeromq"]
+ros2 = ["dep:ros2-client"]
 simd = ["scirs2-core/simd"]
+# `video-pure`: pure-Rust video backend (the OxiMedia stack). Decodes Y4M
+#   (YUV4MPEG2) files and captures from a camera end to end --
+#   `oximedia-container` demuxes Y4M, `oximedia-capture` drives the platform
+#   capture API (AVFoundation / V4L2 / Media Foundation), `oximedia-codec`'s
+#   MJPEG decoder handles compressed camera frames, `oximedia-simd` converts
+#   packed 4:2:2 rows, `oximedia-core` converts YUV/gray to the configured
+#   `PixelFormat` and `oximedia-cv` rescales -- with behaviour identical to
+#   the `video` (FFmpeg) backend for the same source. Network streams, the
+#   one thing still missing, return an honest `Err`. `Auto` routes Y4M files
+#   here, and cameras too on a platform whose capture backend
+#   `oximedia-capture` actually implements.
+video-pure = [
+    "dep:oximedia-core",
+    "dep:oximedia-container",
+    "dep:oximedia-cv",
+    "dep:oximedia-codec",
+    "dep:oximedia-simd",
+    "dep:oximedia-capture",
+    "oximedia-codec/mjpeg",
+]
+
+# --- Impure integrations (NOT pure Rust; each links a C library) ------------
+# All of these are off by default. Enabling any one of them means the build no
+# longer satisfies the Pure Rust policy -- that is the trade the feature name
+# is announcing.
+#
+# `audio`: live capture/playback devices through cpal, which binds the
+#   platform audio API: libasound via `alsa-sys` (a C library) on Linux,
+#   CoreAudio via objc2 on Apple, WASAPI on Windows. Reading and writing WAV
+#   *files* needs no device and stays pure Rust under `file`.
+audio = ["dep:cpal", "dep:hound"]
+# `video`: `ffmpeg-next` binds the FFmpeg C libraries and needs them installed.
+video = ["dep:ffmpeg-next"]
 
 [dependencies]
 # Internal crates
@@ -38,6 +97,10 @@ kizzasi-core.workspace = true
 
 # COOLJAPAN Ecosystem (following KIZZASI_POLICY.md)
 scirs2-core.workspace = true
+# Deterministic symmetric eigendecomposition for FastICA/PCA whitening
+# (replaces an unseeded thread_rng() power iteration with no convergence
+# check). Already declared in [workspace.dependencies] at the repo root.
+scirs2-linalg.workspace = true
 
 # Core dependencies
 thiserror.workspace = true
@@ -50,6 +113,12 @@ async-trait.workspace = true
 
 # IO connectors (optional)
 rumqttc = { workspace = true, optional = true }
+# TLS transport for `mqtt` (optional, feature `mqtt-tls`): pure-Rust rustls +
+# RustCrypto provider, injected explicitly in `mqtt.rs` -- see the
+# `mqtt-tls` feature comment above for why.
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+oxitls-rustcrypto-provider = { workspace = true, optional = true }
 cpal = { workspace = true, optional = true }
 oxifft.workspace = true
 
@@ -60,7 +129,7 @@ tokio-serial = { workspace = true, optional = true }
 # File I/O (optional)
 hound = { workspace = true, optional = true }
 csv = { workspace = true, optional = true }
-hdf5 = { workspace = true, optional = true }
+oxih5 = { workspace = true, optional = true }
 
 # Performance
 crossbeam-queue.workspace = true
@@ -68,20 +137,55 @@ bytes.workspace = true
 
 # Protocol support (optional)
 rosc = { workspace = true, optional = true }
-tmq = { workspace = true, optional = true }
+# Pure-Rust ZMTP implementation (zmq.rs). Replaces `tmq`, which binds to the
+# libzmq C library and therefore violates the Pure Rust policy; it also could
+# not express a persistent per-stream socket.
+zeromq = { workspace = true, optional = true }
+# Pure-Rust ROS2 client on top of RustDDS. Replaces `r2r`, which requires a
+# full ROS2 C/C++ installation (and was therefore unavailable on macOS).
+ros2-client = { workspace = true, optional = true }
 
 # Video support (optional)
 ffmpeg-next = { workspace = true, optional = true }
 
-# Platform-specific dependencies (ROS2 not supported on macOS)
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-r2r = { workspace = true, optional = true }
+# Pure-Rust video (optional)
+oximedia-core = { workspace = true, optional = true }
+oximedia-container = { workspace = true, optional = true }
+oximedia-cv = { workspace = true, optional = true }
+# Pure-Rust camera capture + MJPEG decode + packed-4:2:2 row conversion for
+# the same backend.
+oximedia-codec = { workspace = true, optional = true }
+oximedia-simd = { workspace = true, optional = true }
+oximedia-capture = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
 tokio-tungstenite = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+# `mock`: the deterministic synthetic capture backend the `video-pure` camera
+# tests drive instead of real hardware. A dev-dependency cannot be optional,
+# so this entry is unconditional and every *test* build of this crate compiles
+# `oximedia-capture` -- including a `--features video` (FFmpeg-only) one,
+# where nothing uses it. That costs a small, pure-Rust crate at test time and
+# nothing at all in a library build, which is why it is preferred over
+# duplicating the mock. The tests themselves are `#[cfg(feature =
+# "video-pure")]`, so they simply do not exist in an FFmpeg-only build.
+oximedia-capture = { workspace = true, features = ["mock"] }
 
 [[bench]]
 name = "comprehensive_benchmarks"
 harness = false
+
+# Live-device capture demo: needs the (non-default, C-linking) `audio` feature.
+[[example]]
+name = "audio_processing"
+required-features = ["audio"]
+
+# MQTT broker demo: uses `MqttConfig`/`MqttMessage`/`QosLevel`/`TlsConfig`, all
+# of which only exist with the `mqtt` feature. `mqtt` is on by default, so this
+# was silently fine until someone built with `--no-default-features`; without
+# the gate the example fails to compile there even though nothing about it is
+# broken.
+[[example]]
+name = "mqtt_sensor_monitoring"
+required-features = ["mqtt"]

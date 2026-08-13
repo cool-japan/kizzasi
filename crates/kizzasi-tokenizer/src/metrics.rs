@@ -394,29 +394,45 @@ impl RateDistortionCurve {
             })
     }
 
-    /// Compute BD-rate (Bjøntegaard Delta rate) relative to reference curve
+    /// Mean percentage rate difference at matching SNR points, relative to
+    /// a reference curve.
     ///
-    /// Measures average percentage rate difference for same quality
-    pub fn bd_rate(&self, reference: &RateDistortionCurve) -> f64 {
-        // Simplified BD-rate calculation
-        // In practice, this would use interpolation and integration
-
+    /// This is **not** the Bjøntegaard Delta rate (BD-rate) despite the
+    /// name this method used to have: real BD-rate integrates a
+    /// piecewise-cubic interpolation of `log10(rate)` vs. quality over the
+    /// two curves' overlapping quality interval (Bjøntegaard, VCEG-M33),
+    /// which this crate does not implement. This method instead pairs each
+    /// of `self`'s points with its nearest-SNR point in `reference` (within
+    /// 2 dB) and averages the percentage rate differences — a simpler,
+    /// coarser approximation that is only meaningful when both curves were
+    /// sampled at similar SNR operating points.
+    ///
+    /// Returns `None` when there are no comparable points (either curve is
+    /// empty, or no pair of points falls within 2 dB of each other) —
+    /// distinguishable from `Some(0.0)`, which means the curves were
+    /// genuinely identical at every comparable point.
+    pub fn mean_rate_difference_pct(&self, reference: &RateDistortionCurve) -> Option<f64> {
         let self_points = self.points();
         let ref_points = reference.points();
 
         if self_points.is_empty() || ref_points.is_empty() {
-            return 0.0;
+            return None;
         }
 
-        // Average rate difference at matching SNR points
+        // Average rate difference at matching SNR points.
         let mut rate_diffs = Vec::new();
 
         for self_point in &self_points {
-            if let Some(ref_point) = ref_points
-                .iter()
-                .min_by_key(|p| ((p.snr_db - self_point.snr_db).abs() * 1000.0) as i32)
-            {
-                if (ref_point.snr_db - self_point.snr_db).abs() < 2.0 {
+            // `partial_cmp`/`f32::abs` are always finite here (SNR values
+            // come from `10*log10(...)` of a non-negative ratio elsewhere in
+            // this module), so `unwrap_or(Equal)` never masks a NaN.
+            if let Some(ref_point) = ref_points.iter().min_by(|a, b| {
+                (a.snr_db - self_point.snr_db)
+                    .abs()
+                    .partial_cmp(&(b.snr_db - self_point.snr_db).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                if (ref_point.snr_db - self_point.snr_db).abs() < 2.0 && ref_point.rate != 0.0 {
                     let rate_diff = (self_point.rate - ref_point.rate) / ref_point.rate * 100.0;
                     rate_diffs.push(rate_diff);
                 }
@@ -424,9 +440,9 @@ impl RateDistortionCurve {
         }
 
         if rate_diffs.is_empty() {
-            0.0
+            None
         } else {
-            rate_diffs.iter().sum::<f64>() / rate_diffs.len() as f64
+            Some(rate_diffs.iter().sum::<f64>() / rate_diffs.len() as f64)
         }
     }
 }
@@ -732,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bd_rate() {
+    fn test_mean_rate_difference_pct() {
         let mut curve1 = RateDistortionCurve::new();
         curve1.add_point(1.0, 0.1, 20.0);
         curve1.add_point(2.0, 0.05, 25.0);
@@ -741,8 +757,50 @@ mod tests {
         curve2.add_point(1.5, 0.1, 20.0);
         curve2.add_point(2.5, 0.05, 25.0);
 
-        let bd = curve2.bd_rate(&curve1);
-        assert!(bd > 0.0); // curve2 uses more rate
+        let diff = curve2
+            .mean_rate_difference_pct(&curve1)
+            .expect("points within 2 dB must be comparable");
+        assert!(diff > 0.0); // curve2 uses more rate
+    }
+
+    /// Regression: no comparable points (SNRs more than 2 dB apart) must
+    /// return `None`, distinguishable from `Some(0.0)` ("identical rate").
+    #[test]
+    fn test_mean_rate_difference_pct_none_when_no_comparable_points() {
+        let mut curve1 = RateDistortionCurve::new();
+        curve1.add_point(1.0, 0.1, 10.0);
+
+        let mut curve2 = RateDistortionCurve::new();
+        curve2.add_point(1.0, 0.1, 50.0); // 40 dB away — not comparable
+
+        assert_eq!(curve2.mean_rate_difference_pct(&curve1), None);
+    }
+
+    /// Regression: empty curves must return `None`, not `Some(0.0)`.
+    #[test]
+    fn test_mean_rate_difference_pct_none_when_empty() {
+        let empty = RateDistortionCurve::new();
+        let mut other = RateDistortionCurve::new();
+        other.add_point(1.0, 0.1, 20.0);
+
+        assert_eq!(empty.mean_rate_difference_pct(&other), None);
+        assert_eq!(other.mean_rate_difference_pct(&empty), None);
+    }
+
+    /// Regression: a reference point with `rate == 0.0` used to divide by
+    /// zero (producing inf/NaN silently folded into the average); it must
+    /// now be skipped instead.
+    #[test]
+    fn test_mean_rate_difference_pct_skips_zero_rate_reference() {
+        let mut curve1 = RateDistortionCurve::new();
+        curve1.add_point(0.0, 0.1, 20.0); // rate == 0.0
+
+        let mut curve2 = RateDistortionCurve::new();
+        curve2.add_point(1.5, 0.1, 20.0);
+
+        // The only reference point has rate == 0.0, so there is nothing
+        // comparable left after the guard — must be None, not NaN/inf.
+        assert_eq!(curve2.mean_rate_difference_pct(&curve1), None);
     }
 
     // --- A-weighting and spectral weighted SNR tests ---

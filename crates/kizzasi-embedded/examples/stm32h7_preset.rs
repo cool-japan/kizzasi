@@ -31,9 +31,11 @@ fn main() {
     let mut state = SsmState::new(&config);
 
     // Synthetic SSM diagonals sized to the preset's `d_state = 16`.
+    // `a_log` follows the checkpoint convention `A = -exp(a_log)`, i.e. the
+    // HiPPO initialisation `a_log[n] = ln(n + 1)` used by `kizzasi-model`.
     let d_state = config.d_state;
     let x: alloc::vec::Vec<f32> = (0..d_state).map(|i| 0.01_f32 * i as f32).collect();
-    let a_log: alloc::vec::Vec<f32> = (0..d_state).map(|i| -0.5 - 0.1 * i as f32).collect();
+    let a_log: alloc::vec::Vec<f32> = (0..d_state).map(|n| ((n + 1) as f32).ln()).collect();
     let b: alloc::vec::Vec<f32> = (0..d_state).map(|_| 0.30_f32).collect();
     let c: alloc::vec::Vec<f32> = (0..d_state).map(|i| 0.5 + 0.05 * i as f32).collect();
 

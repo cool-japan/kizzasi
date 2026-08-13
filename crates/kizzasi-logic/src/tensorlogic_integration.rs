@@ -420,15 +420,115 @@ impl ConstraintSynthesizer {
         }
     }
 
-    fn synthesize_linear(&self, _examples: &[(Vec<f32>, bool)]) -> LogicResult<TLExpr> {
-        let var_name = self
-            .variables
-            .first()
-            .ok_or_else(|| LogicError::InvalidConstraint("No variables defined".into()))?;
-        Ok(TLExpr::Lte(
-            Box::new(tl_var(var_name)),
-            Box::new(tl_const(10.0)),
-        ))
+    /// Fit a real linear separator `Σᵢ wᵢ·xᵢ <= b` from the labeled
+    /// examples: `w` is the (unit-normalized) difference `neg_centroid -
+    /// pos_centroid` — the centroid construction is the same idea as
+    /// [`ConstraintLearner::learn_linear_separator`], but pointed the
+    /// opposite way, since a `Lte` decision rule needs the accepted
+    /// (positive) side to have the *smaller* `w·x` — and `b` is the largest
+    /// `w·x` over the positive examples plus a 10% margin (matching the box
+    /// synthesizer's own margin convention below), so every positive
+    /// example satisfies the synthesized constraint.
+    ///
+    /// Uses every variable in `self.variables`, not just the first — a
+    /// synthesizer built with 3 variables previously emitted a 1-D
+    /// constraint over the first one only.
+    fn synthesize_linear(&self, examples: &[(Vec<f32>, bool)]) -> LogicResult<TLExpr> {
+        if self.variables.is_empty() {
+            return Err(LogicError::InvalidConstraint("No variables defined".into()));
+        }
+        let dim = self.variables.len();
+
+        let positives: Vec<&Vec<f32>> = examples
+            .iter()
+            .filter(|(_, sat)| *sat)
+            .map(|(v, _)| v)
+            .collect();
+        let negatives: Vec<&Vec<f32>> = examples
+            .iter()
+            .filter(|(_, sat)| !*sat)
+            .map(|(v, _)| v)
+            .collect();
+        if positives.is_empty() || negatives.is_empty() {
+            return Err(LogicError::InvalidConstraint(
+                "linear synthesis needs both positive and negative examples to fit a separator"
+                    .into(),
+            ));
+        }
+
+        let centroid = |examples: &[&Vec<f32>]| -> Vec<f32> {
+            let mut sum = vec![0.0f32; dim];
+            for example in examples {
+                for (i, slot) in sum.iter_mut().enumerate() {
+                    *slot += example.get(i).copied().unwrap_or(0.0);
+                }
+            }
+            let n = examples.len() as f32;
+            sum.iter().map(|&s| s / n).collect()
+        };
+        let pos_centroid = centroid(&positives);
+        let neg_centroid = centroid(&negatives);
+
+        // Points *away* from the positive centroid (toward the negative
+        // one) — the opposite of `ConstraintLearner::learn_linear_separator`'s
+        // convention. That matters here because the synthesized expression
+        // is `Lte(w·x, b)`: for that to *accept* the positive examples (low
+        // `w·x`) and *reject* the negative ones (high `w·x`), `w` must
+        // decrease from the negative cluster to the positive one. Using
+        // `pos_centroid - neg_centroid` instead would point toward the
+        // positives, making them the *high*-`w·x` side — and since `b` is
+        // then pinned just above the positive cluster, points on the near
+        // (negative) side, including the origin, would trivially also
+        // satisfy `w·x <= b` and be wrongly accepted.
+        let mut normal: Vec<f32> = neg_centroid
+            .iter()
+            .zip(pos_centroid.iter())
+            .map(|(&n, &p)| n - p)
+            .collect();
+        let norm: f32 = normal.iter().map(|&w| w * w).sum::<f32>().sqrt();
+        if norm < 1e-6 {
+            return Err(LogicError::InvalidConstraint(
+                "cannot separate examples: positive and negative centroids coincide".into(),
+            ));
+        }
+        for w in &mut normal {
+            *w /= norm;
+        }
+
+        let dot = |x: &[f32]| -> f32 {
+            normal
+                .iter()
+                .enumerate()
+                .map(|(i, &w)| w * x.get(i).copied().unwrap_or(0.0))
+                .sum()
+        };
+        let max_dot = positives
+            .iter()
+            .map(|x| dot(x))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_dot = positives
+            .iter()
+            .map(|x| dot(x))
+            .fold(f32::INFINITY, f32::min);
+        let margin = 0.1 * (max_dot - min_dot).abs().max(1e-3);
+        let b = max_dot + margin;
+
+        let mut sum_expr: Option<TLExpr> = None;
+        for (i, name) in self.variables.iter().enumerate() {
+            let term = TLExpr::Mul(
+                Box::new(tl_const(normal[i])),
+                Box::new(tl_var(name.clone())),
+            );
+            sum_expr = Some(match sum_expr {
+                Some(acc) => TLExpr::Add(Box::new(acc), Box::new(term)),
+                None => term,
+            });
+        }
+        // `dim >= 1` was checked above, so `sum_expr` is always `Some` here.
+        let sum_expr =
+            sum_expr.ok_or_else(|| LogicError::InvalidConstraint("No variables defined".into()))?;
+
+        Ok(TLExpr::Lte(Box::new(sum_expr), Box::new(tl_const(b))))
     }
 
     fn synthesize_box(&self, examples: &[(Vec<f32>, bool)]) -> LogicResult<TLExpr> {
@@ -464,15 +564,52 @@ impl ConstraintSynthesizer {
         Ok(TLExpr::And(Box::new(lower), Box::new(upper)))
     }
 
-    fn synthesize_quadratic(&self, _examples: &[(Vec<f32>, bool)]) -> LogicResult<TLExpr> {
-        let var_name = self
-            .variables
-            .first()
-            .ok_or_else(|| LogicError::InvalidConstraint("No variables defined".into()))?;
-        // Placeholder: x^2 <= 1  (||x||^2 <= 1)
-        let x = tl_var(var_name);
-        let x_sq = TLExpr::Mul(Box::new(x.clone()), Box::new(x));
-        Ok(TLExpr::Lte(Box::new(x_sq), Box::new(tl_const(1.0))))
+    /// Fit an origin-centered quadratic constraint `Σᵢ xᵢ² <= r²` (matching
+    /// [`ConstraintTemplate::Quadratic`]'s documented "x² <= r²" semantics —
+    /// there is no separate learned center) from the positive examples:
+    /// `r²` is the largest `Σᵢ xᵢ²` among them, plus a 10% margin.
+    ///
+    /// Uses every variable in `self.variables`, not just the first.
+    fn synthesize_quadratic(&self, examples: &[(Vec<f32>, bool)]) -> LogicResult<TLExpr> {
+        if self.variables.is_empty() {
+            return Err(LogicError::InvalidConstraint("No variables defined".into()));
+        }
+        let positives: Vec<&Vec<f32>> = examples
+            .iter()
+            .filter(|(_, sat)| *sat)
+            .map(|(v, _)| v)
+            .collect();
+        if positives.is_empty() {
+            return Err(LogicError::InvalidConstraint("No positive examples".into()));
+        }
+
+        let sum_sq = |x: &[f32]| -> f32 {
+            (0..self.variables.len())
+                .map(|i| {
+                    let v = x.get(i).copied().unwrap_or(0.0);
+                    v * v
+                })
+                .sum()
+        };
+        let max_sum_sq = positives
+            .iter()
+            .map(|x| sum_sq(x))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let r_sq = max_sum_sq * 1.1; // 10% margin, matching synthesize_linear/box
+
+        let mut sum_expr: Option<TLExpr> = None;
+        for name in &self.variables {
+            let var = tl_var(name.clone());
+            let term = TLExpr::Mul(Box::new(var.clone()), Box::new(var));
+            sum_expr = Some(match sum_expr {
+                Some(acc) => TLExpr::Add(Box::new(acc), Box::new(term)),
+                None => term,
+            });
+        }
+        let sum_expr =
+            sum_expr.ok_or_else(|| LogicError::InvalidConstraint("No variables defined".into()))?;
+
+        Ok(TLExpr::Lte(Box::new(sum_expr), Box::new(tl_const(r_sq))))
     }
 }
 
@@ -635,6 +772,92 @@ mod tests {
             "x=15 should fail box constraint"
         );
     }
+
+    /// Regression (finding 129): `synthesize_linear` used to ignore its
+    /// examples entirely and always return the hardcoded `x <= 10.0`, which
+    /// rejects data far outside that range. It must now fit a real
+    /// separator that actually accepts the positive examples.
+    #[test]
+    fn test_constraint_synthesis_linear_fits_shifted_data() {
+        let vars = vec!["x".to_string(), "y".to_string()];
+        let synthesizer = ConstraintSynthesizer::new(vars);
+
+        // All positive examples live around (150, 150) — far outside the
+        // old hardcoded `x <= 10.0` — separated from negatives near the origin.
+        let examples = vec![
+            (vec![140.0, 145.0], true),
+            (vec![150.0, 150.0], true),
+            (vec![160.0, 155.0], true),
+            (vec![0.0, 0.0], false),
+            (vec![5.0, -5.0], false),
+        ];
+
+        let expr = synthesizer
+            .synthesize_from_template(ConstraintTemplate::Linear, &examples)
+            .expect("linear synthesis failed");
+
+        for (values, is_positive) in &examples {
+            let eval = TLExprEvaluator::new()
+                .with_binding("x", values[0])
+                .with_binding("y", values[1]);
+            assert_eq!(
+                eval.evaluate_bool(&expr).expect("eval"),
+                *is_positive,
+                "synthesized constraint disagrees with label for {values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_constraint_synthesis_linear_requires_both_classes() {
+        let synthesizer = ConstraintSynthesizer::new(vec!["x".to_string()]);
+        let only_positive = vec![(vec![1.0], true), (vec![2.0], true)];
+        assert!(synthesizer
+            .synthesize_from_template(ConstraintTemplate::Linear, &only_positive)
+            .is_err());
+    }
+
+    /// Regression (finding 129/308): `synthesize_quadratic` used to ignore
+    /// its examples and always return the hardcoded `x^2 <= 1`. It must now
+    /// derive the radius from the data (and use every variable, not just
+    /// the first).
+    #[test]
+    fn test_constraint_synthesis_quadratic_fits_data() {
+        let synthesizer = ConstraintSynthesizer::new(vec!["x".to_string(), "y".to_string()]);
+
+        // Positive examples have norm^2 around 100 — the old hardcoded
+        // `x^2 <= 1` would reject every one of them.
+        let examples = vec![
+            (vec![6.0, 8.0], true),  // norm^2 = 100
+            (vec![10.0, 0.0], true), // norm^2 = 100
+            (vec![0.0, 9.0], true),  // norm^2 = 81
+            (vec![50.0, 50.0], false),
+        ];
+
+        let expr = synthesizer
+            .synthesize_from_template(ConstraintTemplate::Quadratic, &examples)
+            .expect("quadratic synthesis failed");
+
+        for (values, is_positive) in &examples {
+            let eval = TLExprEvaluator::new()
+                .with_binding("x", values[0])
+                .with_binding("y", values[1]);
+            assert_eq!(
+                eval.evaluate_bool(&expr).expect("eval"),
+                *is_positive,
+                "synthesized constraint disagrees with label for {values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_constraint_synthesis_quadratic_requires_positive_examples() {
+        let synthesizer = ConstraintSynthesizer::new(vec!["x".to_string()]);
+        let only_negative = vec![(vec![1.0], false)];
+        assert!(synthesizer
+            .synthesize_from_template(ConstraintTemplate::Quadratic, &only_negative)
+            .is_err());
+    }
 }
 
 #[cfg(test)]
@@ -728,8 +951,11 @@ mod end_to_end_tests {
             .compile(&expr, "agreement", 1)
             .expect("compile failed");
 
-        // Samples away from boundaries to avoid Lt/Gt collapse edge
-        for x in &[-2.0_f32, -0.5, 0.0, 0.5, 2.0] {
+        // Including the exact boundary values -1.0 and 1.0: now that
+        // `Lt`/`Gt` compile to real strict opcodes (finding 130) instead of
+        // collapsing to `Le`/`Ge`, the compiler and evaluator agree at the
+        // boundary too, not just away from it.
+        for x in &[-2.0_f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0] {
             let eval_result = TLExprEvaluator::new()
                 .with_binding("dim_0", *x)
                 .evaluate_bool(&expr)
@@ -744,5 +970,89 @@ mod end_to_end_tests {
                 "evaluator and compiler disagree at x={x}: eval={eval_result}, compiled={compile_result}"
             );
         }
+    }
+
+    /// Regression (finding 130): `TLExpr::Lt`/`Gt` used to lower to
+    /// `ConstraintExpr::Le`/`Ge`, so the compiled form accepted the boundary
+    /// value itself while `TLExprEvaluator` (true `<`/`>`) rejected it.
+    #[test]
+    fn test_lt_gt_strict_boundary_agrees_with_evaluator() {
+        let lt = TLExpr::Lt(Box::new(tl_var("dim_0")), Box::new(tl_const(10.0)));
+        let gt = TLExpr::Gt(Box::new(tl_var("dim_0")), Box::new(tl_const(10.0)));
+
+        let compiler = TlExprCompiler::new();
+        let compiled_lt = compiler.compile(&lt, "lt", 1).expect("compile failed");
+        let compiled_gt = compiler.compile(&gt, "gt", 1).expect("compile failed");
+
+        // At the exact boundary, both `x < 10.0` and `x > 10.0` are false —
+        // under the old `Le`/`Ge` lowering, `x <= 10.0` was (wrongly) true.
+        let x = Array1::from_vec(vec![10.0_f32]);
+        assert!(
+            !compiled_lt.evaluate(&x).expect("evaluate failed"),
+            "compiled Lt must reject the exact boundary, matching TLExprEvaluator's strict <"
+        );
+        assert!(
+            !compiled_gt.evaluate(&x).expect("evaluate failed"),
+            "compiled Gt must reject the exact boundary, matching TLExprEvaluator's strict >"
+        );
+
+        let eval = TLExprEvaluator::new().with_binding("dim_0", 10.0);
+        assert_eq!(
+            eval.evaluate_bool(&lt).expect("evaluator failed"),
+            compiled_lt.evaluate(&x).expect("evaluate failed")
+        );
+        assert_eq!(
+            eval.evaluate_bool(&gt).expect("evaluator failed"),
+            compiled_gt.evaluate(&x).expect("evaluate failed")
+        );
+
+        // Just off the boundary in each direction must still work as before.
+        let below = Array1::from_vec(vec![9.999_f32]);
+        let above = Array1::from_vec(vec![10.001_f32]);
+        assert!(compiled_lt.evaluate(&below).expect("evaluate failed"));
+        assert!(!compiled_lt.evaluate(&above).expect("evaluate failed"));
+        assert!(!compiled_gt.evaluate(&below).expect("evaluate failed"));
+        assert!(compiled_gt.evaluate(&above).expect("evaluate failed"));
+    }
+
+    /// Regression (finding 130): `TLExpr::Eq` used to lower to exact
+    /// bitwise `Le AND Ge`, while `TLExprEvaluator` uses a `1e-6` tolerance
+    /// — so `Eq(x, 1.0)` at `x = 1.0000001` was true under the evaluator
+    /// and false under the compiler. The compiler now uses the same
+    /// tolerance by default.
+    #[test]
+    fn test_eq_tolerance_matches_evaluator_default() {
+        let expr = TLExpr::Eq(Box::new(tl_var("dim_0")), Box::new(tl_const(1.0)));
+        let compiler = TlExprCompiler::new();
+        let compiled = compiler.compile(&expr, "eq", 1).expect("compile failed");
+
+        for &x in &[1.0_f32, 1.0000001, 0.9999999, 1.1, 0.5] {
+            let eval_result = TLExprEvaluator::new()
+                .with_binding("dim_0", x)
+                .evaluate_bool(&expr)
+                .expect("evaluator failed");
+            let compile_result = compiled
+                .evaluate(&Array1::from_vec(vec![x]))
+                .expect("compiled evaluate failed");
+            assert_eq!(
+                eval_result, compile_result,
+                "evaluator and compiler disagree on Eq at x={x}: eval={eval_result}, compiled={compile_result}"
+            );
+        }
+    }
+
+    /// `with_eq_tolerance` must actually change the lowered comparison.
+    #[test]
+    fn test_with_eq_tolerance_widens_the_accepted_band() {
+        let expr = TLExpr::Eq(Box::new(tl_var("dim_0")), Box::new(tl_const(1.0)));
+        let compiler = TlExprCompiler::new().with_eq_tolerance(0.1);
+        let compiled = compiler
+            .compile(&expr, "eq_wide", 1)
+            .expect("compile failed");
+
+        // 0.05 away from the target: within the widened 0.1 tolerance, but
+        // outside the default 1e-6 tolerance used above.
+        let x = Array1::from_vec(vec![1.05_f32]);
+        assert!(compiled.evaluate(&x).expect("evaluate failed"));
     }
 }

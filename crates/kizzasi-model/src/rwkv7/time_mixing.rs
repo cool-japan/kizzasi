@@ -168,7 +168,7 @@ impl Rwkv7TimeMixing {
 
             // output_h = r_h * (state_h @ b_h + a_h * v_h)
             // The bonus attention term `a_h * v_h` provides direct value bypass
-            let state_b = self.matvec_small(head_state, &b_h);
+            let state_b = self.matvec(head_state, &b_h);
             for i in 0..self.head_dim {
                 let val = r_h[i] * (state_b[i] + a_h[i] * v_h[i]);
                 output_heads[lo + i] = val;
@@ -185,22 +185,21 @@ impl Rwkv7TimeMixing {
     }
 
     // Matrix-vector multiply: y = W @ x
+    //
+    // `w.dot(x)` dispatches to ndarray/matrixmultiply with the correct
+    // (row-major) traversal and no per-element `Index` bounds-check
+    // overhead, instead of walking `w[[i, j]]` through ndarray's checked 2D
+    // indexing one scalar at a time. It requires `x.len() == w.ncols()`
+    // exactly (ndarray panics otherwise), which always holds in this
+    // module's call sites (every input here is sized to `hidden_dim`, and
+    // every weight matrix is `(hidden_dim, hidden_dim)`) — the original
+    // clamped loop is kept as a fallback for any case where that invariant
+    // doesn't hold, so a shape mismatch degrades to the old (slower, silently
+    // truncated) behavior instead of panicking.
     fn matvec(&self, w: &Array2<f32>, x: &Array1<f32>) -> Array1<f32> {
-        let rows = w.shape()[0];
-        let cols = w.shape()[1];
-        let xlen = x.len();
-        let mut out = Array1::zeros(rows);
-        for i in 0..rows {
-            let mut sum = 0.0f32;
-            for j in 0..cols.min(xlen) {
-                sum += w[[i, j]] * x[j];
-            }
-            out[i] = sum;
+        if x.len() == w.shape()[1] {
+            return w.dot(x);
         }
-        out
-    }
-
-    fn matvec_small(&self, w: &Array2<f32>, x: &Array1<f32>) -> Array1<f32> {
         let rows = w.shape()[0];
         let cols = w.shape()[1];
         let xlen = x.len();

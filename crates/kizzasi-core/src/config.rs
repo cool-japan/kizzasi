@@ -1,8 +1,5 @@
 //! Configuration types for the SSM engine
 
-#[cfg(not(feature = "std"))]
-use alloc::string::String;
-
 use serde::{Deserialize, Serialize};
 
 /// Type of state space model to use
@@ -31,6 +28,16 @@ pub struct KizzasiConfig {
     output_dim: usize,
     dt_rank: usize,
     weights_path: Option<String>,
+    /// Inner-dimension expansion factor. Only the gated architectures
+    /// (`ModelType::Mamba`) consume it; see [`KizzasiConfig::expansion_factor`].
+    #[serde(default)]
+    expansion_factor: Option<usize>,
+    /// Multi-head head dimension. See [`KizzasiConfig::head_dim`].
+    #[serde(default)]
+    head_dim: Option<usize>,
+    /// Multi-head head count. See [`KizzasiConfig::num_heads`].
+    #[serde(default)]
+    num_heads: Option<usize>,
 }
 
 impl Default for KizzasiConfig {
@@ -45,6 +52,9 @@ impl Default for KizzasiConfig {
             output_dim: 1,
             dt_rank: 8,
             weights_path: None,
+            expansion_factor: None,
+            head_dim: None,
+            num_heads: None,
         }
     }
 }
@@ -97,6 +107,49 @@ impl KizzasiConfig {
         self
     }
 
+    /// Set the rank of the Δ (time-step) projection used by the selective scan.
+    ///
+    /// The selective mechanism produces one Δ per hidden channel from a
+    /// rank-`dt_rank` projection of the layer input. Values are clamped to at
+    /// least 1 — a rank-0 projection would make Δ constant and collapse the
+    /// selectivity.
+    pub fn dt_rank(mut self, rank: usize) -> Self {
+        self.dt_rank = rank.max(1);
+        self
+    }
+
+    /// Set the inner-dimension expansion factor.
+    ///
+    /// Mamba-style blocks expand the model dimension by this factor inside the
+    /// gated branch (`d_inner = expand · d_model`). It is consumed only by the
+    /// architectures that actually have such a branch — the selective-scan
+    /// engine used for [`ModelType::Mamba2`] has none, and constructing that
+    /// engine with an explicit expansion factor is rejected rather than
+    /// silently ignored.
+    pub fn expansion_factor(mut self, factor: usize) -> Self {
+        self.expansion_factor = Some(factor);
+        self
+    }
+
+    /// Set the per-head dimension for multi-head architectures.
+    ///
+    /// Consumed by the multi-head architectures ([`ModelType::Rwkv`]); the
+    /// single-head selective-scan engine rejects it rather than ignoring it.
+    pub fn head_dim(mut self, dim: usize) -> Self {
+        self.head_dim = Some(dim);
+        self
+    }
+
+    /// Set the number of heads for multi-head architectures.
+    ///
+    /// Must divide `hidden_dim`. Consumed by the multi-head architectures
+    /// ([`ModelType::Rwkv`]); the single-head selective-scan engine rejects it
+    /// rather than ignoring it.
+    pub fn num_heads(mut self, heads: usize) -> Self {
+        self.num_heads = Some(heads);
+        self
+    }
+
     /// Load weights from a file path
     pub fn load_weights(mut self, path: &str) -> Self {
         self.weights_path = Some(path.to_string());
@@ -138,5 +191,20 @@ impl KizzasiConfig {
 
     pub fn get_weights_path(&self) -> Option<&str> {
         self.weights_path.as_deref()
+    }
+
+    /// Explicitly configured inner-dimension expansion factor, if any.
+    pub fn get_expansion_factor(&self) -> Option<usize> {
+        self.expansion_factor
+    }
+
+    /// Explicitly configured per-head dimension, if any.
+    pub fn get_head_dim(&self) -> Option<usize> {
+        self.head_dim
+    }
+
+    /// Explicitly configured head count, if any.
+    pub fn get_num_heads(&self) -> Option<usize> {
+        self.num_heads
     }
 }

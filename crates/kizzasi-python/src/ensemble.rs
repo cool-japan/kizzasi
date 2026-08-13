@@ -15,7 +15,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scirs2_numpy::{PyArray1, PyArray2, PyReadonlyArray1, ToPyArray};
+use scirs2_numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1};
 
 use ::kizzasi::ensemble::{EnsemblePredictor, VotingStrategy};
 use ::kizzasi::Kizzasi;
@@ -41,6 +41,23 @@ fn parse_voting(name: &str) -> PyResult<VotingStrategy> {
             other
         ))),
     }
+}
+
+/// Validate an ensemble-model weight: finite and non-negative.
+///
+/// Core only rejects `weight < 0.0` (`kizzasi::ensemble::add_model_with_id`
+/// / `update_weights`), which is `false` for NaN, so `float('nan')`
+/// previously passed straight through. With `voting="weighted"` /
+/// `"weighted_average"` a NaN (or infinite) weight makes the weighted sum
+/// NaN for every output element, with no error raised anywhere.
+fn validate_weight(index: usize, weight: f64) -> PyResult<()> {
+    if !(weight.is_finite() && weight >= 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "weight at index {} must be finite and non-negative, got {}",
+            index, weight
+        )));
+    }
+    Ok(())
 }
 
 /// Return the canonical, lower-case name of a voting strategy.
@@ -105,6 +122,9 @@ impl PyEnsemblePredictor {
         } else {
             vec![1.0_f64; n_models]
         };
+        for (idx, &w) in weights.iter().enumerate() {
+            validate_weight(idx, w)?;
+        }
 
         let core_config = config.to_core_config()?;
         let mut inner = EnsemblePredictor::new(strategy);
@@ -126,6 +146,8 @@ impl PyEnsemblePredictor {
     }
 
     /// Single autoregressive ensemble prediction step.
+    ///
+    /// Runs with the GIL released (`Python::detach`).
     pub fn step<'py>(
         &mut self,
         py: Python<'py>,
@@ -140,14 +162,16 @@ impl PyEnsemblePredictor {
             )));
         }
         let input_arr: Array1<f32> = arr.to_owned();
-        let output = self.inner.predict(&input_arr).map_err(to_py_err)?;
-        Ok(output.to_pyarray(py))
+        let inner = &mut self.inner;
+        let output = py.detach(|| inner.predict(&input_arr)).map_err(to_py_err)?;
+        Ok(output.into_pyarray(py))
     }
 
     /// N-step autoregressive prediction, feeding each output back as next input.
     ///
     /// Requires `input_dim == output_dim`. Returns a `(n_steps, output_dim)`
-    /// float32 ndarray.
+    /// float32 ndarray. The whole autoregressive loop runs with the GIL
+    /// released (`Python::detach`).
     pub fn predict_n<'py>(
         &mut self,
         py: Python<'py>,
@@ -175,14 +199,22 @@ impl PyEnsemblePredictor {
             )));
         }
 
-        let mut current: Array1<f32> = arr.to_owned();
-        let mut out = Array2::<f32>::zeros((n_steps, self.output_dim));
-        for step in 0..n_steps {
-            let pred = self.inner.predict(&current).map_err(to_py_err)?;
-            out.row_mut(step).assign(&pred);
-            current = pred;
-        }
-        Ok(out.to_pyarray(py))
+        let current: Array1<f32> = arr.to_owned();
+        let output_dim = self.output_dim;
+        let inner = &mut self.inner;
+        let out = py
+            .detach(move || {
+                let mut current = current;
+                let mut out = Array2::<f32>::zeros((n_steps, output_dim));
+                for step in 0..n_steps {
+                    let pred = inner.predict(&current)?;
+                    out.row_mut(step).assign(&pred);
+                    current = pred;
+                }
+                Ok::<_, ::kizzasi::KizzasiError>(out)
+            })
+            .map_err(to_py_err)?;
+        Ok(out.into_pyarray(py))
     }
 
     /// Reset all models in the ensemble.
@@ -198,6 +230,7 @@ impl PyEnsemblePredictor {
                 index, self.n_models
             )));
         }
+        validate_weight(index, weight)?;
         self.inner
             .update_weights(&format!("model_{}", index), weight)
             .map_err(to_py_err)?;
@@ -344,33 +377,109 @@ mod tests {
         assert!(ens.is_err());
     }
 
+    // Regression for the test-gap finding: this now genuinely calls the
+    // `#[pymethods]` `predict_n` through `Python::attach` + real
+    // `PyArray2`, instead of hand-looping `.inner.predict` and merely
+    // asserting shapes on the *emulated* logic (which left
+    // `out.row_mut(step).assign(&pred)` and the numpy conversion entirely
+    // untested).
     #[test]
     fn test_ensemble_predict_n_autoregressive() {
-        let cfg = small_cfg();
-        let mut ens = PyEnsemblePredictor::new(&cfg, 2, "average", None).expect("ensemble");
-        let input = Array1::from_vec(vec![0.1_f32, 0.2]);
-        // Use predict() in a loop to verify autoregressive shape behaviour
-        // (since predict_n requires the Python GIL via PyArray2; we just
-        // emulate the inner logic here).
-        let mut current = input.clone();
-        for _ in 0..4 {
-            let pred = ens.inner.predict(&current).expect("predict");
-            assert_eq!(pred.len(), 2);
-            current = pred;
-        }
+        use scirs2_numpy::{PyArray1, PyArrayMethods};
+        Python::initialize();
+        Python::attach(|py| {
+            let cfg = small_cfg();
+            let mut ens = PyEnsemblePredictor::new(&cfg, 2, "average", None).expect("ensemble");
+            let py_arr = PyArray1::from_vec(py, vec![0.1_f32, 0.2]);
+            let out = ens
+                .predict_n(py, py_arr.readonly(), 4)
+                .expect("predict_n via pymethod");
+            let out_ro = out.readonly();
+            let view = out_ro.as_array();
+            assert_eq!(view.shape(), &[4, 2]);
+            for v in view.iter() {
+                assert!(v.is_finite());
+            }
+        });
+    }
+
+    // Regression: previously this test never called `predict_n` at all —
+    // its only assertion was `assert_ne!(ens2.input_dim(), ens2.output_dim())`,
+    // so the actual guard at the top of `predict_n` (`self.input_dim !=
+    // self.output_dim`) had zero coverage. Now it drives the real
+    // `#[pymethods]` call and checks the returned `PyErr`.
+    #[test]
+    fn test_ensemble_predict_n_dim_mismatch_rejected() {
+        use scirs2_numpy::{PyArray1, PyArrayMethods};
+        Python::initialize();
+        Python::attach(|py| {
+            let cfg = PyKizzasiConfig::new(3, 2, 32, 1, 4, 256, "mamba2".to_string());
+            let mut ens = PyEnsemblePredictor::new(&cfg, 1, "average", None).expect("ensemble");
+            assert_ne!(ens.input_dim(), ens.output_dim());
+            let py_arr = PyArray1::from_vec(py, vec![0.1_f32, 0.2, 0.3]);
+            let result = ens.predict_n(py, py_arr.readonly(), 3);
+            assert!(
+                result.is_err(),
+                "predict_n must reject input_dim != output_dim"
+            );
+        });
     }
 
     #[test]
-    fn test_ensemble_predict_n_dim_mismatch_rejected() {
-        // input_dim != output_dim -> predict_n should error before stepping
-        let cfg = PyKizzasiConfig::new(3, 2, 32, 1, 4, 256, "mamba2".to_string());
-        let _ens = PyEnsemblePredictor::new(&cfg, 2, "average", None).expect("ensemble");
-        // We assert via a fresh-state ensemble that the dimensional check
-        // works by inspecting the recorded dims; predict_n itself needs
-        // the GIL, so we only verify the precondition.
-        let cfg2 = PyKizzasiConfig::new(3, 2, 32, 1, 4, 256, "mamba2".to_string());
-        let ens2 = PyEnsemblePredictor::new(&cfg2, 1, "average", None).expect("ensemble");
-        assert_ne!(ens2.input_dim(), ens2.output_dim());
+    fn test_ensemble_step_crosses_pyo3_boundary() {
+        use scirs2_numpy::{PyArray1, PyArrayMethods};
+        Python::initialize();
+        Python::attach(|py| {
+            let cfg = small_cfg();
+            let mut ens = PyEnsemblePredictor::new(&cfg, 3, "average", None).expect("ensemble");
+            let py_arr = PyArray1::from_vec(py, vec![0.5_f32, -0.5]);
+            let out = ens.step(py, py_arr.readonly()).expect("step via pymethod");
+            let out_ro = out.readonly();
+            let view = out_ro.as_array();
+            assert_eq!(view.len(), 2);
+        });
+    }
+
+    // Regression for the medium bug where NaN/infinite weights passed both
+    // `add_model_with_id`'s and `update_weights`' `weight < 0.0` check
+    // (false for NaN) and silently poisoned every weighted prediction.
+    #[test]
+    fn test_ensemble_new_rejects_nan_weight() {
+        let cfg = small_cfg();
+        let ens = PyEnsemblePredictor::new(&cfg, 2, "weighted", Some(vec![1.0, f64::NAN]));
+        assert!(ens.is_err());
+    }
+
+    #[test]
+    fn test_ensemble_new_rejects_infinite_weight() {
+        let cfg = small_cfg();
+        let ens = PyEnsemblePredictor::new(&cfg, 2, "weighted", Some(vec![f64::INFINITY, 1.0]));
+        assert!(ens.is_err());
+    }
+
+    #[test]
+    fn test_ensemble_new_rejects_negative_weight() {
+        let cfg = small_cfg();
+        let ens = PyEnsemblePredictor::new(&cfg, 2, "weighted", Some(vec![-1.0, 1.0]));
+        assert!(ens.is_err());
+    }
+
+    #[test]
+    fn test_ensemble_set_weight_rejects_nan() {
+        let cfg = small_cfg();
+        let mut ens = PyEnsemblePredictor::new(&cfg, 2, "weighted_average", Some(vec![1.0, 1.0]))
+            .expect("ensemble");
+        assert!(ens.set_weight(0, f64::NAN).is_err());
+        assert!(ens.set_weight(0, f64::INFINITY).is_err());
+        assert!(ens.set_weight(0, -1.0).is_err());
+    }
+
+    /// `EnsemblePredictor` must stay `Send` for `Python::detach` (used by
+    /// `step`/`predict_n`) to compile.
+    #[test]
+    fn test_ensemble_predictor_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<EnsemblePredictor>();
     }
 
     #[test]

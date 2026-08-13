@@ -60,11 +60,21 @@ impl SsmBackend for CpuSsmBackend {
     }
 }
 
-/// Select the best available backend at runtime.
+/// The backend available from *this* crate: always [`CpuSsmBackend`].
 ///
-/// Returns a boxed [`SsmBackend`] — currently always [`CpuSsmBackend`].
-/// When `kizzasi-webgpu` is wired in via the `webgpu` feature, callers can
-/// substitute a `WebGpuSsmBackend` here.
+/// This function cannot return the GPU backend, and that is structural rather
+/// than an omission: `WebGpuSsmBackend` lives in `kizzasi-webgpu`, which
+/// depends on `kizzasi-core`, so selecting it from here would be a dependency
+/// cycle. GPU selection therefore lives one level up, in the `kizzasi` facade
+/// crate:
+///
+/// ```text
+/// kizzasi::ssm_backend::select_ssm_backend()   // with --features webgpu
+/// ```
+///
+/// which returns the hybrid GPU backend when a wgpu adapter is reachable and
+/// falls back to [`CpuSsmBackend`] otherwise. Use this function when you are
+/// inside `kizzasi-core` or deliberately want the CPU implementation.
 pub fn default_backend() -> Box<dyn SsmBackend> {
     Box::new(CpuSsmBackend)
 }

@@ -194,6 +194,14 @@ pub struct StateDependentConstraint<C: ViolationComputable> {
     activation_fn: ActivationFunction,
     /// Current activation state
     is_active: bool,
+    /// State observed on the previous call to `update_activation`, used to
+    /// compute a rate of change for `ActivationFunction::VelocityBased`.
+    prev_state: Option<Array1<f32>>,
+    /// Time step between successive `update_activation` calls, used as the
+    /// denominator of that rate. Defaults to `1.0` (see [`Self::new`]);
+    /// override with [`Self::with_dt`] when calls correspond to a known
+    /// physical time step.
+    dt: f32,
 }
 
 /// Activation function type
@@ -215,14 +223,31 @@ pub enum ActivationFunction {
 }
 
 impl<C: ViolationComputable + Clone> StateDependentConstraint<C> {
-    /// Create a new state-dependent constraint
+    /// Create a new state-dependent constraint.
+    ///
+    /// `dt` for [`ActivationFunction::VelocityBased`] defaults to `1.0`
+    /// (i.e. velocity is measured per call to [`Self::update_activation`]);
+    /// use [`Self::with_dt`] to supply a real physical time step.
     pub fn new(name: impl Into<String>, constraint: C, activation_fn: ActivationFunction) -> Self {
         Self {
             name: name.into(),
             constraint,
             activation_fn,
             is_active: false,
+            prev_state: None,
+            dt: 1.0,
         }
+    }
+
+    /// Set the time step used to convert a state difference into a velocity
+    /// for `ActivationFunction::VelocityBased`. Non-positive or non-finite
+    /// values are ignored (the previous `dt` is kept) to avoid a
+    /// division-by-zero/NaN velocity.
+    pub fn with_dt(mut self, dt: f32) -> Self {
+        if dt.is_finite() && dt > 0.0 {
+            self.dt = dt;
+        }
+        self
     }
 
     /// Update activation state based on current system state
@@ -241,12 +266,35 @@ impl<C: ViolationComputable + Clone> StateDependentConstraint<C> {
                     && state.iter().zip(upper.iter()).all(|(x, u)| x <= u)
             }
             ActivationFunction::VelocityBased { threshold } => {
-                // This requires historical state; simplified version
-                state.iter().any(|x| x.abs() > *threshold)
+                // Requires the previous call's state; on the very first
+                // call (or after `reset`) there is no history yet, so the
+                // constraint stays inactive rather than activating on the
+                // current *position* (the old, documented-wrong behavior).
+                match &self.prev_state {
+                    Some(prev) if prev.len() == state.len() => {
+                        let velocity_norm = state
+                            .iter()
+                            .zip(prev.iter())
+                            .map(|(&curr, &p)| ((curr - p) / self.dt).powi(2))
+                            .sum::<f32>()
+                            .sqrt();
+                        velocity_norm > *threshold
+                    }
+                    _ => false,
+                }
             }
             ActivationFunction::Custom(f) => f(state),
         };
+        self.prev_state = Some(state.clone());
         self.is_active
+    }
+
+    /// Forget the observed history, so the next `VelocityBased` activation
+    /// check treats the following call as the first (inactive) sample
+    /// again — mirrors [`crate::TemporalChecker::reset`].
+    pub fn reset(&mut self) {
+        self.prev_state = None;
+        self.is_active = false;
     }
 
     /// Check if constraint is currently active
@@ -257,7 +305,8 @@ impl<C: ViolationComputable + Clone> StateDependentConstraint<C> {
     /// Check constraint if active
     pub fn check_if_active(&self, state: &Array1<f32>) -> bool {
         if self.is_active {
-            self.constraint.check(state.as_slice().unwrap_or(&[]))
+            self.constraint
+                .check(&crate::array_utils::contiguous(state))
         } else {
             true // Inactive constraints are trivially satisfied
         }
@@ -266,7 +315,8 @@ impl<C: ViolationComputable + Clone> StateDependentConstraint<C> {
     /// Get violation if active
     pub fn violation_if_active(&self, state: &Array1<f32>) -> f32 {
         if self.is_active {
-            self.constraint.violation(state.as_slice().unwrap_or(&[]))
+            self.constraint
+                .violation(&crate::array_utils::contiguous(state))
         } else {
             0.0
         }
@@ -315,7 +365,7 @@ impl<C: ViolationComputable + Clone> PredictiveConstraintAdapter<C> {
         for state in trajectory.iter().take(self.horizon) {
             let viol = self
                 .base_constraint
-                .violation(state.as_slice().unwrap_or(&[]));
+                .violation(&crate::array_utils::contiguous(state));
             violations.push(viol);
         }
         violations
@@ -413,12 +463,9 @@ impl<C: ViolationComputable + Clone> ConstraintInterpolator<C> {
 
     /// Compute interpolated violation
     pub fn violation(&self, state: &Array1<f32>) -> f32 {
-        let v1 = self
-            .start_constraint
-            .violation(state.as_slice().unwrap_or(&[]));
-        let v2 = self
-            .end_constraint
-            .violation(state.as_slice().unwrap_or(&[]));
+        let state_slice = crate::array_utils::contiguous(state);
+        let v1 = self.start_constraint.violation(&state_slice);
+        let v2 = self.end_constraint.violation(&state_slice);
 
         let alpha = match self.mode {
             InterpolationMode::Step => {

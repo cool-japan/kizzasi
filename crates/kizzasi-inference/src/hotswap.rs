@@ -116,8 +116,10 @@ impl ModelInstance {
 
     /// Run health check on model
     pub async fn health_check(&mut self) -> bool {
-        // Basic health check: try a forward pass with dummy data
-        let test_input = Array1::zeros(self.config.hidden_dim);
+        // Basic health check: try a forward pass with dummy data. The probe
+        // must match the model's *input* dimension, not its hidden dimension
+        // (those differ for every normal configuration).
+        let test_input = Array1::zeros(self.config.input_dim);
 
         let mut model = self.model.write().await;
         match model.step(&test_input) {
@@ -218,10 +220,17 @@ impl HotSwapManager {
 
     /// Activate a staged model
     pub async fn activate(&self, model_id: &str, strategy: SwapStrategy) -> InferenceResult<()> {
-        let mut staged = self.staged_models.write().await;
-        let new_model = staged.remove(model_id).ok_or_else(|| {
-            InferenceError::NotFound(format!("Staged model not found: {}", model_id))
-        })?;
+        let new_model = {
+            let mut staged = self.staged_models.write().await;
+            staged.remove(model_id).ok_or_else(|| {
+                InferenceError::NotFound(format!("Staged model not found: {}", model_id))
+            })?
+            // `staged` (the write guard) is dropped here, at the end of this
+            // block — required before calling into `swap_gradual`, which
+            // re-acquires `staged_models` itself (to keep the candidate
+            // reachable during a partial split); holding this guard across
+            // that call would deadlock against itself.
+        };
 
         let old_model = self.active_model.read().await.clone();
 
@@ -309,6 +318,12 @@ impl HotSwapManager {
     }
 
     /// Gradual swap (traffic shifting)
+    ///
+    /// Below 100% this does not touch `active_model`: the candidate is kept
+    /// reachable in `staged_models` and [`HotSwapManager::select_model`] is
+    /// the entry point that actually honours `traffic_split` on a
+    /// per-request basis. At 100% the swap completes immediately, exactly
+    /// like [`HotSwapManager::swap_immediate`].
     async fn swap_gradual(
         &self,
         old_model: ModelInstance,
@@ -321,26 +336,84 @@ impl HotSwapManager {
             ));
         }
 
-        // Set traffic split
-        let mut split = self.traffic_split.write().await;
-        split.insert(new_model.id.clone(), percentage);
-        split.insert(old_model.id.clone(), 100 - percentage);
-
-        // For gradual swap, we keep both models in staged
-        // and route traffic based on percentage
-        // This is a simplified implementation - in production you'd have
-        // more sophisticated routing logic
-
-        info!("Gradual swap configured: {}% to new model", percentage);
-
-        // If 100%, complete the swap
         if percentage == 100 {
             *self.previous_model.write().await = Some(old_model);
             *self.active_model.write().await = new_model;
-            split.clear();
+            self.traffic_split.write().await.clear();
+            info!("Gradual swap configured: 100% to new model (swap completed)");
+            return Ok(());
         }
 
+        // Keep the candidate reachable via `staged_models` for the duration
+        // of the split — `activate` already removed it from there when it
+        // was pulled out for this call.
+        self.staged_models
+            .write()
+            .await
+            .insert(new_model.id.clone(), new_model.clone());
+
+        let mut split = self.traffic_split.write().await;
+        split.insert(new_model.id.clone(), percentage);
+        split.insert(old_model.id.clone(), 100 - percentage);
+        drop(split);
+
+        info!("Gradual swap configured: {}% to new model", percentage);
         Ok(())
+    }
+
+    /// Select a model instance for a single request, honouring any
+    /// in-progress gradual/canary traffic split.
+    ///
+    /// With no split configured — the common case, and always the case
+    /// immediately after an `Immediate` or `Graceful` swap, or once a
+    /// `Gradual` swap reaches 100% — this simply returns the active model.
+    /// During a `SwapStrategy::Gradual { percentage }` rollout it performs a
+    /// weighted random draw over `traffic_split`: with probability
+    /// `percentage / 100` it returns the staged candidate, and with the
+    /// remaining probability it returns the current active model. This is
+    /// the entry point request-handling code should call instead of
+    /// [`HotSwapManager::active_model`] so that a configured split actually
+    /// shifts traffic rather than being recorded and ignored.
+    pub async fn select_model(&self) -> ModelInstance {
+        let split = self.traffic_split.read().await;
+        if split.is_empty() {
+            return self.active_model.read().await.clone();
+        }
+
+        let active = self.active_model.read().await.clone();
+        let staged = self.staged_models.read().await;
+
+        let total: u32 = split.values().map(|&p| p as u32).sum();
+        if total == 0 {
+            return active;
+        }
+
+        // Weighted draw via a Send-safe RNG (no thread-local kept alive
+        // across an `.await` point).
+        let draw: f32 = {
+            use scirs2_core::random::RngExt;
+            crate::sampling::make_sampler_rng(None).random::<f32>()
+        };
+        let threshold = draw * total as f32;
+
+        let mut cumulative = 0.0_f32;
+        for (id, &percentage) in split.iter() {
+            cumulative += percentage as f32;
+            if threshold < cumulative {
+                if *id == active.id {
+                    return active;
+                }
+                if let Some(candidate) = staged.get(id) {
+                    return candidate.clone();
+                }
+                // Stale split entry that no longer resolves to a live
+                // instance: fall back to the active model rather than
+                // erroring a live request over bookkeeping drift.
+                return active;
+            }
+        }
+
+        active
     }
 
     /// Rollback to previous model
@@ -458,5 +531,109 @@ mod tests {
 
         let result = manager.rollback().await;
         assert!(result.is_err());
+    }
+
+    /// Regression: `health_check` used to probe with a `hidden_dim`-sized
+    /// input, so any model with `input_dim != hidden_dim` (the normal case)
+    /// failed its own health check.
+    #[tokio::test]
+    async fn test_health_check_uses_input_dim_not_hidden_dim() {
+        let config = ModelConfig::new(ModelType::S4D)
+            .input_dim(1)
+            .hidden_dim(64)
+            .state_dim(16);
+
+        let mut registry = ModelRegistry::new();
+        registry.register("hc_test", config.clone());
+        let model = registry.create_model("hc_test").unwrap();
+
+        let mut instance = ModelInstance::new("hc", "1.0.0", model, config);
+        assert!(
+            instance.health_check().await,
+            "a correctly loaded model with input_dim != hidden_dim must be healthy"
+        );
+        assert!(instance.healthy);
+    }
+
+    /// Regression: `SwapStrategy::Gradual` used to write `traffic_split` and
+    /// never read it — 100% of traffic stayed on the old model regardless of
+    /// the configured percentage, while reporting `success: true`.
+    #[tokio::test]
+    async fn test_gradual_swap_partial_split_reaches_both_versions() {
+        let config = ModelConfig::new(ModelType::S4D);
+        let mut registry = ModelRegistry::new();
+
+        registry.register("initial", config.clone());
+        let old = registry.create_model("initial").unwrap();
+        let old_instance = ModelInstance::new("old-id", "1.0.0", old, config.clone());
+        let manager = HotSwapManager::new(old_instance);
+
+        registry.register("new", config.clone());
+        let new_model = registry.create_model("new").unwrap();
+        manager
+            .prepare_swap("new-id", "2.0.0", new_model, config)
+            .await
+            .expect("prepare_swap must succeed");
+
+        // Before any swap, select_model must agree with active_model.
+        assert_eq!(manager.select_model().await.version, "1.0.0");
+
+        manager
+            .activate("new-id", SwapStrategy::Gradual { percentage: 50 })
+            .await
+            .expect("gradual activation must succeed");
+
+        // Below 100%, the active model must NOT have switched yet.
+        assert_eq!(manager.active_model().await.version, "1.0.0");
+
+        // Over many draws, a 50/50 split must route to both versions.
+        let mut saw_old = false;
+        let mut saw_new = false;
+        for _ in 0..200 {
+            match manager.select_model().await.version.as_str() {
+                "1.0.0" => saw_old = true,
+                "2.0.0" => saw_new = true,
+                other => panic!("unexpected version routed: {other}"),
+            }
+            if saw_old && saw_new {
+                break;
+            }
+        }
+        assert!(
+            saw_old,
+            "50% split must route to the old model at least once in 200 draws"
+        );
+        assert!(
+            saw_new,
+            "50% split must route to the new (staged) model at least once in 200 draws"
+        );
+    }
+
+    /// A `Gradual { percentage: 100 }` swap must complete immediately, like
+    /// `Immediate`, and leave no residual traffic split.
+    #[tokio::test]
+    async fn test_gradual_swap_full_percentage_completes_immediately() {
+        let config = ModelConfig::new(ModelType::S4D);
+        let mut registry = ModelRegistry::new();
+
+        registry.register("initial", config.clone());
+        let old = registry.create_model("initial").unwrap();
+        let old_instance = ModelInstance::new("old-id", "1.0.0", old, config.clone());
+        let manager = HotSwapManager::new(old_instance);
+
+        registry.register("new", config.clone());
+        let new_model = registry.create_model("new").unwrap();
+        manager
+            .prepare_swap("new-id", "2.0.0", new_model, config)
+            .await
+            .expect("prepare_swap must succeed");
+
+        manager
+            .activate("new-id", SwapStrategy::Gradual { percentage: 100 })
+            .await
+            .expect("100% gradual swap must complete immediately");
+
+        assert_eq!(manager.active_model().await.version, "2.0.0");
+        assert_eq!(manager.select_model().await.version, "2.0.0");
     }
 }

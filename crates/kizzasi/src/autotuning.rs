@@ -191,29 +191,66 @@ impl AutoTuner {
     }
 
     /// Profile a predictor's performance
+    ///
+    /// The predictor's recurrent state is captured before the synthetic
+    /// warmup/profiling samples are pushed through it and restored afterwards,
+    /// so profiling a *live* predictor (as [`AdaptiveTuner`] does) does not
+    /// poison the sequence the caller is streaming.
+    ///
+    /// One exception, inherited from `kizzasi-model`: for
+    /// [`kizzasi_core::ModelType::S4`] the snapshot covers the SSM state but
+    /// not each layer's 3-tap causal-convolution history, which `kizzasi-model`
+    /// does not expose. Profiling an S4-backed predictor therefore leaves up
+    /// to two synthetic frames in that short history. This matters here
+    /// because [`AutoTuner::build_for_latency`] deliberately recommends S4 for
+    /// the tightest latency budgets.
     pub fn profile(
         &mut self,
         predictor: &mut Kizzasi,
         input_dim: usize,
     ) -> KizzasiResult<WorkloadProfile> {
+        if self.config.profiling_iterations == 0 {
+            return Err(KizzasiError::config(
+                "profiling_iterations must be > 0 to profile a predictor",
+            ));
+        }
+        if input_dim == 0 {
+            return Err(KizzasiError::config("input_dim must be > 0 to profile"));
+        }
+
         let mut latencies = Vec::with_capacity(self.config.profiling_iterations);
 
-        // Warmup phase
+        // Snapshot the live hidden state so the synthetic samples below can be
+        // rolled back; without this every `AdaptiveTuner::adapt` would inject
+        // `warmup + profiling` all-ones samples into the user's stream.
+        let saved_state = predictor.snapshot_state();
+
         let test_input = Array1::from_vec(vec![1.0; input_dim]);
-        for _ in 0..self.config.warmup_iterations {
-            let _ = predictor.step(&test_input)?;
-        }
+        let profiled = (|| -> KizzasiResult<()> {
+            // Warmup phase
+            for _ in 0..self.config.warmup_iterations {
+                let _ = predictor.step(&test_input)?;
+            }
 
-        // Profiling phase
-        for _ in 0..self.config.profiling_iterations {
-            let start = Instant::now();
-            let _ = predictor.step(&test_input)?;
-            let elapsed = start.elapsed().as_micros() as u64;
-            latencies.push(elapsed);
-        }
+            // Profiling phase
+            for _ in 0..self.config.profiling_iterations {
+                let start = Instant::now();
+                let _ = predictor.step(&test_input)?;
+                let elapsed = start.elapsed().as_micros() as u64;
+                latencies.push(elapsed);
+            }
+            Ok(())
+        })();
 
-        // Calculate statistics
-        let avg_latency_us = latencies.iter().sum::<u64>() / latencies.len() as u64;
+        // Restore the caller's state whether or not profiling succeeded.
+        let restored = predictor.restore_state(saved_state);
+        profiled?;
+        restored?;
+
+        // Calculate statistics. `latencies` is non-empty: profiling_iterations
+        // was validated above and every iteration pushes exactly one sample.
+        let sample_count = latencies.len().max(1) as u64;
+        let avg_latency_us = latencies.iter().sum::<u64>() / sample_count;
 
         let variance: f64 = latencies
             .iter()
@@ -222,17 +259,24 @@ impl AutoTuner {
                 diff * diff
             })
             .sum::<f64>()
-            / latencies.len() as f64;
+            / sample_count as f64;
         let latency_std_dev_us = variance.sqrt();
 
         // Calculate percentiles
         let mut sorted_latencies = latencies.clone();
         sorted_latencies.sort_unstable();
-        let p50_latency_us = sorted_latencies[sorted_latencies.len() / 2];
-        let p95_latency_us = sorted_latencies[(sorted_latencies.len() as f64 * 0.95) as usize];
-        let p99_latency_us = sorted_latencies[(sorted_latencies.len() as f64 * 0.99) as usize];
+        let last_index = sorted_latencies.len().saturating_sub(1);
+        let percentile = |fraction: f64| -> u64 {
+            let index = ((sorted_latencies.len() as f64 * fraction) as usize).min(last_index);
+            sorted_latencies.get(index).copied().unwrap_or(0)
+        };
+        let p50_latency_us = percentile(0.5);
+        let p95_latency_us = percentile(0.95);
+        let p99_latency_us = percentile(0.99);
 
-        let throughput_pps = 1_000_000.0 / avg_latency_us as f64;
+        // A sub-microsecond step measures as 0 µs; clamp so throughput stays
+        // finite instead of reporting +inf predictions/sec.
+        let throughput_pps = 1_000_000.0 / (avg_latency_us.max(1) as f64);
 
         // Estimate memory usage (rough approximation)
         let hidden_dim = predictor.hidden_dim();
@@ -337,17 +381,23 @@ impl AutoTuner {
             ModelType::Rwkv => 150,
         };
 
-        let expected_latency_us =
-            (base_latency * (hidden_dim / 64) * num_layers * (input_dim + output_dim)
-                / (input_dim.max(1))) as u64;
+        // Computed in f64: `hidden_dim / 64` in integer arithmetic collapses
+        // the whole product to 0 for every model narrower than 64 channels
+        // (which is exactly what the ultra-low-latency and aggressive branches
+        // above produce), yielding a "0 µs, infinite throughput" recommendation.
+        let expected_latency_us = ((base_latency as f64)
+            * (hidden_dim as f64 / 64.0)
+            * num_layers as f64
+            * ((input_dim + output_dim) as f64 / input_dim.max(1) as f64))
+            .max(1.0) as u64;
 
-        let expected_throughput_pps = 1_000_000.0 / expected_latency_us as f64;
+        let expected_throughput_pps = 1_000_000.0 / expected_latency_us.max(1) as f64;
 
         let expected_memory_bytes =
             (hidden_dim * 64 * num_layers * 4) + (hidden_dim * hidden_dim * num_layers * 16);
 
         // Calculate confidence based on how well we can meet the target
-        let latency_ratio = expected_latency_us as f64 / target_latency_us as f64;
+        let latency_ratio = expected_latency_us as f64 / target_latency_us.max(1) as f64;
         let confidence = if latency_ratio <= 0.8 {
             0.95 // Very confident we can meet target
         } else if latency_ratio <= 1.0 {
@@ -378,17 +428,62 @@ impl AutoTuner {
         output_dim: usize,
         target_throughput_pps: f64,
     ) -> TuningRecommendation {
-        // Convert throughput to latency target
-        let target_latency_us = (1_000_000.0 / target_throughput_pps) as u64;
+        // Convert throughput to latency target. A non-positive or non-finite
+        // target would otherwise produce a nonsensical (or saturating) budget.
+        let target_latency_us = if target_throughput_pps.is_finite() && target_throughput_pps > 0.0
+        {
+            (1_000_000.0 / target_throughput_pps).max(1.0) as u64
+        } else {
+            1
+        };
         self.recommend_for_latency(input_dim, output_dim, target_latency_us)
     }
 
     /// Generate balanced recommendations
+    ///
+    /// Uses `TuningConfig::target_latency_us` when one was configured, falling
+    /// back to `TuningConfig::target_throughput` and finally to a 1 ms budget,
+    /// then caps the recommendation with `TuningConfig::max_memory_bytes`.
     pub fn recommend_balanced(&self, input_dim: usize, output_dim: usize) -> TuningRecommendation {
-        // Default to medium latency (1ms)
-        let mut rec = self.recommend_for_latency(input_dim, output_dim, 1000);
+        let mut rec = match (self.config.target_latency_us, self.config.target_throughput) {
+            (Some(latency_us), _) => self.recommend_for_latency(input_dim, output_dim, latency_us),
+            (None, Some(throughput)) => {
+                self.recommend_for_throughput(input_dim, output_dim, throughput)
+            }
+            (None, None) => self.recommend_for_latency(input_dim, output_dim, 1000),
+        };
         rec.reasoning = "Balanced configuration for general-purpose use".to_string();
+        self.apply_memory_cap(&mut rec);
         rec
+    }
+
+    /// Shrink a recommendation until its estimated footprint fits
+    /// `TuningConfig::max_memory_bytes`, if one was configured.
+    ///
+    /// Without this the field would be a builder option that gates nothing.
+    fn apply_memory_cap(&self, rec: &mut TuningRecommendation) {
+        let Some(limit) = self.config.max_memory_bytes else {
+            return;
+        };
+
+        while rec.expected_memory_bytes > limit && (rec.hidden_dim > 8 || rec.num_layers > 1) {
+            if rec.num_layers > 1 {
+                rec.num_layers -= 1;
+            } else {
+                rec.hidden_dim /= 2;
+            }
+            rec.expected_memory_bytes = (rec.hidden_dim * 64 * rec.num_layers * 4)
+                + (rec.hidden_dim * rec.hidden_dim * rec.num_layers * 16);
+        }
+
+        if rec.expected_memory_bytes > limit {
+            rec.confidence = rec.confidence.min(0.5);
+            rec.reasoning
+                .push_str(" (could not fit max_memory_bytes even at the smallest supported size)");
+        } else {
+            rec.reasoning
+                .push_str(" (capped to fit the configured max_memory_bytes)");
+        }
     }
 
     /// Auto-tune and build a predictor for latency target
@@ -509,37 +604,53 @@ impl AdaptiveTuner {
     }
 
     /// Trigger adaptation based on current performance
+    ///
+    /// Profiling restores the live hidden state (see [`AutoTuner::profile`]).
+    /// Switching architectures does **not**: the replacement predictor starts
+    /// from a fresh hidden state and freshly initialised weights, because no
+    /// two architectures share a state layout. Guardrails configured on the
+    /// outgoing predictor are carried over; plugins are not (they are not
+    /// required to be cloneable) and must be re-registered by the caller.
     fn adapt(&mut self) -> KizzasiResult<()> {
-        if let Some(predictor) = &mut self.current_predictor {
-            // Profile current predictor
-            let profile = self.tuner.profile(predictor, self.input_dim)?;
+        let Some(predictor) = &mut self.current_predictor else {
+            return Ok(());
+        };
 
-            // Determine if we need to adapt
-            if let Some(target_latency_us) = self.tuner.config.target_latency_us {
-                if profile.avg_latency_us > target_latency_us * 120 / 100 {
-                    // More than 20% over target - switch to faster model
-                    let rec = self.tuner.recommend_for_latency(
-                        self.input_dim,
-                        self.output_dim,
-                        target_latency_us,
-                    );
+        // Profile current predictor
+        let profile = self.tuner.profile(predictor, self.input_dim)?;
 
-                    if rec.confidence > 0.7 {
-                        // Build and switch to new predictor
-                        let new_predictor = KizzasiBuilder::new()
-                            .model_type(rec.model_type)
-                            .input_dim(self.input_dim)
-                            .output_dim(self.output_dim)
-                            .hidden_dim(rec.hidden_dim)
-                            .num_layers(rec.num_layers)
-                            .context_window(rec.context_window)
-                            .build()?;
-
-                        self.current_predictor = Some(new_predictor);
-                    }
-                }
-            }
+        // Determine if we need to adapt
+        let Some(target_latency_us) = self.tuner.config.target_latency_us else {
+            return Ok(());
+        };
+        if profile.avg_latency_us <= target_latency_us * 120 / 100 {
+            return Ok(());
         }
+
+        // More than 20% over target - switch to faster model
+        let rec =
+            self.tuner
+                .recommend_for_latency(self.input_dim, self.output_dim, target_latency_us);
+        if rec.confidence <= 0.7 {
+            return Ok(());
+        }
+
+        let mut builder = KizzasiBuilder::new()
+            .model_type(rec.model_type)
+            .input_dim(self.input_dim)
+            .output_dim(self.output_dim)
+            .hidden_dim(rec.hidden_dim)
+            .num_layers(rec.num_layers)
+            .context_window(rec.context_window);
+
+        // Carry safety constraints across the switch; dropping them silently
+        // would remove enforcement the caller explicitly asked for.
+        #[cfg(feature = "logic")]
+        if let Some(guardrails) = predictor.guardrails() {
+            builder = builder.guardrails(guardrails.clone());
+        }
+
+        self.current_predictor = Some(builder.build()?);
 
         Ok(())
     }
@@ -609,13 +720,77 @@ mod tests {
     fn test_throughput_recommendations() {
         let tuner = AutoTuner::with_defaults();
 
-        // High throughput = low latency
+        // High throughput = low latency. The estimate must be strictly
+        // positive: integer division used to collapse it to 0 for every model
+        // narrower than 64 channels (the ultra-low-latency branch picks
+        // hidden_dim = 32), which reported +inf throughput at 0.95 confidence.
+        // The old bound `< 20` passed only because the value was 0.
         let rec1 = tuner.recommend_for_throughput(2, 2, 100000.0); // 100K pps
-        assert!(rec1.expected_latency_us < 20);
+        assert!(rec1.expected_latency_us > 0, "latency estimate must be > 0");
+        assert!(rec1.expected_throughput_pps.is_finite());
 
         // Low throughput = can use larger model
         let rec2 = tuner.recommend_for_throughput(64, 64, 100.0); // 100 pps
         assert!(rec2.expected_latency_us > 1000);
+        assert!(rec2.expected_throughput_pps.is_finite());
+
+        // A tighter budget must still yield a cheaper model.
+        assert!(rec1.expected_latency_us < rec2.expected_latency_us);
+    }
+
+    #[test]
+    fn test_zero_profiling_iterations_is_rejected() {
+        let mut tuner = AutoTuner::new(TuningConfig::new().with_profiling(0));
+        let mut predictor = KizzasiBuilder::new()
+            .input_dim(2)
+            .output_dim(2)
+            .hidden_dim(16)
+            .build()
+            .unwrap();
+
+        // Must return an error rather than dividing by zero / indexing an
+        // empty percentile vector.
+        assert!(tuner.profile(&mut predictor, 2).is_err());
+    }
+
+    #[test]
+    fn test_profile_restores_live_hidden_state() {
+        let mut predictor = KizzasiBuilder::new()
+            .input_dim(2)
+            .output_dim(2)
+            .hidden_dim(16)
+            .state_dim(4)
+            .num_layers(1)
+            .build()
+            .unwrap();
+
+        let input = Array1::from_vec(vec![0.25, -0.5]);
+        predictor.step(&input).unwrap();
+
+        // Baseline: what the live stream would produce next.
+        let mut reference = predictor.fork().unwrap();
+        reference.step(&input).unwrap();
+        let expected = reference.step(&input).unwrap();
+
+        let mut tuner = AutoTuner::new(TuningConfig::new().with_warmup(2).with_profiling(5));
+        tuner.profile(&mut predictor, 2).unwrap();
+
+        // The synthetic profiling samples must not have advanced the caller's
+        // hidden state.
+        let actual = predictor.step(&input).unwrap();
+        for (a, b) in actual.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "profiling poisoned the hidden state");
+        }
+    }
+
+    #[test]
+    fn test_max_memory_caps_recommendation() {
+        let tuner = AutoTuner::new(TuningConfig::new().with_max_memory(64 * 1024));
+        let rec = tuner.recommend_balanced(8, 8);
+        assert!(
+            rec.expected_memory_bytes <= 64 * 1024 || rec.confidence <= 0.5,
+            "max_memory_bytes must actually constrain the recommendation"
+        );
     }
 
     #[test]

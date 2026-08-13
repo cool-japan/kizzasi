@@ -250,6 +250,14 @@ impl S4DLayer {
     ///
     /// Input shape: (seq_len, input_dim)
     /// Output shape: (seq_len, hidden_dim)
+    ///
+    /// When `config.bidirectional` is set, this runs the recurrence a
+    /// second time over the time-reversed sequence (with its own
+    /// independent hidden state) and averages the two passes -- giving
+    /// every output position access to both past and future context,
+    /// unlike the causal-only forward pass. Previously `bidirectional` was
+    /// accepted by the config and builder but never read anywhere in this
+    /// file, so enabling it silently produced a plain causal model.
     pub fn forward_sequence(&self, input: &Array2<f32>) -> CoreResult<Array2<f32>> {
         let (seq_len, input_dim) = input.dim();
         if input_dim != self.config.input_dim {
@@ -259,6 +267,39 @@ impl S4DLayer {
             });
         }
 
+        let forward_out = self.forward_sequence_causal(input)?;
+
+        if !self.config.bidirectional {
+            return Ok(forward_out);
+        }
+
+        // Backward pass: run the SAME recurrence (fresh hidden state) over
+        // the time-reversed input, then reverse the result back into
+        // forward time order before combining.
+        let mut reversed_input = Array2::zeros((seq_len, input_dim));
+        for t in 0..seq_len {
+            reversed_input
+                .row_mut(t)
+                .assign(&input.row(seq_len - 1 - t));
+        }
+        let backward_out_reversed = self.forward_sequence_causal(&reversed_input)?;
+
+        let mut output = Array2::zeros((seq_len, self.config.hidden_dim));
+        for t in 0..seq_len {
+            let fwd = forward_out.row(t);
+            let bwd = backward_out_reversed.row(seq_len - 1 - t);
+            output.row_mut(t).assign(&((&fwd + &bwd) * 0.5));
+        }
+
+        Ok(output)
+    }
+
+    /// The causal (forward-only) recurrence itself, independent of
+    /// `config.bidirectional`. Used directly for the forward pass, and
+    /// again on a time-reversed input for the backward pass when
+    /// bidirectional mode is enabled.
+    fn forward_sequence_causal(&self, input: &Array2<f32>) -> CoreResult<Array2<f32>> {
+        let seq_len = input.nrows();
         let mut output = Array2::zeros((seq_len, self.config.hidden_dim));
         let mut h = Array1::zeros(self.config.state_dim);
 
@@ -441,6 +482,82 @@ mod tests {
         for &val in lambda.iter() {
             assert!(val < 0.0);
         }
+    }
+
+    #[test]
+    fn test_bidirectional_forward_sequence_uses_future_context() {
+        // Regression: `bidirectional` was accepted by the config/builder but
+        // never read by `forward_sequence`, so enabling it silently produced
+        // the same causal-only output as `bidirectional: false`.
+        let state_dim = 8;
+        let hidden_dim = 6;
+        let seq_len = 10;
+
+        let mut config_causal = S4DConfig::new(4, state_dim, hidden_dim).use_hippo(false);
+        config_causal.bidirectional = false;
+        let mut config_bidi = config_causal.clone();
+        config_bidi.bidirectional = true;
+
+        let layer_causal = S4DLayer::new(config_causal).unwrap();
+        // `S4DLayer::new` re-randomizes internal parameters per call (via
+        // `thread_rng`), so build the bidirectional layer by cloning the
+        // causal layer's already-initialized parameters via its config
+        // rather than constructing independently -- otherwise a difference
+        // in output could come from different random weights, not from
+        // bidirectionality.
+        let mut layer_bidi = S4DLayer::new(config_bidi).unwrap();
+        layer_bidi.lambda = layer_causal.lambda.clone();
+        layer_bidi.b = layer_causal.b.clone();
+        layer_bidi.c = layer_causal.c.clone();
+        layer_bidi.d = layer_causal.d;
+        layer_bidi.input_proj = layer_causal.input_proj.clone();
+        layer_bidi.output_proj = layer_causal.output_proj.clone();
+        layer_bidi.a_bar = layer_causal.a_bar.clone();
+        layer_bidi.b_bar = layer_causal.b_bar.clone();
+
+        // Non-trivial (non-constant) input so a causal vs. non-causal
+        // difference actually has something to show up in.
+        let input = Array2::from_shape_fn((seq_len, 4), |(t, d)| {
+            (t as f32 * 0.3 + d as f32 * 0.7).sin()
+        });
+
+        let out_causal = layer_causal.forward_sequence(&input).unwrap();
+        let out_bidi = layer_bidi.forward_sequence(&input).unwrap();
+
+        assert_eq!(out_causal.dim(), (seq_len, hidden_dim));
+        assert_eq!(out_bidi.dim(), (seq_len, hidden_dim));
+
+        // With identical parameters, bidirectional output must differ from
+        // the causal-only output at at least one position (proving the
+        // backward pass genuinely contributes), except possibly at the very
+        // first timestep where forward-only and backward-only can coincide
+        // for a degenerate case -- so check the whole sequence, not just t=0.
+        let mut any_difference = false;
+        for t in 0..seq_len {
+            for d in 0..hidden_dim {
+                if (out_causal[[t, d]] - out_bidi[[t, d]]).abs() > 1e-6 {
+                    any_difference = true;
+                }
+            }
+        }
+        assert!(
+            any_difference,
+            "bidirectional=true must produce different output than bidirectional=false"
+        );
+    }
+
+    #[test]
+    fn test_bidirectional_false_is_unchanged() {
+        // Sanity check: leaving bidirectional at its default (false) must
+        // behave identically to calling the causal recurrence directly.
+        let config = S4DConfig::new(5, 12, 8);
+        let layer = S4DLayer::new(config).unwrap();
+        let input = Array2::from_shape_fn((7, 5), |(t, d)| (t + d) as f32 * 0.05);
+
+        let via_forward_sequence = layer.forward_sequence(&input).unwrap();
+        let via_causal_directly = layer.forward_sequence_causal(&input).unwrap();
+
+        assert_eq!(via_forward_sequence, via_causal_directly);
     }
 
     #[test]

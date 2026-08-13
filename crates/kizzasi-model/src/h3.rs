@@ -297,6 +297,8 @@ impl H3 {
 impl SignalPredictor for H3 {
     #[instrument(skip(self, input))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.config.input_dim)?;
+
         let mut x = input.clone();
 
         for layer in &mut self.layers {

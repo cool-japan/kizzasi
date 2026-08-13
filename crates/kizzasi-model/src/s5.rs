@@ -53,7 +53,14 @@ pub struct S5Config {
     pub num_layers: usize,
     /// Discretization step size (Δt)
     pub dt: f32,
-    /// Block size for chunked computation
+    /// Reserved for a future chunked parallel-scan implementation.
+    ///
+    /// `S5Layer::forward` (used by [`S5::step`]) is a single-step
+    /// sequential recurrence — the O(1)-per-token path needed for
+    /// autoregressive inference — so there is currently no batched/sequence
+    /// forward pass for this field to chunk. It is validated as non-zero (a
+    /// zero block size can never denote a real chunk) but otherwise has no
+    /// effect yet.
     pub block_size: usize,
 }
 
@@ -179,6 +186,29 @@ impl S5Block {
     fn reset(&mut self) {
         self.state.fill(0.0);
     }
+
+    /// Recompute the zero-order-hold discretization from `log_a`, `b_matrix`
+    /// and `dt`.
+    ///
+    /// Must be called after any of those three are replaced (e.g. by weight
+    /// loading); otherwise the block would keep stepping with the discretized
+    /// matrices derived from the previous parameters.
+    fn rediscretize(&mut self) {
+        let state_dim = self.log_a.len();
+        let hidden_dim = self.b_matrix.shape().get(1).copied().unwrap_or(0);
+        let mut a_bar = Array1::zeros(state_dim);
+        let mut b_bar = Array2::zeros(self.b_matrix.raw_dim());
+        for i in 0..state_dim {
+            let a_i = -self.log_a[i].exp();
+            a_bar[i] = (self.dt * a_i).exp();
+            let scale = (1.0 - a_bar[i]) / (-a_i);
+            for j in 0..hidden_dim {
+                b_bar[[i, j]] = self.b_matrix[[i, j]] * scale;
+            }
+        }
+        self.a_bar = a_bar;
+        self.b_bar = b_bar;
+    }
 }
 
 /// S5 layer with SSM block, activation, and normalization
@@ -278,11 +308,216 @@ impl S5 {
     pub fn config(&self) -> &S5Config {
         &self.config
     }
+
+    /// Load weights from a JSON file holding a `HashMap<String, Vec<f32>>`.
+    ///
+    /// Only keys present in the file are applied; missing keys leave the current
+    /// randomly-initialized values in place (graceful partial loading).
+    pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
+        let file = std::fs::File::open(path.as_ref()).map_err(|e| {
+            ModelError::load_error("s5 load_weights", format!("failed to open file: {e}"))
+        })?;
+        let weights: std::collections::HashMap<String, Vec<f32>> = serde_json::from_reader(file)
+            .map_err(|e| {
+                ModelError::load_error(
+                    "s5 load_weights",
+                    format!("JSON deserialization failed: {e}"),
+                )
+            })?;
+        self.load_weights_map(&weights).map(|_| ())
+    }
+
+    /// Load weights from an in-memory `name → flat f32 values` map.
+    ///
+    /// # Expected keys
+    ///
+    /// For each layer `i` in `0..num_layers`:
+    /// - `layers.{i}.input_proj`: `[input_dim, hidden_dim]`
+    /// - `layers.{i}.output_proj`: `[hidden_dim, input_dim]`
+    /// - `layers.{i}.s5_block.log_a`: `[state_dim]`
+    /// - `layers.{i}.s5_block.b_matrix`: `[state_dim, hidden_dim]`
+    /// - `layers.{i}.s5_block.c_matrix`: `[hidden_dim, state_dim]`
+    /// - `layers.{i}.s5_block.d_vec`: `[hidden_dim]`
+    ///
+    /// Replacing `log_a` or `b_matrix` invalidates the zero-order-hold
+    /// discretization, so it is recomputed for every layer that was touched.
+    pub fn load_weights_map(
+        &mut self,
+        weights: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> ModelResult<usize> {
+        // Number of tensors actually applied. The caller needs this to tell a
+        // genuine partial load from a weight map whose names match nothing at
+        // all — the latter would otherwise leave the model randomly
+        // initialised while reporting success.
+        let applied = std::cell::Cell::new(0usize);
+        let load_array2 = |map: &std::collections::HashMap<String, Vec<f32>>,
+                           key: &str,
+                           rows: usize,
+                           cols: usize|
+         -> ModelResult<Option<Array2<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != rows * cols {
+                    return Err(ModelError::load_error(
+                        "s5 load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {}×{}={} but got {}",
+                            key,
+                            rows,
+                            cols,
+                            rows * cols,
+                            data.len()
+                        ),
+                    ));
+                }
+                let arr = Array2::from_shape_vec((rows, cols), data.clone()).map_err(|e| {
+                    ModelError::load_error(
+                        "s5 load_weights",
+                        format!("failed to reshape '{}': {e}", key),
+                    )
+                })?;
+                applied.set(applied.get() + 1);
+                Ok(Some(arr))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let load_array1 = |map: &std::collections::HashMap<String, Vec<f32>>,
+                           key: &str,
+                           expected_len: usize|
+         -> ModelResult<Option<Array1<f32>>> {
+            if let Some(data) = map.get(key) {
+                if data.len() != expected_len {
+                    return Err(ModelError::load_error(
+                        "s5 load_weights",
+                        format!(
+                            "shape mismatch for '{}': expected {} but got {}",
+                            key,
+                            expected_len,
+                            data.len()
+                        ),
+                    ));
+                }
+                applied.set(applied.get() + 1);
+                Ok(Some(Array1::from_vec(data.clone())))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let input_dim = self.config.input_dim;
+        let hidden = self.config.hidden_dim;
+        let state = self.config.state_dim;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let prefix = format!("layers.{}", i);
+            let bp = format!("{}.s5_block", prefix);
+
+            if let Some(arr) = load_array2(
+                weights,
+                &format!("{}.input_proj", prefix),
+                input_dim,
+                hidden,
+            )? {
+                layer.input_proj = arr;
+            }
+            if let Some(arr) = load_array2(
+                weights,
+                &format!("{}.output_proj", prefix),
+                hidden,
+                input_dim,
+            )? {
+                layer.output_proj = arr;
+            }
+
+            let mut discretization_stale = false;
+            if let Some(arr) = load_array1(weights, &format!("{}.log_a", bp), state)? {
+                layer.s5_block.log_a = arr;
+                discretization_stale = true;
+            }
+            if let Some(arr) = load_array2(weights, &format!("{}.b_matrix", bp), state, hidden)? {
+                layer.s5_block.b_matrix = arr;
+                discretization_stale = true;
+            }
+            if let Some(arr) = load_array2(weights, &format!("{}.c_matrix", bp), hidden, state)? {
+                layer.s5_block.c_matrix = arr;
+            }
+            if let Some(arr) = load_array1(weights, &format!("{}.d_vec", bp), hidden)? {
+                layer.s5_block.d_vec = arr;
+            }
+
+            if discretization_stale {
+                layer.s5_block.rediscretize();
+            }
+        }
+
+        Ok(applied.get())
+    }
+
+    /// Serialize weights to an in-memory `name → flat f32 values` map.
+    ///
+    /// Covers exactly the keys [`Self::load_weights_map`] reads back — see
+    /// its doc for the full key list — so `save_weights_map` followed by
+    /// `load_weights_map` round-trips every parameter this model exposes a
+    /// way to read. `layer_norm`'s gain/bias are the one exception: this
+    /// crate's `kizzasi_core::LayerNorm` exposes `set_gamma`/`set_beta`
+    /// setters but no getters, so there is no way to read the *current*
+    /// normalization parameters back out to serialize them (this mirrors
+    /// `load_weights_map`, which correspondingly never touches
+    /// `layer_norm` either — the round trip is symmetric, not silently
+    /// lossy relative to what loading itself already restores).
+    pub fn save_weights_map(&self) -> std::collections::HashMap<String, Vec<f32>> {
+        let mut weights = std::collections::HashMap::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+            let bp = format!("{}.s5_block", prefix);
+
+            weights.insert(
+                format!("{}.input_proj", prefix),
+                layer.input_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.output_proj", prefix),
+                layer.output_proj.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.log_a", bp),
+                layer.s5_block.log_a.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.b_matrix", bp),
+                layer.s5_block.b_matrix.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.c_matrix", bp),
+                layer.s5_block.c_matrix.iter().copied().collect(),
+            );
+            weights.insert(
+                format!("{}.d_vec", bp),
+                layer.s5_block.d_vec.iter().copied().collect(),
+            );
+        }
+        weights
+    }
+
+    /// Save weights to a JSON file holding a `HashMap<String, Vec<f32>>`
+    /// (see [`Self::save_weights_map`] for exactly what is covered).
+    pub fn save_weights_json<P: AsRef<std::path::Path>>(&self, path: P) -> ModelResult<()> {
+        let weights = self.save_weights_map();
+        let file = std::fs::File::create(path.as_ref()).map_err(|e| {
+            ModelError::load_error("s5 save_weights", format!("failed to create file: {e}"))
+        })?;
+        serde_json::to_writer(file, &weights).map_err(|e| {
+            ModelError::load_error("s5 save_weights", format!("JSON serialization failed: {e}"))
+        })
+    }
 }
 
 impl SignalPredictor for S5 {
     #[instrument(skip(self, input))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.config.input_dim)?;
+
         let mut x = input.clone();
 
         for layer in &mut self.layers {
@@ -359,11 +594,120 @@ impl AutoregressiveModel for S5 {
 
         Ok(())
     }
+
+    fn load_weights_json(&mut self, path: &std::path::Path) -> ModelResult<()> {
+        S5::load_weights_json(self, path)
+    }
+
+    fn save_weights_json(&self, path: &std::path::Path) -> ModelResult<()> {
+        S5::save_weights_json(self, path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn small_s5() -> (S5Config, S5) {
+        let mut config = S5Config::new(2, 4, 1);
+        config.state_dim = 3;
+        let model = S5::new(config.clone()).expect("S5::new");
+        (config, model)
+    }
+
+    #[test]
+    fn test_load_weights_map_applies_projections() {
+        let (config, mut model) = small_s5();
+        let before = model.layers[0].input_proj.clone();
+
+        let values: Vec<f32> = (0..(config.input_dim * config.hidden_dim))
+            .map(|i| i as f32 * 0.125)
+            .collect();
+        let mut weights = std::collections::HashMap::new();
+        weights.insert("layers.0.input_proj".to_string(), values.clone());
+
+        let applied = model.load_weights_map(&weights).expect("load_weights_map");
+        assert_eq!(applied, 1, "exactly one tensor should have been applied");
+        assert_ne!(model.layers[0].input_proj, before);
+        for (i, v) in model.layers[0].input_proj.iter().enumerate() {
+            assert!((v - values[i]).abs() < 1e-6, "element {i}");
+        }
+    }
+
+    #[test]
+    fn test_load_weights_map_rediscretizes_ssm() {
+        let (config, mut model) = small_s5();
+        let a_bar_before = model.layers[0].s5_block.a_bar.clone();
+        let b_bar_before = model.layers[0].s5_block.b_bar.clone();
+
+        // A different log_a and B must invalidate the cached ZOH matrices.
+        let log_a: Vec<f32> = (0..config.state_dim).map(|i| 1.0 + i as f32).collect();
+        let b: Vec<f32> = (0..(config.state_dim * config.hidden_dim))
+            .map(|i| 0.5 + i as f32 * 0.25)
+            .collect();
+        let mut weights = std::collections::HashMap::new();
+        weights.insert("layers.0.s5_block.log_a".to_string(), log_a.clone());
+        weights.insert("layers.0.s5_block.b_matrix".to_string(), b.clone());
+
+        let applied = model.load_weights_map(&weights).expect("load_weights_map");
+        assert_eq!(applied, 2);
+
+        assert_ne!(
+            model.layers[0].s5_block.a_bar, a_bar_before,
+            "a_bar must be recomputed after log_a changes"
+        );
+        assert_ne!(
+            model.layers[0].s5_block.b_bar, b_bar_before,
+            "b_bar must be recomputed after B changes"
+        );
+
+        // Check the ZOH formula element-wise against the freshly loaded values.
+        let dt = config.dt;
+        for i in 0..config.state_dim {
+            let a_i = -log_a[i].exp();
+            let expected_a = (dt * a_i).exp();
+            assert!(
+                (model.layers[0].s5_block.a_bar[i] - expected_a).abs() < 1e-6,
+                "a_bar[{i}]: {} != {expected_a}",
+                model.layers[0].s5_block.a_bar[i]
+            );
+            let scale = (1.0 - expected_a) / (-a_i);
+            for j in 0..config.hidden_dim {
+                let expected_b = b[i * config.hidden_dim + j] * scale;
+                assert!(
+                    (model.layers[0].s5_block.b_bar[[i, j]] - expected_b).abs() < 1e-6,
+                    "b_bar[{i},{j}]: {} != {expected_b}",
+                    model.layers[0].s5_block.b_bar[[i, j]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_load_weights_map_reports_unmatched_names() {
+        let (_config, mut model) = small_s5();
+        let mut weights = std::collections::HashMap::new();
+        weights.insert("blocks.0.attn.q_proj".to_string(), vec![0.0f32; 8]);
+        let applied = model.load_weights_map(&weights).expect("load_weights_map");
+        assert_eq!(
+            applied, 0,
+            "unknown names must report zero applied tensors, not a silent success"
+        );
+    }
+
+    #[test]
+    fn test_load_weights_map_reports_shape_mismatch() {
+        let (_config, mut model) = small_s5();
+        let mut weights = std::collections::HashMap::new();
+        weights.insert("layers.0.input_proj".to_string(), vec![0.0f32; 3]);
+        let err = model
+            .load_weights_map(&weights)
+            .expect_err("wrong shape must be rejected");
+        assert!(
+            err.to_string().contains("layers.0.input_proj"),
+            "got: {err}"
+        );
+    }
 
     #[test]
     fn test_s5_creation() {
@@ -396,6 +740,58 @@ mod tests {
         let output2 = model.step(&input).expect("Failed to get output2");
         // After reset, same input should give similar output to first step
         assert_eq!(output2.len(), 32);
+    }
+
+    #[test]
+    fn test_s5_save_load_json_round_trip_identical_step_output() {
+        // Regression test for id103's real residual gap: S5 previously had
+        // no `save_weights_json` at all (the `AutoregressiveModel` trait
+        // default unconditionally errors), so an S5 model could never be
+        // persisted. `load_weights_json`/`create_s5` already worked -- this
+        // specifically exercises the save side and a full round trip.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uid = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let config = S5Config::new(6, 12, 2);
+        let mut model_a = S5::new(config.clone()).expect("S5::new (a)");
+
+        // Give the model non-default weights so a round trip that silently
+        // fell back to fresh random init would be detectable.
+        let input_proj_values: Vec<f32> = (0..(config.input_dim * config.hidden_dim))
+            .map(|i| 0.01 * i as f32)
+            .collect();
+        let mut seed_weights = std::collections::HashMap::new();
+        seed_weights.insert("layers.0.input_proj".to_string(), input_proj_values);
+        model_a
+            .load_weights_map(&seed_weights)
+            .expect("seeding model_a with distinct weights should succeed");
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("kizzasi_s5_roundtrip_test_{uid}.json"));
+
+        model_a
+            .save_weights_json(&tmp)
+            .expect("save_weights_json should succeed");
+
+        let mut model_b = S5::new(config).expect("S5::new (b)");
+        model_b
+            .load_weights_json(&tmp)
+            .expect("load_weights_json should succeed");
+        let _ = std::fs::remove_file(&tmp);
+
+        let input = Array1::from_vec(vec![0.2, -0.4, 0.6, -0.1, 0.3, -0.5]);
+        let out_a = model_a.step(&input).expect("model_a step");
+        let out_b = model_b.step(&input).expect("model_b step");
+
+        assert_eq!(out_a.len(), out_b.len());
+        for (a, b) in out_a.iter().zip(out_b.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "save->load round trip must reproduce identical step() \
+                 output: {a} vs {b}"
+            );
+        }
     }
 
     #[test]

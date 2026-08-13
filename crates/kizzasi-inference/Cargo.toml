@@ -14,27 +14,43 @@ documentation = "https://docs.rs/kizzasi-inference"
 homepage = "https://github.com/cool-japan/kizzasi"
 
 [features]
-default = ["std"]
+default = ["std", "mamba"]
 std = []
-# GPU features (optional - propagate to dependencies)
-cuda = ["kizzasi-core/cuda", "kizzasi-model/cuda", "kizzasi-tokenizer/cuda"]
+# GPU acceleration (optional, off by default). Forwards candle's Metal
+# backend through `kizzasi-core/metal`, which is live on Apple targets and
+# inert -- but still buildable -- everywhere else, so `--all-features` works on
+# every host; the `kizzasi-metal` crate explains how that target gating is
+# done. There is no `cuda` counterpart -- see kizzasi-core's `[features]` for
+# why a CUDA flag cannot be offered without breaking every non-CUDA build.
 metal = ["kizzasi-core/metal", "kizzasi-model/metal", "kizzasi-tokenizer/metal"]
 # Async and streaming
 async = ["dep:tokio", "dep:tokio-stream", "dep:futures", "dep:async-stream"]
 streaming = ["async"]
 msgpack = ["dep:rmp-serde"]
-mamba = []
+# Forwards to kizzasi-model's own (default-on) `mamba` feature so the
+# registry's Mamba/Mamba2 branches are reachable by default, matching the
+# top-level README's description of Mamba2 as the default architecture, and
+# so that `default-features = false, features = ["mamba"]` compiles even
+# against a `default-features = false` kizzasi-model.
+mamba = ["kizzasi-model/mamba"]
 # Network adapters
 websocket = ["streaming", "dep:tokio-tungstenite", "dep:bytes"]
 mqtt = ["streaming", "dep:rumqttc", "dep:bytes"]
 grpc = ["streaming", "dep:tonic", "dep:prost", "dep:bytes", "dep:http", "dep:http-body", "dep:tower-service"]
-rest = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio"]
+# `rest` needs `streaming` for `StreamingEngine`, the same engine-hosting type
+# `websocket`/`mqtt`/`grpc` already build on: `POST /infer` runs real
+# inference through it instead of being a hardcoded mock.
+rest = ["streaming", "dep:axum", "dep:tower", "dep:tower-http", "dep:tokio"]
 network = ["websocket", "mqtt", "grpc"]
 
 [dependencies]
 # Internal crates
 kizzasi-core.workspace = true
-kizzasi-model.workspace = true
+# `registry.rs` builds RWKV (v6/v5), S4 and Transformer models unconditionally,
+# so those architecture features are required here rather than assumed from
+# kizzasi-model's defaults; `mamba` stays behind this crate's own `mamba`
+# feature, which does gate code in `registry.rs`.
+kizzasi-model = { workspace = true, features = ["rwkv", "s4", "transformer"] }
 kizzasi-tokenizer.workspace = true
 kizzasi-logic.workspace = true
 

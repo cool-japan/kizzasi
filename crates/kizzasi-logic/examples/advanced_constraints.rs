@@ -20,11 +20,17 @@ fn main() {
         0.95, // 95% confidence
         25.0, // mean temperature
         3.0,  // std dev
-    );
+    )
+    .expect("valid chance constraint");
 
     println!("   Constraint: {}", chance.name());
     println!("   Confidence: {}", chance.confidence());
-    println!("   Tightened bound: {:.2}°C", chance.get_tightened_bound());
+    println!(
+        "   Tightened bound: {:.2}°C",
+        chance
+            .get_tightened_bound()
+            .expect("gaussian tightening succeeds")
+    );
     println!("   (Mean + 1.96*σ for 95% confidence)\n");
 
     // ============================================
@@ -37,10 +43,13 @@ fn main() {
         "power_limit",
         vec![-5.0, -3.0], // min deviations
         vec![5.0, 3.0],   // max deviations
-    );
+    )
+    .expect("valid robust constraint");
 
     let x = [10.0, 20.0];
-    let worst_case = robust.worst_case_scenario(&x);
+    let worst_case = robust
+        .worst_case_scenario(&x)
+        .expect("box worst case succeeds");
     println!("   Constraint: {}", robust.name());
     println!("   Nominal values: {:?}", x);
     println!("   Worst-case scenario: {:?}\n", worst_case);
@@ -50,7 +59,8 @@ fn main() {
         "response_time",
         vec![100.0, 50.0], // nominal response times (ms)
         10.0,              // uncertainty radius
-    );
+    )
+    .expect("valid ellipsoidal constraint");
 
     println!("   Ellipsoidal uncertainty:");
     println!("   Nominal: [100ms, 50ms]");
@@ -67,7 +77,8 @@ fn main() {
         0.05,  // α = 5% (worst 5% of cases)
         100.0, // threshold
         1000,  // number of scenarios
-    );
+    )
+    .expect("valid CVaR constraint");
 
     // Sample losses from different scenarios
     let scenario_losses: Vec<f32> = (0..100)
@@ -110,7 +121,8 @@ fn main() {
         50.0, // threshold
         100,  // number of samples
         0.5,  // Wasserstein radius
-    );
+    )
+    .expect("valid Wasserstein constraint");
 
     // Sample consumption data
     let consumption_data = vec![30.0, 35.0, 40.0, 45.0, 50.0, 55.0];
@@ -144,7 +156,8 @@ fn main() {
         10.0,           // threshold
         vec![5.0, 3.0], // mean defect rates
         1.0,            // covariance radius
-    );
+    )
+    .expect("valid moment-based constraint");
 
     let defect_data = vec![4.0, 5.0, 6.0, 5.0, 7.0, 4.0];
 

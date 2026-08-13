@@ -9,6 +9,181 @@
   - **Tests:** `test_custom_alignment_64`, `test_invalid_alignment_rejected`, `test_alignment_metadata_as_uint32`; keep existing GGUF tests green.
   - **Risk:** Existing tests that hard-code 32-byte padding must remain green; the restructure must not regress default-alignment parsing.
 
+## Production-Readiness Sweep (2026-08-10, /loop ultracode audit)
+
+A 16-agent exhaustive audit (11 per-crate + 5 cross-cutting lenses) surfaced 344 deduplicated findings
+(39 critical / 115 high / 158 medium / 32 low), triaged into 20 conflict-free work packages.
+Full machine-readable findings: session scratchpad `findings_deduped.json` / `packages/*.json`.
+
+### Critical findings (all scheduled for implementation)
+
+**kizzasi**
+- [x] `kizzasi/src/distributed.rs:263` — DistributedPredictor::set_guardrails is a silent no-op — safety constraints are never applied to any worker
+- [x] `kizzasi/src/predictor.rs:137` — KizzasiConfig.weights_path is accepted everywhere but never loads any weights — models always run on random init
+- [x] `kizzasi/src/predictor.rs:95` — ModelType selection is a complete no-op: every model type produces the identical SelectiveSSM, and the facade cannot reach kizzasi-model at all
+- [x] `kizzasi/src/predictor.rs:302` — KizzasiConfig::model_type is stored but never dispatched — facade always runs SelectiveSSM
+- [x] `kizzasi/src/predictor.rs:628` — Kizzasi::fork() re-randomizes all model weights instead of cloning them
+- [x] `kizzasi/src/predictor.rs:302` — ModelType is inert: Mamba/Mamba2/S4/RWKV all build the identical SelectiveSSM
+**kizzasi-core**
+- [x] `kizzasi-core/src/config.rs:139` — weights_path is accepted by the builder and config file but never loaded — models silently run on random weights
+- [x] `kizzasi-core/src/config.rs:101` — weights_path / load_weights is stored and never read — trained weights silently never load
+- [x] `kizzasi-core/src/scan.rs:151` — Advertised O(log N) parallel SSM scan always falls back to the sequential scan because identity() returns None
+- [x] `kizzasi-core/src/simd.rs:53` — dot_view silently returns 0.0 for non-contiguous views instead of erroring
+- [x] `kizzasi-core/src/training_loop.rs:307` — LR scheduler is computed and logged but never applied to the optimizer — all schedulers are no-ops
+**kizzasi-embedded**
+- [x] `kizzasi-embedded/src/ssm.rs:155` — MambaStep treats `a_log` as raw A instead of log(-A): real Mamba weights diverge silently
+**kizzasi-inference**
+- [x] `kizzasi-inference/src/adapters/rest.rs:388` — REST /infer endpoint is a hardcoded mock: it never runs the inference engine
+- [x] `kizzasi-inference/src/batch.rs:173` — BatchScheduler can never load a model — the entire continuous-batching module always errors
+- [x] `kizzasi-inference/src/pool.rs:255` — TensorPool transmutes Vec<T> based on a caller-supplied dtype string — safe API causes UB / heap corruption
+- [x] `kizzasi-inference/src/streaming.rs:191` — Batched streaming path busy-spins a core forever and its output stream never terminates
+**kizzasi-io**
+- [x] `kizzasi-io/src/compression.rs:402` — decompress_dpcm slices out of bounds on attacker/corruption-controlled predictor_order
+- [x] `kizzasi-io/src/mqtt.rs:415` — MQTT never re-subscribes after a reconnect, so the client silently receives nothing forever
+- [x] `kizzasi-io/src/mqtt.rs:277` — MQTT silently connects in plaintext when use_tls is true but no CA certificate path is set
+- [x] `kizzasi-io/src/ros2.rs:199` — Ros2Stream drops every subscription immediately and read() always returns zeros
+- [x] `kizzasi-io/src/ros2.rs:288` — Ros2Stream silently returns all-zero arrays forever: subscriptions are dropped immediately and the buffer is never filled
+- [x] `kizzasi-io/src/signal/wavelets.rs:249` — WaveletAnalyzer::idwt does not invert dwt for any wavelet except Haar — IDWT/denoise output is garbage
+- [x] `kizzasi-io/src/video.rs:1205` — VideoReader is a stub that reports success: never opens the source, always returns end-of-stream, fabricates metadata
+- [x] `kizzasi-io/src/zeromq.rs:232` — ZmqStream::connect creates no socket; the default SUB pattern always errors; PULL/PUB build and destroy a socket per message; 7 config fields never read
+**kizzasi-logic**
+- [x] `kizzasi-logic/src/constraint/basic.rs:205` — Constraint::project() produces points that Constraint::check() rejects (strict bounds)
+- [x] `kizzasi-logic/src/constraint_repair.rs:112` — ConstraintRepairer returns the unmodified input as the 'repaired point' and evaluates every constraint at point[0]
+- [x] `kizzasi-logic/src/decomposition.rs:767` — BendersDecomposition is a fake solver: subproblem returns hardcoded constants and iterate() always reports converged with a zero solution
+- [x] `kizzasi-logic/src/mpc.rs:457` — MPCController::project_control ignores the actual control constraints and clamps to a hardcoded [-10, 10]
+**kizzasi-model**
+- [x] `kizzasi-model/src/gguf/dequant.rs:113` — Legacy GGUF quant types emit elements in the wrong order (Q4_0/Q4_1/Q5_0/Q5_1/Q6_K)
+- [x] `kizzasi-model/src/gguf_dequant.rs:89` — GGUF K-quant dequantization does not match the GGML block layout (Q2_K/Q3_K/Q4_K/Q5_K produce garbage)
+- [x] `kizzasi-model/src/mamba.rs:404` — Mamba selective-SSM recomputes the B and C projections batch_size times (loop-invariant inner sum)
+- [x] `kizzasi-model/src/rwkv.rs:309` — RWKV WKV recurrence is numerically wrong: scalar normalizer shared across channels, decay applied without the exp(-exp(w)) transform
+**kizzasi-python**
+- [x] `kizzasi-python/python/kizzasi/__init__.py:19` — Python package __init__.py exports only 2 of the 12 registered classes — 10 documented classes raise AttributeError
+- [x] `kizzasi-python/src/lib.rs:70` — pymodule init symbol is PyInit_kizzasi but maturin installs the artifact as kizzasi._kizzasi, which CPython loads via PyInit__kizzasi
+- [x] `kizzasi-python/src/predictor.rs:83` — Guardrails silently discard min_val whenever both min_val and max_val are given — lower bound is never enforced
+**kizzasi-tokenizer**
+- [x] `kizzasi-tokenizer/src/entropy/encoder.rs:354` — ArithmeticEncoder emits a fixed 12-byte payload with no renormalization — silently wrong decode plus u64 underflow panic
+- [x] `kizzasi-tokenizer/src/entropy/encoder.rs:492` — RangeEncoder/RangeDecoder silently corrupt streams when any symbol probability is below 2^-14
+**kizzasi-webgpu**
+- [x] `kizzasi-webgpu/src/backend.rs:198` — All wgpu validation errors abort the process; the documented WebGpuError::Other path is unreachable
+- [x] `kizzasi-webgpu/src/ssm_scan.rs:199` — ssm_scan_gpu silently returns wrong results for sequences > 256 elements
+
+### Results (completed 2026-08-10, same day)
+
+All 20 packages executed (17 parallel per-crate + 3 serial cross-crate) and the verification gate passed:
+
+- **Outcomes:** 291 implemented, 18 honest-docs (API made truthful where real implementation is infeasible in pure Rust), 1 deferred (facade doctest wiring, below), ~34 absorbed by sibling packages in the same crate chain (re-verified individually).
+- **All 39 critical findings resolved** (checkboxes above).
+- **Tests:** 2,744 → 3,624 passed (+880; 619 new regression tests reported by implementers), 0 failed, 24 skipped (pre-existing #[ignore] only — verified no new #[ignore] was introduced).
+- **Gates:** cargo build/clippy(--all-targets)/nextest/doc — all zero warnings; `cargo deny check bans` passes against the new workspace `deny.toml`.
+- [ ] Deferred: facade doctest wiring (`#![doc = include_str!("../README.md")]` + converting `rust,ignore` fences) — docs-only, tracked for a later pass.
+- [ ] Known-honest remaining gap: PEAQ NN weights are LCG-seeded placeholders behind `WEIGHTS_ARE_TRAINED = false` (ITU-R BS.1387-1 Annex 2 tables are paid); output documented as relative-only.
+
+### Work packages (high/medium/low handled per package)
+
+| Package | Model | Findings | Scope |
+|---------|-------|---------:|-------|
+| core-A | opus | 11 | kizzasi-core: training loop, SSM state, backend trait |
+| core-B | sonnet | 35 | kizzasi-core: scan/parallel/SIMD/S5/misc |
+| emb | opus | 22 | kizzasi-embedded: a_log, fixed-point |
+| inf-A | opus | 18 | kizzasi-inference: engine/batch/streaming/pool/speculative |
+| inf-B | sonnet | 21 | kizzasi-inference: REST, hotswap, LoRA, samplers |
+| io-A | opus | 11 | kizzasi-io: zeromq/ros2/video adapters |
+| io-B | sonnet | 22 | kizzasi-io: mqtt, compression, misc |
+| io-C | opus | 4 | kizzasi-io: wavelets, STOI/PESQ |
+| logic-A | opus | 7 | kizzasi-logic: Benders, MPC, constraint repair |
+| logic-B | sonnet | 27 | kizzasi-logic: gpu_acceleration honesty, misc |
+| macros | sonnet | 16 | kizzasi-macros: misc |
+| model-A | opus | 7 | kizzasi-model: GGUF dequant, RWKV recurrence |
+| model-B | sonnet | 26 | kizzasi-model: mamba perf, weight I/O, distributed, features |
+| py | sonnet | 19 | kizzasi-python: exports, GIL, guardrails |
+| tok-A | opus | 4 | kizzasi-tokenizer: entropy coders |
+| tok-B | sonnet | 25 | kizzasi-tokenizer: misc |
+| w2-crosscut | sonnet | 4 | cross-crate leftovers |
+| w2-facade | opus | 41 | facade: ModelType dispatch, weights_path, OptimizationConfig wiring |
+| w2-features | opus | 6 | workspace: cuda/metal/webgpu features, purity, deny.toml |
+| webgpu | opus | 18 | kizzasi-webgpu: scan correctness, errors, thresholds |
+
+### Wave 1 — kizzasi-io video-pure feature (2026-08-11)
+
+Follow-up to the `io-A` package above (`kizzasi-io/src/video.rs:1205`, the stub `VideoReader`):
+a from-scratch pure-Rust video backend, built in six packages (B1-B6) on top of the FFmpeg fix.
+
+- [x] **B1 — dispatch facade**: `src/video.rs` (2152 lines) split into
+  `src/video/{mod, types, processing, backend_ffmpeg, backend_pure, backend_pure_camera}.rs`;
+  `VideoBackend` enum (`Auto`/`Ffmpeg`/`Pure`) added to `VideoConfig::backend`; `resolve_backend`/
+  `resolve_auto` route per source (Y4M file / other file / camera / network) between the two
+  backend implementations. Public `kizzasi_io::Video*` surface unchanged.
+- [x] **B2 — Y4M pure path**: `backend_pure::PureReader` decodes Y4M end to end via
+  `oximedia-container`'s `Y4mDemuxer` + `oximedia-core` conversion + `oximedia-cv` rescale, held to
+  the same observable contract as `FfmpegReader` (frame indices, timestamps, decimation, buffering,
+  `max_frames`) and enforced by `reader_tests` running its suite once per compiled-in backend.
+- [x] **B3 — camera pure path**: `backend_pure_camera` opens a live device via `oximedia-capture`
+  on Linux (V4L2) / macOS (AVFoundation) / Windows (Media Foundation), negotiating NV12 → YUYV/UYVY
+  → planar 4:2:0/RGB24 → MJPEG in ascending conversion cost; `CameraDevice::list_devices()` real
+  enumeration on every platform (Linux now `VIDIOC_QUERYCAP`-filtered, replacing the old
+  `video`-only path's unconditional `/dev/video*` scan); `VideoConfig::from_camera`'s
+  `camera_format` default-platform bug fixed (was hardcoded `"video4linux2"` on every OS).
+- [x] **B4 — mock e2e tests**: camera-path tests drive `oximedia_capture::mock`, a scripted,
+  deterministic capture backend, so the full suite (decimation, `max_frames`, tiny buffers, format
+  conversion, seek refusal, a scripted fatal capture error) runs without real hardware.
+- [x] **B5 — test-matrix hardening**: four-config audit (`video`; `video-pure` alone,
+  `--no-default-features --features std,video-pure`; both; neither) — **291 / 335 / 344 / 267**
+  tests passed respectively, 0 failed, 0 skipped, confirmed via `scripts/check-video-matrix.sh`
+  (new; also runs `bench --no-run` on all four configs, `clippy --all-targets -D warnings` on
+  `video,video-pure` and `video-pure` alone, `cargo doc`/`test --doc` with
+  `RUSTDOCFLAGS="-D warnings"`, and `cargo deny check bans`). Added
+  `reader_tests::test_auto_routes_y4m_to_pure_observably`: opens the same 4:2:0 Y4M file once via
+  `Auto` and once forced onto `Pure` and asserts byte-identical frames -- chosen over the `Cmono`
+  parity fixture because Pure/FFmpeg YUV→RGB conversion is *not* guaranteed to agree there, which
+  is what gives the comparison discriminating power without a backend-introspection API. Confirmed
+  all five `tests/integration_tests.rs` video cfg sites are already `any(feature = "video", feature
+  = "video-pure")` (no fix needed). Confirmed the bench file's `#[cfg(feature = "video")]` /
+  `#[cfg(not(feature = "video"))]` `criterion_main!` arms compile under all four configs as-is; left
+  untouched (not broken) -- `bench_optical_flow` itself stays gated on `video` only, so it does not
+  run under a `video-pure`-only build, a coverage gap rather than a compile break.
+- [x] **B6 — documentation**: `src/video/mod.rs` module doc gained an explicit per-source routing
+  table, a "what the pure backend does not do" list (OxiMedia's Red List: H.264/H.265/H.266/AAC
+  excluded permanently on patent grounds, not "not yet"), and a verification-status paragraph.
+  `crates/kizzasi-io/README.md` and root `README.md` coherence pass (see CHANGELOG `[0.2.3]` for
+  the itemised changes); new "Testing the video backends" section in the crate README.
+
+**Verification claim, precisely scoped:** Y4M decode and camera capture are exercised on every
+test run via synthetic Y4M fixtures and `oximedia_capture::mock` (scripted, deterministic, no real
+hardware or OS permission prompt touched). Real hardware is a narrower claim: while preparing B6,
+`CameraDevice::list_devices()` was run against the real platform API on this workspace's macOS
+development machine and correctly reached AVFoundation and surfaced a genuine TCC permission error
+(`IoError::Connection`, message naming TCC) rather than fabricating a device list or panicking --
+evidence the integration is wired to the real capture API, not evidence a real camera was
+enumerated (this machine has not granted the process Camera access). Linux and Windows capture
+have not been exercised against real hardware from this repository at all.
+
+**Deferred (not attempted this wave -- upstream or out of scope, not silently dropped):**
+- **Network-stream pure video.** `VideoSource::Network` stays FFmpeg-only. `oximedia-net` has a
+  real RTSP 1.0 client/server and RTP packet parsing (`RtpPacket::parse`, RFC 3550), but
+  `kizzasi-io` does not depend on `oximedia-net` at all today, and RTP packet parsing is not the
+  same thing as the per-codec RTP depacketizers a decode pipeline needs on top of it (`oximedia-net`
+  itself documents that depacketization "lives in the codec depacketizers", a separate piece).
+  Wiring this up is a multi-step upstream dependency, not a kizzasi-io-local fix -- and even once
+  wired, it would only ever cover patent-free codecs the Red List allows, which most legacy RTSP
+  cameras do not emit.
+- **O(1) Y4M seek.** `PureReader::seek` reopens the file and drains frames sequentially back to the
+  target (`backend_pure.rs`'s `reopen` + drain, see its `debug!` log message) rather than computing
+  a byte offset directly. Y4M's fixed per-frame size after the header makes an O(1) seek
+  computable in principle; `oximedia-container`'s `Y4mDemuxer` does not expose that today, so doing
+  it properly is upstream work, not a kizzasi-io-local one.
+- **NV12 cross-path byte-equality.** The Y4M/container path's YUV→RGB (`oximedia-core`'s
+  `convert::pixel::yuv420_to_rgb`, BT.601 fixed-point scaled ×1024) and the camera/capture path's
+  NV12→RGB (`convert::simd_pixel::nv12_to_rgb24`, a separate `YuvCoeffs`-based fixed-point
+  implementation) are two independent converters in `oximedia-core`. Unifying them so the same
+  conceptual YUV 4:2:0 sample produces byte-identical RGB regardless of which path decoded it is
+  upstream `oximedia-core` work; `reader_tests` already documents (rather than hides) the resulting
+  cross-backend colour tolerance for 4:2:0 content.
+- **Real-device smoke testing.** Left to whoever runs this on hardware with a camera attached and
+  permission granted. `oximedia-capture` itself already has this convention one layer down --
+  `OXIMEDIA_CAPTURE_DEVICE`-gated `#[ignore]`d tests in its own `tests/live_capture.rs` -- but
+  `kizzasi-io` has no equivalent test of its own yet; adding one (or documenting running
+  `oximedia-capture`'s directly) is future work, not done this wave.
+
 ## Project Overview
 
 **Kizzasi** (兆し) - Autoregressive General-Purpose Signal Predictor (AGSP)
@@ -17,33 +192,34 @@ A Rust-native system for predicting continuous signal streams (audio, sensors, v
 
 ---
 
-## Current Status (v0.2.2)
+## Current Status (v0.2.3)
 
 ### Codebase Metrics
 
 | Metric | Value |
 |--------|-------|
-| Total Lines | ~140,000 Rust ⬆️ |
-| Crates | 11 |
-| Test Count | 2,744 (workspace, all-features) |
+| Total Lines | ~170,200 Rust |
+| Crates | 12 |
+| Test Count | 3,688 passed, 24 skipped (workspace, all-features) |
 | Coverage | Core paths + comprehensive |
-| Last Updated | 2026-08-09 |
+| Last Updated | 2026-08-12 |
 
 ### Implementation Status by Crate
 
 | Crate | Status | Completion |
 |-------|:------:|:----------:|
-| kizzasi-core | Production | 90% |
-| kizzasi-model | Production | 90% ⬆️ |
-| kizzasi-tokenizer | Production | 85% |
-| kizzasi-inference | Production | 85% ⬆️ |
-| kizzasi-logic | Production | 90% |
-| kizzasi-io | Production | 80% |
-| kizzasi | Production | 85% |
-| kizzasi-webgpu | Production | 80% |
-| kizzasi-embedded | Production | 75% |
-| kizzasi-macros | Production | 100% ✅ |
-| kizzasi-python | Production | 80% |
+| kizzasi-core | Stable | 90% |
+| kizzasi-model | Stable | 90% |
+| kizzasi-tokenizer | Stable | 85% |
+| kizzasi-inference | Stable | 85% |
+| kizzasi-logic | Stable | 90% |
+| kizzasi-io | Stable | 80% |
+| kizzasi | Stable | 85% |
+| kizzasi-webgpu | Alpha | 80% |
+| kizzasi-embedded | Stable | 75% |
+| kizzasi-macros | Stable | 100% ✅ |
+| kizzasi-metal | Stable | 100% ✅ |
+| kizzasi-python | Alpha | 80% |
 
 ---
 
@@ -377,13 +553,14 @@ kizzasi/
 |---------|------|------------|
 | v0.1.0 | 2024-12 | Initial release, core SSM engine |
 | v0.2.0 | 2026-03 | JSON weight I/O (save/load_weights_json all models), NameRemapper, factory injection, file splits (vqvae, training) |
-| v0.2.2 | 2026-04-28 | WebGPU acceleration (kizzasi-webgpu), TensorLogic-IR integration, multi-speaker tokenizer, Bark-scale perceptual quantizer |
+| v0.2.2 | 2026-08-09 | WebGPU acceleration (kizzasi-webgpu), real tensorlogic-ir constraint pipeline, PEAQ perceptual audio quality evaluation, workspace-wide numerical/logic correctness sweep |
+| v0.2.3 | 2026-08-12 | 100% C-free default build (candle onig→fancy-regex patch), pure-Rust `video-pure` feature (OxiMedia Y4M decode + camera capture), pure `mqtt-tls` (rustls + RustCrypto provider), new `kizzasi-metal` crate for cross-platform-safe Apple Metal activation |
 | v0.3.0 | TBD | Training infrastructure |
 | v1.0.0 | TBD | Production-ready, stable API |
 
 ---
 
-*Last Updated: 2026-05-17*
+*Last Updated: 2026-08-12*
 
 ### v0.2.x iteration follow-up (2026-05-17)
 

@@ -136,16 +136,55 @@ impl OdgGrade {
 }
 
 /// Complete result of a PEAQ evaluation.
+///
+/// # Which fields are meaningful
+///
+/// [`PeaqResult::movs`] is produced by the fully implemented ear model and MOV
+/// calculators, and responds monotonically to added distortion.
+///
+/// [`PeaqResult::distortion_index`], [`PeaqResult::odg`] and
+/// [`PeaqResult::grade`] all come from the 11→3→1 neural network, whose
+/// weights are LCG-seeded placeholders while
+/// [`crate::peaq::nn::WEIGHTS_VERIFIED`] is `false` (the real coefficients are
+/// BS.1387-1 Annex 2 Tables B.11/B.12, available only in the paid ITU
+/// document). Consequently those three fields are **not ordered with respect
+/// to signal quality**: a more heavily degraded signal can, and in practice
+/// does, produce a numerically higher ODG. Compare MOVs, not ODGs, until the
+/// standard weights are installed.
 #[derive(Debug, Clone)]
 pub struct PeaqResult {
     /// All 11 Model Output Variables.
+    ///
+    /// This is the part of the result backed by a complete implementation.
     pub movs: PeaqMovs,
     /// Distortion Index (DI) — output of the neural network, before ODG mapping.
+    ///
+    /// Placeholder-weight caveat: see the [`PeaqResult`] type documentation.
     pub distortion_index: f32,
     /// Objective Difference Grade (ODG) in `[-4, 0]`.
+    ///
+    /// Guaranteed finite and inside `[-4, 0]`, but **not comparable between
+    /// signals** while the network weights are placeholders. See the
+    /// [`PeaqResult`] type documentation.
     pub odg: f32,
     /// Perceptual quality grade corresponding to the ODG value.
+    ///
+    /// Inherits the ODG caveat: see the [`PeaqResult`] type documentation.
     pub grade: OdgGrade,
+}
+
+impl PeaqResult {
+    /// Whether `distortion_index`/`odg`/`grade` come from certified
+    /// BS.1387-1 Annex 2 weights (`true`) or from the LCG-seeded
+    /// placeholder weights described above (`false`).
+    ///
+    /// A programmatic way to check the caveat this type's documentation
+    /// describes, for callers that branch on it rather than just reading
+    /// the docs (e.g. to skip ODG-based filtering, or to emit a warning,
+    /// until real weights are installed).
+    pub fn is_certified(&self) -> bool {
+        crate::peaq::nn::WEIGHTS_VERIFIED
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +237,14 @@ impl PeaqEvaluator {
     /// Evaluate perceptual quality by comparing `reference` to `test`.
     ///
     /// Both signals must have the same length and be at least `frame_size` samples long.
+    ///
+    /// # Interpreting the result
+    ///
+    /// The returned [`PeaqResult::movs`] are computed end to end and increase
+    /// with distortion. The `distortion_index`, `odg` and `grade` fields are
+    /// produced by a neural network whose weights are placeholders until
+    /// [`nn::WEIGHTS_VERIFIED`] is `true`, so they do **not** rank signals by
+    /// quality — see [`PeaqResult`] for the full caveat.
     ///
     /// # Errors
     /// - `TokenizerError::InvalidConfig` if `reference.len() != test.len()`.
@@ -520,6 +567,97 @@ mod integration {
         assert!(
             result.is_err(),
             "Non-power-of-two frame_size should return error"
+        );
+    }
+
+    /// Increasing degradation must move the Model Output Variables in the
+    /// degraded direction.
+    ///
+    /// Before this test the whole PEAQ suite only checked that ODG was finite
+    /// and inside `[-4, 0]`, which any constant satisfies — a quality metric
+    /// that cannot discriminate at all would have passed. The assertions here
+    /// are placed on the MOVs rather than on the ODG deliberately: the ear
+    /// model and the MOV calculators are fully implemented, whereas the ODG is
+    /// produced by placeholder network weights (see [`PeaqResult`]) and is not
+    /// ordered with respect to quality. Once
+    /// [`nn::WEIGHTS_VERIFIED`] is `true`, the same sweep should additionally
+    /// assert that `odg` decreases.
+    #[test]
+    fn test_movs_degrade_monotonically_with_noise() {
+        let mut evaluator = PeaqEvaluator::new(PeaqConfig::default()).unwrap();
+        let signal = sine_wave(1000.0, 48_000.0, 48_000);
+        let noise = white_noise(48_000, 42);
+
+        let amplitudes = [0.0f32, 0.001, 0.01, 0.05, 0.1, 0.3];
+        let results: Vec<PeaqResult> = amplitudes
+            .iter()
+            .map(|&amplitude| {
+                let noisy: Array1<f32> = Array1::from_iter(
+                    signal
+                        .iter()
+                        .zip(noise.iter())
+                        .map(|(&s, &n)| s + amplitude * n),
+                );
+                evaluator
+                    .evaluate(&signal, &noisy)
+                    .expect("evaluation must succeed")
+            })
+            .collect();
+
+        // An identical pair must register no modulation difference and no
+        // error-harmonic structure at all.
+        let clean = results.first().expect("sweep is non-empty");
+        assert_eq!(clean.movs.win_mod_diff_1_b, 0.0);
+        assert_eq!(clean.movs.avg_mod_diff_1_b, 0.0);
+        assert_eq!(clean.movs.avg_mod_diff_2_b, 0.0);
+        assert_eq!(clean.movs.ehs_b, 0.0);
+
+        for (window, amps) in results.windows(2).zip(amplitudes.windows(2)) {
+            let (lower, higher) = (&window[0], &window[1]);
+            let (amp_lo, amp_hi) = (amps[0], amps[1]);
+
+            // Modulation-difference MOVs grow strictly with added noise.
+            assert!(
+                higher.movs.win_mod_diff_1_b > lower.movs.win_mod_diff_1_b,
+                "WinModDiff1B must increase from amp {} to {}: {} vs {}",
+                amp_lo,
+                amp_hi,
+                lower.movs.win_mod_diff_1_b,
+                higher.movs.win_mod_diff_1_b
+            );
+            assert!(
+                higher.movs.avg_mod_diff_1_b > lower.movs.avg_mod_diff_1_b,
+                "AvgModDiff1B must increase from amp {} to {}: {} vs {}",
+                amp_lo,
+                amp_hi,
+                lower.movs.avg_mod_diff_1_b,
+                higher.movs.avg_mod_diff_1_b
+            );
+            assert!(
+                higher.movs.avg_mod_diff_2_b > lower.movs.avg_mod_diff_2_b,
+                "AvgModDiff2B must increase from amp {} to {}: {} vs {}",
+                amp_lo,
+                amp_hi,
+                lower.movs.avg_mod_diff_2_b,
+                higher.movs.avg_mod_diff_2_b
+            );
+            // EhsB saturates at its ceiling, so it is only non-decreasing.
+            assert!(
+                higher.movs.ehs_b >= lower.movs.ehs_b,
+                "EhsB must not improve from amp {} to {}: {} vs {}",
+                amp_lo,
+                amp_hi,
+                lower.movs.ehs_b,
+                higher.movs.ehs_b
+            );
+        }
+
+        // Across the full sweep the change must be substantial, not noise.
+        let loudest = results.last().expect("sweep is non-empty");
+        assert!(
+            loudest.movs.ehs_b > 0.5,
+            "EhsB should be well above zero for audible noise, got {}",
+            loudest.movs.ehs_b
         );
     }
 }

@@ -15,10 +15,12 @@ use scirs2_core::ndarray::Array1;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Pipeline Usage Example ===\n");
 
-    // 1. Create and configure model
+    // 1. Create and configure model.
+    //    Transformer has no output-projection layer, so output_dim must
+    //    equal input_dim.
     let mut registry = ModelRegistry::new();
     let model_config = ModelBuilder::transformer()
-        .dims(1, 128, 10)
+        .dims(1, 128, 1)
         .layers(3)
         .build();
 
@@ -32,14 +34,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .temperature(0.8);
 
     // 3. Build pipeline
-    let engine_config = EngineConfig::new(1, 10)
+    let engine_config = EngineConfig::new(1, 1)
         .sampling(sampling)
         .use_embeddings(true);
 
     let mut pipeline = PipelineBuilder::new()
         .engine_config(engine_config)
         .model(model)
-        .with_constraints() // Enable constraint enforcement (placeholder)
+        // Constraint enforcement needs a GuardrailSet; see the full_stack_agsp
+        // example for a pipeline that configures one.
         .build()?;
 
     println!("Pipeline created successfully!");

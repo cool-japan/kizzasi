@@ -238,16 +238,37 @@ pub struct FullStateCheckpoint {
 
 impl FullStateCheckpoint {
     /// Create a new full state checkpoint from a predictor
-    pub fn from_predictor(predictor: &Kizzasi) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Only the [`SelectiveSSM`] engine ([`kizzasi_core::ModelType::Mamba2`])
+    /// serialises its weights and hidden state. The `kizzasi-model`
+    /// architectures reachable through the other `ModelType` variants are not
+    /// serialisable, so this returns [`KizzasiError::InvalidState`] for them
+    /// rather than writing a checkpoint that would silently restore a
+    /// different model. Persist those with [`Kizzasi::save_weights`].
+    pub fn from_predictor(predictor: &Kizzasi) -> KizzasiResult<Self> {
+        let ssm = predictor.ssm().ok_or_else(|| {
+            KizzasiError::invalid_state_with_recovery(
+                format!(
+                    "full-state checkpoints require the SelectiveSSM engine, but this \
+                     predictor runs a {}",
+                    predictor.engine_name()
+                ),
+                "use ModelType::Mamba2, or persist parameters with Kizzasi::save_weights \
+                 and rebuild with KizzasiBuilder::weights_path",
+            )
+        })?;
+
+        Ok(Self {
             version: CHECKPOINT_VERSION,
-            ssm: predictor.ssm().clone(),
+            ssm: ssm.clone(),
             config: predictor.config().clone(),
             metadata: CheckpointMetadata {
-                step_count: predictor.ssm().step_count(),
+                step_count: predictor.step_count(),
                 ..Default::default()
             },
-        }
+        })
     }
 
     /// Create a checkpoint with custom metadata
@@ -363,7 +384,8 @@ impl Kizzasi {
     /// Not included (current limitations):
     /// - SSM hidden state (restored predictor starts with fresh state)
     /// - Guardrails (must be re-added manually after loading)
-    /// - Model weights (use `weights_path` in config for weight persistence)
+    /// - Model weights (use [`Kizzasi::save_weights`] to persist them, and
+    ///   [`crate::KizzasiBuilder::weights_path`] to load them back)
     ///
     /// # Example
     ///
@@ -438,7 +460,7 @@ impl Kizzasi {
     /// predictor.save_full_checkpoint("model_state_v1.checkpoint")?;
     /// ```
     pub fn save_full_checkpoint<P: AsRef<Path>>(&self, path: P) -> KizzasiResult<()> {
-        let checkpoint = FullStateCheckpoint::from_predictor(self);
+        let checkpoint = FullStateCheckpoint::from_predictor(self)?;
         checkpoint.save_json(path)
     }
 
@@ -453,7 +475,7 @@ impl Kizzasi {
     /// predictor.save_full_checkpoint_binary("model_state.bin")?;
     /// ```
     pub fn save_full_checkpoint_binary<P: AsRef<Path>>(&self, path: P) -> KizzasiResult<()> {
-        let checkpoint = FullStateCheckpoint::from_predictor(self);
+        let checkpoint = FullStateCheckpoint::from_predictor(self)?;
         checkpoint.save_binary(path)
     }
 
@@ -472,7 +494,7 @@ impl Kizzasi {
         path: P,
         description: impl Into<String>,
     ) -> KizzasiResult<()> {
-        let checkpoint = FullStateCheckpoint::from_predictor(self).with_metadata(description);
+        let checkpoint = FullStateCheckpoint::from_predictor(self)?.with_metadata(description);
         checkpoint.save_json(path)
     }
 
@@ -707,14 +729,14 @@ mod tests {
         assert_eq!(restored.config().get_num_layers(), 2);
 
         // Check step count before continuing predictions
-        assert_eq!(restored.ssm().step_count(), 2);
+        assert_eq!(restored.step_count(), 2);
 
         // State should be preserved - predictions should continue from same state
         let restored_output = restored.step(&input).unwrap();
         assert_eq!(restored_output.len(), 3);
 
         // Step count should increment after the new prediction
-        assert_eq!(restored.ssm().step_count(), 3);
+        assert_eq!(restored.step_count(), 3);
 
         // Cleanup
         let _ = fs::remove_file(checkpoint_path);
@@ -746,7 +768,7 @@ mod tests {
 
         assert_eq!(restored.config().get_input_dim(), 2);
         assert_eq!(restored.config().get_output_dim(), 2);
-        assert_eq!(restored.ssm().step_count(), 1);
+        assert_eq!(restored.step_count(), 1);
 
         // Cleanup
         let _ = fs::remove_file(checkpoint_path);
@@ -756,8 +778,9 @@ mod tests {
     fn test_full_checkpoint_with_metadata() {
         let predictor = KizzasiBuilder::audio_preset().build().unwrap();
 
-        let checkpoint =
-            FullStateCheckpoint::from_predictor(&predictor).with_metadata("Full state model v1");
+        let checkpoint = FullStateCheckpoint::from_predictor(&predictor)
+            .unwrap()
+            .with_metadata("Full state model v1");
 
         assert_eq!(
             checkpoint.metadata.description,
@@ -792,7 +815,7 @@ mod tests {
         let mut predictor2 = Kizzasi::load_full_checkpoint(&path).unwrap();
 
         // Step count should match after loading
-        assert_eq!(predictor1.ssm().step_count(), predictor2.ssm().step_count());
+        assert_eq!(predictor1.step_count(), predictor2.step_count());
 
         // Next prediction should be consistent with the state
         let output_after = predictor2.step(&input).unwrap();

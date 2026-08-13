@@ -1,7 +1,25 @@
-//! ONNX model export for kizzasi-model
+//! ONNX weight export for kizzasi-model
 //!
-//! Serializes kizzasi model weights and architecture to ONNX protobuf format
-//! using manual byte encoding (Pure Rust approach — no prost, no build.rs).
+//! Serializes kizzasi model **weights** to ONNX protobuf tensors using manual
+//! byte encoding (Pure Rust approach — no prost, no build.rs). This module
+//! provides two levels of support:
+//!
+//! - [`export_weights_to_onnx`]: a flat weight dump — every tensor in the
+//!   input map becomes a graph *initializer*, with no `nodes`/`inputs`/
+//!   `outputs`. This is a portable container for weights, not a runnable
+//!   ONNX graph.
+//! - [`export_linear_layer`]: builds one real, runnable ONNX graph (a
+//!   `MatMul` node, optionally followed by an `Add` for the bias) for a
+//!   single linear layer.
+//!
+//! No model type in this crate (Mamba, RWKV, S4, Transformer, …) has a
+//! `to_onnx`/`export` method that walks its full architecture and emits the
+//! corresponding sequence of ONNX ops — several of these SSM recurrences
+//! have no direct ONNX operator equivalent, so a faithful per-architecture
+//! graph exporter is a separate, much larger undertaking than tensor
+//! serialization. Callers who need a full computation graph must currently
+//! compose one from [`OnnxGraph`]/[`OnnxTensor`]/[`OnnxValueInfo`] (or
+//! [`export_linear_layer`] repeated per layer) themselves.
 //!
 //! ## ONNX Protobuf Reference
 //! <https://github.com/onnx/onnx/blob/main/onnx/onnx.proto3>
@@ -198,7 +216,26 @@ impl OnnxTensor {
     /// - data_type: 2 (int32)
     /// - name:      8 (string)
     /// - raw_data:  9 (bytes)
-    fn to_proto_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    /// Returns [`ModelError::InvalidConfig`] when `data_type` is not `Float`
+    /// but `float_data` is populated. `OnnxTensor` has only one data payload
+    /// field (`float_data: Vec<f32>`, 4 bytes/element); writing it out as
+    /// `raw_data` while the header declares a different `data_type` (e.g.
+    /// `Float16`, 2 bytes/element, or `Int8`, 1 byte/element) would produce a
+    /// `TensorProto` whose byte length contradicts its own dtype tag —
+    /// silent corruption for any reader that trusts the header.
+    fn to_proto_bytes(&self) -> ModelResult<Vec<u8>> {
+        if self.data_type != OnnxDataType::Float && !self.float_data.is_empty() {
+            return Err(ModelError::invalid_config(format!(
+                "OnnxTensor '{}': data_type is {:?} but float_data has {} values \
+                 populated — only Float tensors can be serialized from float_data \
+                 (raw_data is always written as an f32 little-endian blob)",
+                self.name,
+                self.data_type,
+                self.float_data.len()
+            )));
+        }
         let mut buf = Vec::new();
         // field 1: dims (packed int64)
         buf.extend(proto::encode_packed_i64(1, &self.dims));
@@ -210,7 +247,7 @@ impl OnnxTensor {
         if !self.float_data.is_empty() {
             buf.extend(proto::encode_float_slice_as_raw(9, &self.float_data));
         }
-        buf
+        Ok(buf)
     }
 }
 
@@ -255,8 +292,17 @@ impl OnnxValueInfo {
         for dim_opt in &self.shape {
             let dim_bytes = match dim_opt {
                 Some(v) => {
-                    // dim_value: field 1 int64
-                    proto::encode_i64(1, *v)
+                    // dim_value: field 1 int64. Emitted unconditionally, even
+                    // when `*v == 0` — this is a `TensorShapeProto.Dimension`
+                    // oneof entry, where `proto::encode_i64`'s usual
+                    // default-value elision (correct for a plain optional
+                    // scalar field) would instead drop the *entire*
+                    // `Dimension` submessage below, silently shrinking the
+                    // declared tensor rank instead of representing a
+                    // genuine 0-sized dimension.
+                    let mut b = proto::field_tag(1, 0);
+                    b.extend(proto::encode_varint(*v as u64));
+                    b
                 }
                 None => {
                     // dim_param: field 2 string (use "?" as placeholder)
@@ -433,7 +479,11 @@ impl OnnxGraph {
     /// - initializer: 6 (TensorProto repeated)
     /// - input:      11 (ValueInfoProto repeated)
     /// - output:     12 (ValueInfoProto repeated)
-    fn to_proto_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    /// Propagates [`OnnxTensor::to_proto_bytes`]'s dtype/payload validation
+    /// error for any mismatched initializer.
+    fn to_proto_bytes(&self) -> ModelResult<Vec<u8>> {
         let mut buf = Vec::new();
         // field 1: nodes
         for node in &self.nodes {
@@ -444,7 +494,7 @@ impl OnnxGraph {
         buf.extend(proto::encode_string(2, &self.name));
         // field 6: initializers (weight tensors)
         for init in &self.initializers {
-            let init_bytes = init.to_proto_bytes();
+            let init_bytes = init.to_proto_bytes()?;
             buf.extend(proto::encode_submessage(6, &init_bytes));
         }
         // field 11: inputs
@@ -457,7 +507,7 @@ impl OnnxGraph {
             let out_bytes = out.to_proto_bytes();
             buf.extend(proto::encode_submessage(12, &out_bytes));
         }
-        buf
+        Ok(buf)
     }
 }
 
@@ -510,7 +560,7 @@ impl OnnxModel {
         buf.extend(proto::encode_i64(1, self.ir_version));
 
         // field 7: graph (GraphProto)
-        let graph_bytes = self.graph.to_proto_bytes();
+        let graph_bytes = self.graph.to_proto_bytes()?;
         buf.extend(proto::encode_submessage(7, &graph_bytes));
 
         // field 8: opset_import (OperatorSetIdProto)
@@ -841,6 +891,77 @@ mod tests {
         let model = OnnxModel::new(graph);
         let bytes = model.to_bytes().expect("serialization must succeed");
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn test_value_info_zero_dim_is_not_dropped() {
+        // A dimension of exactly 0 must still be represented as a
+        // `TensorShapeProto.Dimension` submessage, not silently omitted
+        // (which would shrink the declared tensor rank).
+        let with_zero_dim = OnnxValueInfo {
+            name: "x".to_string(),
+            data_type: OnnxDataType::Float,
+            shape: vec![Some(0), Some(4)],
+        };
+        let without_dims = OnnxValueInfo {
+            name: "x".to_string(),
+            data_type: OnnxDataType::Float,
+            shape: vec![],
+        };
+        let with_bytes = with_zero_dim.to_proto_bytes();
+        let without_bytes = without_dims.to_proto_bytes();
+        assert!(
+            with_bytes.len() > without_bytes.len(),
+            "a shape containing a 0-sized dimension must serialize to more \
+             bytes than no shape at all -- the 0 dimension must not be \
+             silently dropped"
+        );
+    }
+
+    #[test]
+    fn test_tensor_dtype_mismatch_rejected() {
+        let bad_tensor = OnnxTensor {
+            name: "bad".to_string(),
+            dims: vec![2],
+            data_type: OnnxDataType::Float16,
+            float_data: vec![1.0, 2.0],
+        };
+        let graph = OnnxGraph {
+            name: "test".to_string(),
+            nodes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            initializers: vec![bad_tensor],
+        };
+        let model = OnnxModel::new(graph);
+        assert!(
+            model.to_bytes().is_err(),
+            "a Float16-tagged tensor with float_data populated (always \
+             encoded as f32 raw bytes) must be rejected, not silently \
+             serialized with a contradicting dtype tag"
+        );
+    }
+
+    #[test]
+    fn test_tensor_dtype_mismatch_allows_empty_payload() {
+        // A non-Float dtype with EMPTY float_data is fine (e.g. a
+        // shape-only placeholder) -- only a *populated* mismatched payload
+        // is an error.
+        let placeholder = OnnxTensor {
+            name: "placeholder".to_string(),
+            dims: vec![2],
+            data_type: OnnxDataType::Int8,
+            float_data: vec![],
+        };
+        let graph = OnnxGraph {
+            name: "test".to_string(),
+            nodes: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            initializers: vec![placeholder],
+        };
+        let model = OnnxModel::new(graph);
+        assert!(model.to_bytes().is_ok());
     }
 
     #[test]

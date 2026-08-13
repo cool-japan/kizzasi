@@ -829,7 +829,18 @@ impl AutoregressiveModel for MultiModalModel {
     }
 
     fn get_states(&self) -> Vec<HiddenState> {
-        vec![HiddenState::new(self.config.fusion_dim, 1)]
+        // `self.state` is the real fused hidden vector from the last
+        // forward pass (see `forward_multimodal`/`forward_with_missing`),
+        // stored as a `(fusion_dim, 1)` column so it round-trips through
+        // `set_states` exactly.
+        let mut hs = HiddenState::new(self.config.fusion_dim, 1);
+        {
+            let mat = hs.state_mut();
+            for (i, &v) in self.state.iter().enumerate() {
+                mat[[i, 0]] = v;
+            }
+        }
+        vec![hs]
     }
 
     fn set_states(&mut self, states: Vec<HiddenState>) -> ModelResult<()> {
@@ -839,6 +850,17 @@ impl AutoregressiveModel for MultiModalModel {
                 1,
                 states.len(),
             ));
+        }
+        let mat = states[0].state();
+        if mat.shape() != [self.config.fusion_dim, 1] {
+            return Err(ModelError::dimension_mismatch(
+                "MultiModalModel::set_states",
+                self.config.fusion_dim,
+                mat.shape().first().copied().unwrap_or(0),
+            ));
+        }
+        for i in 0..self.config.fusion_dim {
+            self.state[i] = mat[[i, 0]];
         }
         Ok(())
     }
@@ -1191,6 +1213,64 @@ mod tests {
         assert_eq!(model.model_type(), ModelType::MultiModal);
         let states = model.get_states();
         assert_eq!(states.len(), 1);
+    }
+
+    #[test]
+    fn test_get_set_states_round_trip_real_state() {
+        let config = make_default_config();
+        let mut model = MultiModalModel::new(config).expect("failed to create model");
+
+        // Before any step, `self.state` is all zeros, so exercise a step
+        // first so `get_states` has non-trivial data to actually capture.
+        let inputs: Vec<Array1<f32>> = vec![
+            Array1::from_vec(vec![0.3; 8]),
+            Array1::from_vec(vec![0.6; 12]),
+            Array1::from_vec(vec![0.9; 6]),
+        ];
+        model
+            .forward_multimodal(&inputs)
+            .expect("forward_multimodal failed");
+
+        // The old stub returned a freshly-zeroed HiddenState regardless of
+        // the model's real fused state; assert get_states reflects the
+        // model's actual (non-zero) internal state.
+        assert!(
+            model.state.iter().any(|&v| v != 0.0),
+            "test setup should have produced a non-zero fused state"
+        );
+        let states = model.get_states();
+        assert_eq!(states.len(), 1);
+        let captured: Vec<f32> = (0..model.config.fusion_dim)
+            .map(|i| states[0].state()[[i, 0]])
+            .collect();
+        for (i, &v) in captured.iter().enumerate() {
+            assert!(
+                (v - model.state[i]).abs() < 1e-7,
+                "get_states must capture the real fused state, not zeros"
+            );
+        }
+
+        // Corrupt the live state, then restore from the snapshot and check
+        // set_states actually writes it back (old stub was a silent no-op).
+        model.state.fill(-1.0);
+        model
+            .set_states(states)
+            .expect("set_states should accept its own get_states output");
+        for (i, &v) in captured.iter().enumerate() {
+            assert!(
+                (model.state[i] - v).abs() < 1e-7,
+                "set_states must restore the exact captured state"
+            );
+        }
+
+        // Wrong element count -> Err (existing behavior, still required).
+        assert!(model.set_states(vec![]).is_err());
+
+        // Right count, wrong inner shape -> Err (this is the part the old
+        // no-op stub could never detect, since it never looked at the
+        // HiddenState's contents at all).
+        let bad = HiddenState::new(model.config.fusion_dim + 1, 1);
+        assert!(model.set_states(vec![bad]).is_err());
     }
 
     // 15. test_modality_display

@@ -37,11 +37,7 @@ impl FirFilter {
 
     /// Design a windowed sinc low-pass filter
     pub fn sinc_lowpass(cutoff_normalized: f32, num_taps: usize) -> IoResult<Self> {
-        if !(0.0..0.5).contains(&cutoff_normalized) {
-            return Err(IoError::SignalError(
-                "Normalized cutoff must be in (0, 0.5)".into(),
-            ));
-        }
+        validate_normalized_freq(cutoff_normalized, "Normalized cutoff")?;
 
         if num_taps == 0 || num_taps.is_multiple_of(2) {
             return Err(IoError::SignalError(
@@ -65,6 +61,13 @@ impl FirFilter {
         }
 
         let sum: f32 = coeffs.iter().sum();
+        if !sum.is_finite() || sum.abs() < 1e-10 {
+            return Err(IoError::SignalError(
+                "sinc_lowpass: coefficient sum is degenerate (too close to zero) and cannot be \
+                 normalized"
+                    .into(),
+            ));
+        }
         for c in &mut coeffs {
             *c /= sum;
         }
@@ -74,11 +77,7 @@ impl FirFilter {
 
     /// Design a windowed sinc high-pass filter
     pub fn sinc_highpass(cutoff_normalized: f32, num_taps: usize) -> IoResult<Self> {
-        if !(0.0..0.5).contains(&cutoff_normalized) {
-            return Err(IoError::SignalError(
-                "Normalized cutoff must be in (0, 0.5)".into(),
-            ));
-        }
+        validate_normalized_freq(cutoff_normalized, "Normalized cutoff")?;
 
         if num_taps == 0 || num_taps.is_multiple_of(2) {
             return Err(IoError::SignalError(
@@ -201,11 +200,7 @@ impl IirFilter {
 
     /// Design a 2nd-order Butterworth low-pass filter
     pub fn butterworth_lowpass(cutoff_normalized: f32) -> IoResult<Self> {
-        if !(0.0..0.5).contains(&cutoff_normalized) {
-            return Err(IoError::SignalError(
-                "Normalized cutoff must be in (0, 0.5)".into(),
-            ));
-        }
+        validate_normalized_freq(cutoff_normalized, "Normalized cutoff")?;
 
         let omega = (PI * cutoff_normalized).tan();
         let omega2 = omega * omega;
@@ -224,11 +219,7 @@ impl IirFilter {
 
     /// Design a 2nd-order Butterworth high-pass filter
     pub fn butterworth_highpass(cutoff_normalized: f32) -> IoResult<Self> {
-        if !(0.0..0.5).contains(&cutoff_normalized) {
-            return Err(IoError::SignalError(
-                "Normalized cutoff must be in (0, 0.5)".into(),
-            ));
-        }
+        validate_normalized_freq(cutoff_normalized, "Normalized cutoff")?;
 
         let omega = (PI * cutoff_normalized).tan();
         let omega2 = omega * omega;
@@ -247,11 +238,7 @@ impl IirFilter {
 
     /// Design a 2nd-order notch (band-stop) filter
     pub fn notch(center_normalized: f32, q: f32) -> IoResult<Self> {
-        if !(0.0..0.5).contains(&center_normalized) {
-            return Err(IoError::SignalError(
-                "Normalized center must be in (0, 0.5)".into(),
-            ));
-        }
+        validate_normalized_freq(center_normalized, "Normalized center")?;
 
         if q <= 0.0 {
             return Err(IoError::SignalError("Q factor must be positive".into()));
@@ -343,4 +330,159 @@ pub enum Filter {
     Iir(IirFilter),
     /// Custom FIR filter
     Fir(FirFilter),
+}
+
+/// Shared validation for the normalized-frequency designers
+/// (`sinc_lowpass`/`sinc_highpass`/`butterworth_lowpass`/
+/// `butterworth_highpass`/`notch`).
+///
+/// The valid range is the OPEN interval `(0, 0.5)`. A previous version used
+/// the half-open Rust range `0.0..0.5`, which *includes* 0.0 despite every
+/// error message claiming otherwise -- letting `cutoff = 0.0` through
+/// produced a zero sinc sum (dividing every FIR coefficient by ~0, yielding
+/// NaN) or an all-zero IIR numerator, silently on `Ok`.
+fn validate_normalized_freq(value: f32, name: &str) -> IoResult<()> {
+    if !(value.is_finite() && value > 0.0 && value < 0.5) {
+        return Err(IoError::SignalError(format!(
+            "{name} must be in (0, 0.5), got {value}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === Regression tests: cutoff/center == 0.0 must be rejected (medium, id=44) ===
+
+    #[test]
+    fn test_sinc_lowpass_rejects_zero_cutoff() {
+        assert!(FirFilter::sinc_lowpass(0.0, 15).is_err());
+    }
+
+    #[test]
+    fn test_sinc_highpass_rejects_zero_cutoff() {
+        assert!(FirFilter::sinc_highpass(0.0, 15).is_err());
+    }
+
+    #[test]
+    fn test_sinc_lowpass_rejects_boundary_and_invalid_values() {
+        assert!(
+            FirFilter::sinc_lowpass(0.5, 15).is_err(),
+            "0.5 is out of range"
+        );
+        assert!(
+            FirFilter::sinc_lowpass(-0.1, 15).is_err(),
+            "negative is out of range"
+        );
+        assert!(
+            FirFilter::sinc_lowpass(f32::NAN, 15).is_err(),
+            "NaN is never a valid cutoff"
+        );
+    }
+
+    #[test]
+    fn test_sinc_lowpass_accepts_valid_cutoff_and_normalizes() {
+        let filter = FirFilter::sinc_lowpass(0.25, 15).unwrap();
+        let sum: f32 = filter.coeffs().iter().sum();
+        // A correctly normalized low-pass filter has unity DC gain.
+        assert!((sum - 1.0).abs() < 1e-3, "sum = {sum}");
+        assert!(filter.coeffs().iter().all(|c| c.is_finite()));
+    }
+
+    #[test]
+    fn test_butterworth_lowpass_rejects_zero_cutoff() {
+        assert!(IirFilter::butterworth_lowpass(0.0).is_err());
+    }
+
+    #[test]
+    fn test_butterworth_highpass_rejects_zero_cutoff() {
+        assert!(IirFilter::butterworth_highpass(0.0).is_err());
+    }
+
+    #[test]
+    fn test_butterworth_lowpass_accepts_valid_cutoff() {
+        let mut filter = IirFilter::butterworth_lowpass(0.25).unwrap();
+        // The filter must produce finite, non-degenerate output (a zero
+        // cutoff used to produce an all-zero numerator via a silent Ok,
+        // which would process any input into a constant zero).
+        let signal = Array1::from_vec(vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0]);
+        let output = filter.process(&signal);
+        assert!(output.iter().all(|x| x.is_finite()));
+        assert!(output.iter().any(|&x| x.abs() > 1e-6));
+    }
+
+    #[test]
+    fn test_notch_rejects_zero_center() {
+        assert!(IirFilter::notch(0.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn test_notch_accepts_valid_center() {
+        assert!(IirFilter::notch(0.25, 1.0).is_ok());
+    }
+
+    // === Basic FIR/IIR behavior (test-gap, id=365 in-scope portion) ===
+
+    #[test]
+    fn test_fir_moving_average_smooths_step() {
+        let mut filter = FirFilter::moving_average(4).unwrap();
+        let signal = Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
+        let output = filter.process(&signal);
+        // Once the window is full of 1.0s, output should approach 1.0.
+        assert!((output[7] - 1.0).abs() < 1e-6, "output[7] = {}", output[7]);
+        assert!(output[0].abs() < 1e-6, "output[0] = {}", output[0]);
+    }
+
+    #[test]
+    fn test_fir_differentiator() {
+        let mut filter = FirFilter::differentiator().unwrap();
+        let signal = Array1::from_vec(vec![0.0, 1.0, 3.0, 6.0]);
+        let output = filter.process(&signal);
+        // y[n] = x[n] - x[n-1]
+        assert!((output[0] - 0.0).abs() < 1e-6);
+        assert!((output[1] - 1.0).abs() < 1e-6);
+        assert!((output[2] - 2.0).abs() < 1e-6);
+        assert!((output[3] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_fir_new_rejects_empty_coeffs() {
+        assert!(FirFilter::new(vec![]).is_err());
+    }
+
+    #[test]
+    fn test_fir_reset_clears_state() {
+        let mut filter = FirFilter::moving_average(3).unwrap();
+        filter.process_sample(5.0);
+        filter.process_sample(5.0);
+        filter.reset();
+        // Right after reset, the delay line is all zeros again, so the
+        // very next sample is averaged with two zeros.
+        let out = filter.process_sample(3.0);
+        assert!((out - 1.0).abs() < 1e-6, "out = {out}");
+    }
+
+    #[test]
+    fn test_iir_new_requires_normalized_a0() {
+        assert!(IirFilter::new(vec![1.0], vec![2.0]).is_err());
+        assert!(IirFilter::new(vec![1.0], vec![1.0]).is_ok());
+    }
+
+    #[test]
+    fn test_iir_notch_attenuates_target_frequency() {
+        let mut filter = IirFilter::notch(0.1, 10.0).unwrap();
+        let n = 512;
+        let signal = Array1::from_vec((0..n).map(|i| (2.0 * PI * 0.1 * i as f32).sin()).collect());
+        let output = filter.process(&signal);
+        // Skip the transient at the start; the steady-state tail should be
+        // strongly attenuated relative to the input.
+        let tail_in: f32 = signal.iter().skip(n / 2).map(|x| x * x).sum();
+        let tail_out: f32 = output.iter().skip(n / 2).map(|x| x * x).sum();
+        assert!(
+            tail_out < tail_in * 0.1,
+            "notch filter should strongly attenuate its center frequency: in={tail_in}, out={tail_out}"
+        );
+    }
 }

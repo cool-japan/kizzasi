@@ -91,7 +91,11 @@ fn l2_dist(a: &Array1<f32>, b: &Array1<f32>) -> f32 {
 pub struct SpeakerCodebook {
     /// Centroid matrix, shape `[num_speakers, embed_dim]`.
     pub embeddings: Array2<f32>,
-    /// Running soft counts used for EMA normalisation.
+    /// Running soft counts, updated by [`SpeakerCodebook::ema_update`] as
+    /// `count = decay*count + (1-decay)`. Used to identify under-used
+    /// ("dead") speaker centroids via [`SpeakerCodebook::dead_speakers`] /
+    /// [`SpeakerCodebook::reseed_dead_speakers`] — a centroid that has
+    /// received few or no EMA updates keeps a low count.
     pub counts: Array1<f32>,
     /// EMA decay factor (e.g. 0.999).
     pub decay: f32,
@@ -205,14 +209,91 @@ impl SpeakerCodebook {
     }
 
     /// Update the centroid for `speaker_id` via EMA: `embed = decay*embed + (1-decay)*vec`.
-    pub fn ema_update(&mut self, speaker_id: u32, vec: &Array1<f32>) {
+    ///
+    /// # Errors
+    /// Returns an error if `speaker_id >= num_speakers` or `vec.len() !=
+    /// embed_dim` — both used to index `self.embeddings`/`self.counts`
+    /// unchecked, which panicked on out-of-range input despite this being a
+    /// `pub` method reachable from outside the crate (via
+    /// [`crate::MultiSpeakerTokenizer::speaker`]).
+    pub fn ema_update(&mut self, speaker_id: u32, vec: &Array1<f32>) -> TokenizerResult<()> {
+        let num_speakers = self.embeddings.shape()[0];
         let idx = speaker_id as usize;
+        if idx >= num_speakers {
+            return Err(TokenizerError::out_of_range(
+                speaker_id as f32,
+                0.0,
+                (num_speakers.saturating_sub(1)) as f32,
+                "SpeakerCodebook::ema_update: speaker_id",
+            ));
+        }
+
         let embed_dim = self.embeddings.shape()[1];
+        if vec.len() != embed_dim {
+            return Err(TokenizerError::dim_mismatch(
+                embed_dim,
+                vec.len(),
+                "SpeakerCodebook::ema_update: vec",
+            ));
+        }
+
         let d = self.decay;
         for j in 0..embed_dim {
             self.embeddings[[idx, j]] = d * self.embeddings[[idx, j]] + (1.0 - d) * vec[j];
         }
         self.counts[idx] = d * self.counts[idx] + (1.0 - d);
+        Ok(())
+    }
+
+    /// Indices of speakers whose running soft count (see
+    /// [`SpeakerCodebook::counts`]) is below `threshold` — i.e. centroids
+    /// that have received few or no [`SpeakerCodebook::ema_update`] calls
+    /// and are therefore still close to their k-means++ seed (or, if never
+    /// seeded, to zero).
+    pub fn dead_speakers(&self, threshold: f32) -> Vec<usize> {
+        self.counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c < threshold)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Reseed centroids identified as "dead" by [`SpeakerCodebook::dead_speakers`]
+    /// with fresh data points, then reset their running count to `1.0` so a
+    /// freshly reseeded centroid is not immediately flagged as dead again.
+    ///
+    /// Mirrors [`crate::VectorQuantizer::reset_unused_codes`]'s pattern for
+    /// the same purpose in the VQ-VAE codebook.
+    ///
+    /// Returns the number of centroids reseeded.
+    pub fn reseed_dead_speakers(
+        &mut self,
+        data: &[Array1<f32>],
+        threshold: f32,
+        rng_seed: u64,
+    ) -> TokenizerResult<usize> {
+        if data.is_empty() {
+            return Err(TokenizerError::invalid_input(
+                "reseed_dead_speakers",
+                "data must not be empty",
+            ));
+        }
+
+        let embed_dim = self.embeddings.shape()[1];
+        let dead = self.dead_speakers(threshold);
+        let mut rng = SplitMix64::new(rng_seed);
+
+        for idx in &dead {
+            let source = &data[rng.next_usize(data.len())];
+            let mut row = self.embeddings.row_mut(*idx);
+            for (dst_val, &src_val) in row.iter_mut().zip(source.iter()).take(embed_dim) {
+                *dst_val = src_val;
+            }
+            self.counts[*idx] = 1.0;
+        }
+
+        Ok(dead.len())
     }
 }
 
@@ -371,7 +452,7 @@ impl MultiSpeakerTokenizer {
         // One EMA pass to accumulate counts
         for emb in &embeddings {
             let sid = self.speaker.find_nearest(emb)?;
-            self.speaker.ema_update(sid, emb);
+            self.speaker.ema_update(sid, emb)?;
         }
 
         Ok(())
@@ -639,6 +720,75 @@ mod tests {
         // A vector very close to [1,1,1,1] should map to centroid 1
         let near_one = Array1::from_vec(vec![0.95, 1.0, 1.0, 1.0]);
         assert_eq!(cb.find_nearest(&near_one).unwrap(), 1);
+    }
+
+    /// Regression: `ema_update` used to index `embeddings`/`counts` with an
+    /// unchecked `speaker_id`, panicking on out-of-range input despite being
+    /// a `pub` method. It must return an error instead.
+    #[test]
+    fn test_ema_update_rejects_out_of_range_speaker_id() {
+        let mut cb = SpeakerCodebook::new(2, 4, 0.99);
+        let vec = Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4]);
+
+        assert!(cb.ema_update(2, &vec).is_err());
+        assert!(cb.ema_update(u32::MAX, &vec).is_err());
+        assert!(cb.ema_update(0, &vec).is_ok());
+        assert!(cb.ema_update(1, &vec).is_ok());
+    }
+
+    /// Regression: `ema_update` used to index `vec[j]` with no length check,
+    /// panicking on a shorter-than-`embed_dim` embedding.
+    #[test]
+    fn test_ema_update_rejects_wrong_length_vec() {
+        let mut cb = SpeakerCodebook::new(2, 4, 0.99);
+        let short = Array1::from_vec(vec![0.1, 0.2]);
+        let long = Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4, 0.5]);
+
+        assert!(cb.ema_update(0, &short).is_err());
+        assert!(cb.ema_update(0, &long).is_err());
+    }
+
+    /// Regression: `counts` must be genuinely consulted, not just written.
+    /// A centroid that never receives an `ema_update` call stays "dead" and
+    /// is reported by `dead_speakers`; `reseed_dead_speakers` then moves it
+    /// away from its initial value and marks it as no longer dead.
+    #[test]
+    fn test_dead_speakers_detection_and_reseed() {
+        // A low decay so `counts` (== `1 - decay^n` after `n` updates on a
+        // codebook starting at zero) rises past the 0.5 threshold quickly.
+        let mut cb = SpeakerCodebook::new(3, 2, 0.5);
+        let data = vec![
+            Array1::from_vec(vec![10.0, 10.0]),
+            Array1::from_vec(vec![-10.0, -10.0]),
+        ];
+
+        // Only speaker 0 ever gets updated (repeatedly, so its count
+        // actually crosses the threshold — a single EMA update only moves
+        // count from 0 to `1 - decay`, which is itself still "dead" for
+        // most decay values); 1 and 2 stay at their all-zero initial value
+        // with counts == 0.0.
+        for _ in 0..5 {
+            cb.ema_update(0, &Array1::from_vec(vec![1.0, 1.0])).unwrap();
+        }
+        assert!(
+            cb.counts[0] > 0.5,
+            "speaker 0's count should have crossed the threshold after 5 updates, got {}",
+            cb.counts[0]
+        );
+
+        let dead = cb.dead_speakers(0.5);
+        assert_eq!(dead, vec![1, 2]);
+
+        let reseeded = cb.reseed_dead_speakers(&data, 0.5, 7).unwrap();
+        assert_eq!(reseeded, 2);
+
+        // Reseeded centroids must no longer be flagged as dead.
+        assert!(cb.dead_speakers(0.5).is_empty());
+        // Reseeded centroids must have moved away from the all-zero init.
+        for idx in [1usize, 2usize] {
+            let row = cb.embeddings.row(idx);
+            assert!(row.iter().any(|&v| v.abs() > 1e-6));
+        }
     }
 
     // -----------------------------------------------------------------------

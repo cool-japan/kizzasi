@@ -8,11 +8,8 @@
 //! * **ESP32-C3** — 400 KB SRAM, single-core RV32IMC (no FPU), 4 MB external flash.
 //!
 //! The presets pick `d_model` / `d_state` / `expand` values so that the
-//! recurrent state (`d_state * 4 bytes` for `f32` `h`, plus
-//! `d_inner * 4 bytes` for `prev_x`) and the on-stack working buffers stay
-//! well within the target's RAM budget. Weight sizes are quoted assuming
-//! INT8-quantised parameters for the diagonal `A`, `B`, `C` projections of a
-//! single Mamba block; users with multi-layer stacks should scale accordingly.
+//! recurrent state and the on-stack working buffers stay well within the
+//! target's RAM budget.
 //!
 //! # Examples
 //!
@@ -28,27 +25,42 @@
 //! `const fn` wrappers in future revisions; today they return a freshly
 //! constructed [`SsmConfig`] each call.
 //!
-//! # Memory estimate cheat sheet
+//! # State memory
 //!
-//! | Preset      | `d_model` | `d_state` | `d_inner` | State RAM | INT8 weights |
-//! |-------------|-----------|-----------|-----------|-----------|---------------|
-//! | `stm32h7`   | 64        | 16        | 128       | ~ 576 B   | ~ 50 KB       |
-//! | `rp2040`    | 32        | 8         | 64        | ~ 288 B   | ~ 16 KB       |
-//! | `esp32c3`   | 48        | 12        | 96        | ~ 432 B   | ~ 32 KB       |
+//! The figures below are **derived from the code**, not estimated:
+//! [`SsmState`](crate::SsmState) allocates `d_state` floats for `h` and
+//! `d_inner` floats for `prev_x`, so its footprint is exactly
+//! `(d_state + d_inner) * 4` bytes. The test
+//! `presets::tests::test_documented_state_ram_matches_allocation` keeps this
+//! table honest.
 //!
-//! The "State RAM" figure counts only the [`SsmState`](crate::SsmState) vectors
-//! `h` and `prev_x`; transient activation buffers are caller-supplied and not
-//! included.
+//! | Preset      | `d_model` | `d_state` | `d_inner` | `SsmState` (f32) | `Q16SsmState` |
+//! |-------------|-----------|-----------|-----------|------------------|---------------|
+//! | `stm32h7`   | 64        | 16        | 128       | 576 B            | 64 B          |
+//! | `rp2040`    | 32        | 8         | 64        | 288 B            | 32 B          |
+//! | `esp32c3`   | 48        | 12        | 96        | 432 B            | 48 B          |
+//!
+//! The last column is the Q16.16 state used by
+//! `ssm_fixed::MambaStepQ16` (feature `fixed-point`), which keeps only `h`
+//! (`d_state * 4` bytes) because the fixed-point path has no convolution
+//! history. Transient activation buffers are caller-supplied and not counted,
+//! and the `*_slice` kernels let the caller place both buffers in `.bss`
+//! instead of on a heap.
+//!
+//! **Weight sizes are deliberately not quoted.** This crate contains no
+//! projection weights, no weight-loading code and no block structure — only
+//! the diagonal recurrence — so any "KB of INT8 weights per block" figure
+//! here would describe a model this crate cannot see. Size your flash budget
+//! from the checkpoint you actually deploy.
 
 use crate::ssm::SsmConfig;
 
 /// STM32H7 preset: `d_model = 64`, `d_state = 16`, `expand = 2`.
 ///
 /// Targets the high-end Cortex-M7 family (e.g. STM32H743, STM32H753) with
-/// 1 MB SRAM and a single-precision FPU. A single Mamba block at this size
-/// occupies roughly **50 KB** of INT8 weights in flash and **<1 KB** of RAM
-/// for the recurrent state, leaving ample headroom for activations and
-/// per-frame audio/sensor buffers.
+/// 1 MB SRAM and a single-precision FPU. The recurrent state costs 576 B
+/// (`(16 + 128) * 4`), leaving ample headroom for activations and per-frame
+/// audio/sensor buffers.
 ///
 /// # Rationale
 ///
@@ -70,11 +82,11 @@ pub fn stm32h7() -> SsmConfig {
 ///
 /// Targets the dual Cortex-M0+ on the Raspberry Pi Pico / RP2040 SoC. The
 /// M0+ lacks an FPU, so callers should enable the `fixed-point` feature and
-/// use [`Q16`](crate::fixed_point::Q16) arithmetic instead of `f32`.
+/// run `ssm_fixed::MambaStepQ16`, which executes the
+/// entire recurrence in `fixed_point::Q16` integer arithmetic —
+/// 32 bytes of state at this size, and no soft-float calls in the hot loop.
 ///
-/// At this size a single Mamba block fits in roughly **16 KB** of INT8
-/// weights — small enough to live in on-chip SRAM rather than XIP flash if
-/// latency is critical. The recurrent state requires only ~288 bytes.
+/// The `f32` [`SsmState`](crate::SsmState) equivalent is 288 bytes.
 ///
 /// # Rationale
 ///
@@ -82,8 +94,8 @@ pub fn stm32h7() -> SsmConfig {
 ///   for binary classifiers and small-vocabulary keyword spotters.
 /// * `d_state = 8` keeps the inner loop iteration count low enough to
 ///   compile to a tight, branch-free sequence on M0+.
-/// * `expand = 2` yields `d_inner = 64`, matching `prev_x` to a single
-///   cache line on most targets.
+/// * `expand = 2` yields `d_inner = 64`, so the convolution history `prev_x`
+///   is 256 bytes — four 64-byte lines on targets that have a cache at all.
 #[must_use]
 pub fn rp2040() -> SsmConfig {
     SsmConfig {
@@ -100,9 +112,9 @@ pub fn rp2040() -> SsmConfig {
 /// this preset, though the `fixed-point` feature is recommended where every
 /// microsecond counts (e.g. real-time audio).
 ///
-/// A single Mamba block uses roughly **32 KB** of INT8 weights, comfortably
-/// fitting in the ~300 KB usable SRAM after subtracting the IDF runtime
-/// (~64 KB BSS) and Wi-Fi/BLE buffers (~32 KB).
+/// The recurrent state costs 432 B (`(12 + 96) * 4`), comfortably fitting in
+/// the ~300 KB usable SRAM after subtracting the IDF runtime (~64 KB BSS) and
+/// Wi-Fi/BLE buffers (~32 KB).
 ///
 /// # Rationale
 ///
@@ -168,6 +180,39 @@ mod tests {
                 cfg.d_model * 2,
                 "preset d_inner must equal d_model * 2 (canonical Mamba expand=2)"
             );
+        }
+    }
+
+    #[test]
+    fn test_documented_state_ram_matches_allocation() {
+        // Keeps the module-level memory table tied to the code that
+        // implements it, instead of to a hand-written estimate.
+        const F32_BYTES: usize = core::mem::size_of::<f32>();
+        for (name, cfg, documented_f32, documented_q16) in [
+            ("stm32h7", stm32h7(), 576_usize, 64_usize),
+            ("rp2040", rp2040(), 288, 32),
+            ("esp32c3", esp32c3(), 432, 48),
+        ] {
+            let state = crate::ssm::SsmState::new(&cfg);
+            let actual = (state.h.len() + state.prev_x.len()) * F32_BYTES;
+            assert_eq!(
+                actual, documented_f32,
+                "{name}: documented SsmState size {documented_f32} B, actual {actual} B"
+            );
+            let q16 = cfg.d_state * core::mem::size_of::<i32>();
+            assert_eq!(
+                q16, documented_q16,
+                "{name}: documented Q16SsmState size {documented_q16} B, actual {q16} B"
+            );
+        }
+    }
+
+    #[test]
+    fn test_presets_pass_validation() {
+        // The presets are struct literals, so `SsmConfig::new`'s checks are
+        // bypassed; `validate` is what re-establishes the invariant.
+        for cfg in [stm32h7(), rp2040(), esp32c3()] {
+            assert!(cfg.validate().is_ok(), "preset must pass validate()");
         }
     }
 

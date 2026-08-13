@@ -106,7 +106,7 @@
 - [x] Signal transforms (scale, offset, clip, normalize, decimate, moving average, derivative)
 - [x] Parallel pipeline processing with multiple combine strategies
 
-## Advanced Features (Phase 2 - Latest)
+## Advanced Features (Phase 2)
 
 - [x] Signal compression and decompression
   - RLE, Delta, Delta+RLE, Quantization, DPCM

@@ -18,6 +18,7 @@
 //! - Robust temporal property checking
 //! - Safety-critical system monitoring
 
+use crate::error::{LogicError, LogicResult};
 use scirs2_core::ndarray::Array1;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -33,14 +34,18 @@ pub struct TimeInterval {
 
 impl TimeInterval {
     /// Create a new time interval
-    pub fn new(lower: f32, upper: f32) -> Self {
-        assert!(
-            lower >= 0.0 && upper >= lower,
-            "Invalid time interval: [{}, {}]",
-            lower,
-            upper
-        );
-        Self { lower, upper }
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidConstraint`] when `lower` is negative or `upper`
+    /// is below `lower` (an empty interval).
+    pub fn new(lower: f32, upper: f32) -> LogicResult<Self> {
+        if lower.is_nan() || upper.is_nan() || lower < 0.0 || upper < lower {
+            return Err(LogicError::InvalidConstraint(format!(
+                "invalid time interval [{lower}, {upper}]: need 0 <= lower <= upper"
+            )));
+        }
+        Ok(Self { lower, upper })
     }
 
     /// Unbounded interval [0, ∞)
@@ -271,16 +276,34 @@ pub struct Signal {
 
 impl Signal {
     /// Create a new signal
-    pub fn new(times: Vec<f32>, values: Vec<Array1<f32>>) -> Self {
-        assert_eq!(
-            times.len(),
-            values.len(),
-            "Time and value vectors must have same length"
-        );
-        assert!(
-            times.windows(2).all(|w| w[0] <= w[1]),
-            "Times must be sorted"
-        );
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidInput`] when `times` and `values` have different
+    /// lengths, or when `times` is not sorted ascending (the interpolation in
+    /// [`Signal::at`] relies on that ordering).
+    pub fn new(times: Vec<f32>, values: Vec<Array1<f32>>) -> LogicResult<Self> {
+        if times.len() != values.len() {
+            return Err(LogicError::InvalidInput(format!(
+                "signal needs one value per time stamp, got {} times and {} values",
+                times.len(),
+                values.len()
+            )));
+        }
+        if !times.windows(2).all(|w| w[0] <= w[1]) {
+            return Err(LogicError::InvalidInput(
+                "signal time stamps must be sorted ascending".to_string(),
+            ));
+        }
+        Ok(Self { times, values })
+    }
+
+    /// Build a signal whose invariants the caller already guarantees.
+    ///
+    /// Only [`OnlineSTLMonitor`] uses this: it inserts every sample at its
+    /// sorted position, so its buffer is sorted and equal-length by
+    /// construction and re-validating it on every update would be wasted work.
+    fn from_sorted_parts(times: Vec<f32>, values: Vec<Array1<f32>>) -> Self {
         Self { times, values }
     }
 
@@ -353,9 +376,18 @@ pub struct STLMonitor {
 
 impl STLMonitor {
     /// Create a new STL monitor
-    pub fn new(formula: STLFormula, dt: f32) -> Self {
-        assert!(dt > 0.0, "Time resolution must be positive");
-        Self { formula, dt }
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidConstraint`] when the time resolution `dt` is not
+    /// strictly positive.
+    pub fn new(formula: STLFormula, dt: f32) -> LogicResult<Self> {
+        if dt.is_nan() || dt <= 0.0 {
+            return Err(LogicError::InvalidConstraint(format!(
+                "STL time resolution must be positive, got {dt}"
+            )));
+        }
+        Ok(Self { formula, dt })
     }
 
     /// Compute robustness of a signal over time
@@ -542,9 +574,19 @@ impl OnlineSTLMonitor {
     }
 
     /// Add a new observation and compute robustness
+    ///
+    /// Samples may arrive out of order: each one is inserted at its sorted
+    /// position so the internal signal keeps its ascending-time invariant.
     pub fn update(&mut self, time: f32, value: Array1<f32>) -> f32 {
-        // Add to buffer
-        self.buffer.push_back((time, value.clone()));
+        // Insert at the sorted position (a plain push_back would corrupt the
+        // ascending-time invariant when samples arrive out of order).
+        let position = self
+            .buffer
+            .iter()
+            .rposition(|(t, _)| *t <= time)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        self.buffer.insert(position, (time, value.clone()));
 
         // Remove old observations outside horizon
         while let Some((t, _)) = self.buffer.front() {
@@ -568,10 +610,13 @@ impl OnlineSTLMonitor {
     }
 
     /// Convert buffer to signal
+    ///
+    /// The buffer is kept sorted and equal-length by [`Self::update`], so the
+    /// signal invariants hold by construction here.
     fn buffer_to_signal(&self) -> Signal {
         let times: Vec<f32> = self.buffer.iter().map(|(t, _)| *t).collect();
         let values: Vec<Array1<f32>> = self.buffer.iter().map(|(_, v)| v.clone()).collect();
-        Signal::new(times, values)
+        Signal::from_sorted_parts(times, values)
     }
 
     /// Evaluate formula (same as STLMonitor)
@@ -607,9 +652,55 @@ impl OnlineSTLMonitor {
 mod tests {
     use super::*;
 
+    /// Regression (finding 140 class): a `Signal` with mismatched or unsorted
+    /// inputs must be reported, and out-of-order online samples must not
+    /// panic the monitor.
+    #[test]
+    fn test_signal_validation_and_out_of_order_updates() {
+        assert!(matches!(
+            Signal::new(vec![0.0, 1.0], vec![Array1::from_vec(vec![1.0])]),
+            Err(LogicError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            Signal::new(
+                vec![1.0, 0.0],
+                vec![Array1::from_vec(vec![1.0]), Array1::from_vec(vec![2.0])]
+            ),
+            Err(LogicError::InvalidInput(_))
+        ));
+
+        let phi = STLFormula::greater_eq("x_geq_0", 0, 0.0);
+        let mut monitor = OnlineSTLMonitor::new(phi);
+        let _ = monitor.update(2.0, Array1::from_vec(vec![1.0]));
+        // Arrives late — the old implementation pushed it to the back and then
+        // tripped the "times must be sorted" assertion.
+        let robustness = monitor.update(1.0, Array1::from_vec(vec![2.0]));
+        assert!(
+            robustness.is_finite(),
+            "out-of-order sample must be handled"
+        );
+    }
+
+    /// Regression (finding 140): invalid STL inputs must return a typed error.
+    #[test]
+    fn test_stl_constructors_reject_invalid_input() {
+        assert!(matches!(
+            TimeInterval::new(-1.0, 1.0),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+        assert!(matches!(
+            TimeInterval::new(2.0, 1.0),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+        let phi = STLFormula::greater_eq("x_geq_5", 0, 5.0);
+        assert!(matches!(
+            STLMonitor::new(phi, 0.0),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+    }
     #[test]
     fn test_time_interval() {
-        let interval = TimeInterval::new(0.0, 5.0);
+        let interval = TimeInterval::new(0.0, 5.0).expect("valid interval");
         assert!(interval.contains(2.5));
         assert!(!interval.contains(6.0));
         assert_eq!(interval.duration(), 5.0);
@@ -657,7 +748,7 @@ mod tests {
             Array1::from_vec(vec![4.0]),
         ];
 
-        let signal = Signal::new(times, values);
+        let signal = Signal::new(times, values).expect("valid signal");
         assert_eq!(signal.len(), 4);
         assert_eq!(signal.time_range(), (0.0, 3.0));
     }
@@ -667,7 +758,7 @@ mod tests {
         let times = vec![0.0, 2.0];
         let values = vec![Array1::from_vec(vec![0.0]), Array1::from_vec(vec![10.0])];
 
-        let signal = Signal::new(times, values);
+        let signal = Signal::new(times, values).expect("valid signal");
 
         // At t=1.0 (midpoint), should be 5.0
         let val = signal.at(1.0).unwrap();
@@ -686,7 +777,7 @@ mod tests {
     fn test_stl_monitor_basic() {
         // φ: x[0] ≥ 5.0
         let phi = STLFormula::greater_eq("x_geq_5", 0, 5.0);
-        let monitor = STLMonitor::new(phi, 0.1);
+        let monitor = STLMonitor::new(phi, 0.1).expect("valid monitor");
 
         let times = vec![0.0, 1.0, 2.0, 3.0];
         let values = vec![
@@ -696,7 +787,7 @@ mod tests {
             Array1::from_vec(vec![8.0]), // robustness = 3.0
         ];
 
-        let signal = Signal::new(times, values);
+        let signal = Signal::new(times, values).expect("valid signal");
         let results = monitor.monitor(&signal);
 
         assert_eq!(results.len(), 4);
@@ -712,8 +803,9 @@ mod tests {
     fn test_stl_eventually() {
         // ◇[0,2] (x[0] ≥ 8.0): eventually x[0] reaches 8.0 within 2 time units
         let phi = STLFormula::greater_eq("x_geq_8", 0, 8.0);
-        let eventually_phi = STLFormula::eventually(TimeInterval::new(0.0, 2.0), phi);
-        let monitor = STLMonitor::new(eventually_phi, 0.1);
+        let eventually_phi =
+            STLFormula::eventually(TimeInterval::new(0.0, 2.0).expect("valid interval"), phi);
+        let monitor = STLMonitor::new(eventually_phi, 0.1).expect("valid monitor");
 
         let times = vec![0.0, 1.0, 2.0, 3.0];
         let values = vec![
@@ -723,7 +815,7 @@ mod tests {
             Array1::from_vec(vec![7.0]),
         ];
 
-        let signal = Signal::new(times, values);
+        let signal = Signal::new(times, values).expect("valid signal");
         let results = monitor.monitor(&signal);
 
         // At t=0, eventually[0,2] checks t ∈ [0,2], should find 9.0 at t=1
@@ -734,8 +826,9 @@ mod tests {
     fn test_stl_always() {
         // □[0,2] (x[0] ≤ 10.0): always x[0] stays below 10.0 for 2 time units
         let phi = STLFormula::less_eq("x_leq_10", 0, 10.0);
-        let always_phi = STLFormula::always(TimeInterval::new(0.0, 2.0), phi);
-        let monitor = STLMonitor::new(always_phi, 0.1);
+        let always_phi =
+            STLFormula::always(TimeInterval::new(0.0, 2.0).expect("valid interval"), phi);
+        let monitor = STLMonitor::new(always_phi, 0.1).expect("valid monitor");
 
         let times = vec![0.0, 1.0, 2.0, 3.0];
         let values = vec![
@@ -745,7 +838,7 @@ mod tests {
             Array1::from_vec(vec![15.0]), // Violates at t=3
         ];
 
-        let signal = Signal::new(times, values);
+        let signal = Signal::new(times, values).expect("valid signal");
 
         // At t=0, always[0,2] checks t ∈ [0,2], all values ≤ 10
         let results = monitor.monitor(&signal);
@@ -778,7 +871,7 @@ mod tests {
         let phi2 = STLFormula::less_eq("x1_leq_10", 1, 10.0);
         let phi_complex = STLFormula::and(phi1, phi2);
 
-        let monitor = STLMonitor::new(phi_complex, 0.1);
+        let monitor = STLMonitor::new(phi_complex, 0.1).expect("valid monitor");
 
         let times = vec![0.0, 1.0];
         let values = vec![
@@ -786,7 +879,7 @@ mod tests {
             Array1::from_vec(vec![7.0, 11.0]), // Second violated
         ];
 
-        let signal = Signal::new(times, values);
+        let signal = Signal::new(times, values).expect("valid signal");
         let results = monitor.monitor(&signal);
 
         assert!(results[0].1 >= 0.0); // t=0: satisfied
@@ -798,12 +891,15 @@ mod tests {
         let phi = STLFormula::greater_eq("x_geq_5", 0, 5.0);
         assert_eq!(phi.horizon(), 0.0);
 
-        let eventually_phi = STLFormula::eventually(TimeInterval::new(0.0, 5.0), phi.clone());
+        let eventually_phi = STLFormula::eventually(
+            TimeInterval::new(0.0, 5.0).expect("valid interval"),
+            phi.clone(),
+        );
         assert_eq!(eventually_phi.horizon(), 5.0);
 
         let always_eventually = STLFormula::always(
-            TimeInterval::new(0.0, 3.0),
-            STLFormula::eventually(TimeInterval::new(0.0, 2.0), phi),
+            TimeInterval::new(0.0, 3.0).expect("valid interval"),
+            STLFormula::eventually(TimeInterval::new(0.0, 2.0).expect("valid interval"), phi),
         );
         assert_eq!(always_eventually.horizon(), 5.0); // 3.0 + 2.0
     }

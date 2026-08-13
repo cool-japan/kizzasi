@@ -1,32 +1,55 @@
-//! GPU-accelerated SSM prefix scan via WGSL Blelloch kernel.
+//! GPU-accelerated SSM prefix scan via WGSL Blelloch kernels.
 //!
-//! Provides a single-pass inclusive SSM associative scan for sequences up to
-//! [`MAX_SINGLE_PASS_LEN`] elements.  Longer sequences fall back to the CPU
-//! implementation in `kizzasi-core`.
+//! Implements an inclusive SSM associative scan for sequences of **any**
+//! length: each work-group scans a block of [`MAX_SINGLE_PASS_LEN`] elements,
+//! the per-block aggregates are scanned by the same kernel (recursively, when
+//! there is more than one block of aggregates), and a final pass folds the
+//! resulting block prefixes back into the per-block results.
+//!
+//! The only hard limits are the device's own — storage binding size and
+//! work-groups per dispatch — and exceeding either returns
+//! [`WebGpuError::DeviceLimitExceeded`] before anything is dispatched.
 //!
 //! # Associative operator
 //! `(a₁, bu₁) ⊗ (a₂, bu₂) = (a₂·a₁, a₂·bu₁ + bu₂)`
 //!
 //! Identity: `(1.0, 0.0)`.
 
+use crate::buffer::GpuBuffer;
 use crate::error::WebGpuError;
 use crate::WebGpuBackend;
 
-/// Maximum sequence length that fits in one work-group (256 elements).
+#[cfg(feature = "webgpu")]
+use crate::backend::{decode_pairs, read_staging, F32_BYTES};
+#[cfg(feature = "webgpu")]
+use crate::buffer::GpuBufferUsage;
+#[cfg(feature = "webgpu")]
+use crate::pipeline::KernelKind;
+
+/// Number of elements one work-group scans in a single block (256).
+///
+/// Sequences longer than this are **not** rejected: the multi-block driver
+/// scans them exactly, using this value as the block size.
 pub const MAX_SINGLE_PASS_LEN: usize = 256;
 
-/// The WGSL shader source, embedded at compile time.
+/// Block size as used by the dispatcher, matching `@workgroup_size(256)`.
 #[cfg(feature = "webgpu")]
-const SHADER_SRC: &str = include_str!("shaders/ssm_scan.wgsl");
+const BLOCK_SIZE: u32 = 256;
+
+/// Bytes occupied by one `(a, bu)` element.
+#[cfg(feature = "webgpu")]
+const PAIR_BYTES: usize = F32_BYTES * 2;
 
 /// Execute an inclusive SSM associative scan on the GPU.
 ///
-/// Sequences longer than [`MAX_SINGLE_PASS_LEN`] are not supported by this
-/// single-pass kernel; callers should fall back to the CPU path.
+/// Sequences of any length are supported; the kernel automatically switches to
+/// the multi-block path beyond [`MAX_SINGLE_PASS_LEN`] elements.
 ///
 /// # Errors
 ///
 /// - [`WebGpuError::BackendUnavailable`] if compiled without `--features webgpu`.
+/// - [`WebGpuError::DeviceLimitExceeded`] if the sequence exceeds the device's
+///   storage-binding or dispatch limits.
 /// - [`WebGpuError::Other`] for wgpu pipeline / dispatch errors.
 pub fn ssm_scan_gpu(
     backend: &WebGpuBackend,
@@ -44,6 +67,37 @@ pub fn ssm_scan_gpu(
     }
 }
 
+/// Device-resident variant of [`ssm_scan_gpu`].
+///
+/// `input` holds interleaved `(a, bu)` pairs (`[a₀, bu₀, a₁, bu₁, …]`), and the
+/// returned buffer holds the scan result in the same layout without ever
+/// touching host memory — so `matvec → silu → scan` chains stay on the device.
+///
+/// # Errors
+///
+/// - [`WebGpuError::BackendUnavailable`] without `--features webgpu`.
+/// - [`WebGpuError::NoGpuAllocation`] if `input` is metadata-only.
+/// - [`WebGpuError::BufferSizeMismatch`] if `input` is empty or its byte size
+///   is not a multiple of `2 × size_of::<f32>()`.
+/// - [`WebGpuError::DeviceLimitExceeded`] / [`WebGpuError::Other`] as above.
+pub fn ssm_scan_gpu_buf(
+    backend: &WebGpuBackend,
+    input: &GpuBuffer,
+) -> Result<GpuBuffer, WebGpuError> {
+    #[cfg(not(feature = "webgpu"))]
+    {
+        let _ = (backend, input);
+        Err(WebGpuError::BackendUnavailable)
+    }
+
+    #[cfg(feature = "webgpu")]
+    {
+        ssm_scan_buf_impl(backend, input)
+    }
+}
+
+// ── GPU implementation — only compiled with `--features webgpu` ──────────────
+
 #[cfg(feature = "webgpu")]
 fn ssm_scan_impl(
     backend: &WebGpuBackend,
@@ -56,232 +110,294 @@ fn ssm_scan_impl(
         return Ok(elements.to_vec());
     }
 
-    let (device, queue) = backend.device_and_queue();
-    let n = elements.len() as u32;
+    let n = element_count(elements.len())?;
+    let bytes = pairs_to_bytes(elements);
+    let size_bytes = bytes.len() as u64;
 
-    // Flatten (a, bu) pairs to an f32 slice for upload.
-    let flat: Vec<f32> = elements.iter().flat_map(|&(a, bu)| [a, bu]).collect();
+    backend.run_scoped(|| {
+        let input = backend.upload_bytes("ssm-scan-input", &bytes)?;
+        let output = backend.create_storage_buffer("ssm-scan-output", size_bytes)?;
+        let staging = backend.create_staging_buffer("ssm-scan-staging", size_bytes)?;
 
-    let flat_bytes: &[u8] = f32_slice_as_bytes(&flat);
-    let input_size = flat_bytes.len() as u64;
-
-    // --- Buffers -------------------------------------------------------
-
-    // Uniform buffer: single u32 holding `n`.
-    let params_data: [u8; 4] = n.to_ne_bytes();
-    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ssm-scan-params"),
-        size: 4,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&uniform_buf, 0, &params_data);
-
-    // Input storage buffer.
-    let input_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ssm-scan-input"),
-        size: input_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&input_buf, 0, flat_bytes);
-
-    // Output storage buffer.
-    let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ssm-scan-output"),
-        size: input_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-
-    // Staging buffer for readback.
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ssm-scan-staging"),
-        size: input_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    // --- Shader + pipeline -----------------------------------------------
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("ssm-scan-shader"),
-        source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
-    });
-
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("ssm-scan-bgl"),
-        entries: &[
-            // binding 0: uniform params
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // binding 1: input storage (read-only)
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // binding 2: output storage (read-write)
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("ssm-scan-pipeline-layout"),
-        bind_group_layouts: &[Some(&bind_group_layout)],
-        immediate_size: 0,
-    });
-
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("ssm-scan-pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
-    });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("ssm-scan-bg"),
-        layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: input_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: output_buf.as_entire_binding(),
-            },
-        ],
-    });
-
-    // --- Encode and dispatch -------------------------------------------
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("ssm-scan-encoder"),
-    });
-
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("ssm-scan-pass"),
-            timestamp_writes: None,
-        });
-        cpass.set_pipeline(&pipeline);
-        cpass.set_bind_group(0, &bind_group, &[]);
-        // Single work-group covers up to 256 elements.
-        let workgroups = (elements.len() as u32).div_ceil(256);
-        cpass.dispatch_workgroups(workgroups, 1, 1);
-    }
-
-    // Copy output buffer → staging buffer.
-    encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, input_size);
-
-    queue.submit(std::iter::once(encoder.finish()));
-
-    // Block until GPU work completes.
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        })
-        .map_err(|e| WebGpuError::Other(format!("device poll error: {e:?}")))?;
-
-    // --- Map and read back --------------------------------------------
-
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
-    staging_buf
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
+        let (device, queue) = backend.device_and_queue();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ssm-scan-encoder"),
         });
 
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        })
-        .map_err(|e| WebGpuError::Other(format!("device poll error after map: {e:?}")))?;
+        // Held until after submission so no intermediate is freed early.
+        let _scratch = encode_scan(backend, &mut encoder, &input, &output, n)?;
 
-    rx.recv()
-        .map_err(|_| WebGpuError::MapBuffer("channel closed before map completed".into()))?
-        .map_err(|e| WebGpuError::MapBuffer(e.to_string()))?;
+        encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, size_bytes);
+        queue.submit(std::iter::once(encoder.finish()));
 
-    let mapped = staging_buf
-        .slice(..)
-        .get_mapped_range()
-        .map_err(|e| WebGpuError::MapBuffer(e.to_string()))?;
-    let result_flat: Vec<f32> = mapped
-        .chunks_exact(4)
-        .map(|chunk| {
-            let arr: [u8; 4] = chunk.try_into().unwrap_or([0u8; 4]);
-            f32::from_ne_bytes(arr)
-        })
-        .collect();
-
-    drop(mapped);
-    staging_buf.unmap();
-
-    // Re-pack interleaved f32 pairs back into (a, bu) tuples.
-    let output: Vec<(f32, f32)> = result_flat
-        .chunks_exact(2)
-        .map(|pair| (pair[0], pair[1]))
-        .collect();
-
-    Ok(output)
+        read_staging(device, &staging, size_bytes, decode_pairs)
+    })
 }
 
-/// Reinterpret a `&[f32]` as `&[u8]` without copying.
-///
-/// Safe because `f32` has no invalid byte representations and `u8` has
-/// alignment 1.
 #[cfg(feature = "webgpu")]
-fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
-    // SAFETY: f32 has no padding or invalid byte patterns; u8 has alignment 1.
-    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
+fn ssm_scan_buf_impl(backend: &WebGpuBackend, input: &GpuBuffer) -> Result<GpuBuffer, WebGpuError> {
+    let source = input.wgpu_buffer()?;
+    let size_bytes = input.size_bytes;
+
+    if size_bytes == 0 || !size_bytes.is_multiple_of(PAIR_BYTES as u64) {
+        return Err(WebGpuError::BufferSizeMismatch {
+            expected: size_bytes
+                .next_multiple_of(PAIR_BYTES as u64)
+                .max(PAIR_BYTES as u64),
+            got: size_bytes,
+        });
+    }
+
+    let pairs = usize::try_from(size_bytes / PAIR_BYTES as u64)
+        .map_err(|_| WebGpuError::Other("ssm_scan_gpu_buf: buffer too large".into()))?;
+    let n = element_count(pairs)?;
+
+    backend.run_scoped(|| {
+        let output = backend.create_storage_buffer("ssm-scan-output", size_bytes)?;
+
+        let (device, queue) = backend.device_and_queue();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ssm-scan-buf-encoder"),
+        });
+
+        let _scratch = encode_scan(backend, &mut encoder, source, &output, n)?;
+        queue.submit(std::iter::once(encoder.finish()));
+
+        Ok(GpuBuffer::from_wgpu(
+            output,
+            size_bytes,
+            GpuBufferUsage::Storage,
+            "ssm-scan-output",
+        ))
+    })
+}
+
+/// GPU resources that must outlive the command buffer they were encoded into.
+#[cfg(feature = "webgpu")]
+struct ScanScratch {
+    #[allow(dead_code, reason = "kept alive until the command buffer is submitted")]
+    buffers: Vec<wgpu::Buffer>,
+    #[allow(dead_code, reason = "kept alive until the command buffer is submitted")]
+    bind_groups: Vec<wgpu::BindGroup>,
+}
+
+/// Encode the full multi-block scan of `n` elements from `input` into `output`.
+///
+/// Pass structure (all in one command encoder, one compute pass per dispatch
+/// so that cross-dispatch writes are visible to the following reads):
+///
+/// 1. level 0: block scan of the sequence → per-block aggregates
+/// 2. level *k*: block scan of level *k−1*'s aggregates, until one block remains
+/// 3. levels descending: apply each level's scanned aggregates as block prefixes
+#[cfg(feature = "webgpu")]
+fn encode_scan(
+    backend: &WebGpuBackend,
+    encoder: &mut wgpu::CommandEncoder,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    n: u32,
+) -> Result<ScanScratch, WebGpuError> {
+    let (device, _queue) = backend.device_and_queue();
+
+    // Element count at each level: level 0 is the sequence, level k+1 is the
+    // aggregate of level k's blocks.  The last level fits in a single block.
+    let mut level_lens: Vec<u32> = Vec::new();
+    let mut current = n;
+    loop {
+        level_lens.push(current);
+        let blocks = current.div_ceil(BLOCK_SIZE);
+        if blocks == 1 {
+            break;
+        }
+        current = blocks;
+    }
+
+    let levels = level_lens.len();
+    let mut buffers: Vec<wgpu::Buffer> = Vec::new();
+    let mut bind_groups: Vec<wgpu::BindGroup> = Vec::new();
+
+    // Outputs for levels 1.. (level 0 writes into the caller's `output`).
+    let mut extra_outputs: Vec<wgpu::Buffer> = Vec::with_capacity(levels.saturating_sub(1));
+    // Block aggregates for every level.
+    let mut block_sums: Vec<wgpu::Buffer> = Vec::with_capacity(levels);
+
+    for (level, &len) in level_lens.iter().enumerate() {
+        let blocks = len.div_ceil(BLOCK_SIZE);
+        backend.check_workgroups(&format!("ssm scan level {level}"), blocks)?;
+
+        if level > 0 {
+            extra_outputs.push(backend.create_storage_buffer(
+                &format!("ssm-scan-level{level}-output"),
+                pair_bytes(len)?,
+            )?);
+        }
+        block_sums.push(
+            backend.create_storage_buffer(
+                &format!("ssm-scan-level{level}-sums"),
+                pair_bytes(blocks)?,
+            )?,
+        );
+    }
+
+    // ── Upward pass: scan each level's blocks ───────────────────────────────
+    for (level, &len) in level_lens.iter().enumerate() {
+        let blocks = len.div_ceil(BLOCK_SIZE);
+        let source = if level == 0 {
+            input
+        } else {
+            level_buffer(&block_sums, level - 1, "block sums")?
+        };
+        let destination = level_output(output, &extra_outputs, level)?;
+        let sums = level_buffer(&block_sums, level, "block sums")?;
+
+        let params = backend
+            .create_uniform_buffer(&format!("ssm-scan-level{level}-params"), &len.to_ne_bytes());
+        let pipeline = backend.pipeline(KernelKind::SsmScanBlock)?;
+        let bind_group = pipeline.bind_group(
+            device,
+            &format!("ssm-scan-block-bg-l{level}"),
+            &[&params, source, destination, sums],
+        );
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ssm-scan-block-pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&pipeline.pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(blocks, 1, 1);
+        }
+
+        buffers.push(params);
+        bind_groups.push(bind_group);
+    }
+
+    // ── Downward pass: fold each level's scanned aggregates back in ─────────
+    for level in (0..levels.saturating_sub(1)).rev() {
+        let len = *level_lens
+            .get(level)
+            .ok_or_else(|| WebGpuError::Other(format!("ssm scan: missing level {level}")))?;
+        let blocks = len.div_ceil(BLOCK_SIZE);
+
+        // Level `level + 1` holds the scanned aggregates of `level`'s blocks.
+        let prefixes = level_output(output, &extra_outputs, level + 1)?;
+        let data = level_output(output, &extra_outputs, level)?;
+
+        let params = backend
+            .create_uniform_buffer(&format!("ssm-scan-apply{level}-params"), &len.to_ne_bytes());
+        let pipeline = backend.pipeline(KernelKind::SsmScanApply)?;
+        let bind_group = pipeline.bind_group(
+            device,
+            &format!("ssm-scan-apply-bg-l{level}"),
+            &[&params, prefixes, data],
+        );
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ssm-scan-apply-pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&pipeline.pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(blocks, 1, 1);
+        }
+
+        buffers.push(params);
+        bind_groups.push(bind_group);
+    }
+
+    buffers.extend(extra_outputs);
+    buffers.extend(block_sums);
+
+    Ok(ScanScratch {
+        buffers,
+        bind_groups,
+    })
+}
+
+/// Borrow the output buffer of `level` (level 0 is the caller's buffer).
+#[cfg(feature = "webgpu")]
+fn level_output<'a>(
+    output: &'a wgpu::Buffer,
+    extra: &'a [wgpu::Buffer],
+    level: usize,
+) -> Result<&'a wgpu::Buffer, WebGpuError> {
+    if level == 0 {
+        return Ok(output);
+    }
+    extra.get(level - 1).ok_or_else(|| {
+        WebGpuError::Other(format!("ssm scan: missing output buffer for level {level}"))
+    })
+}
+
+/// Borrow entry `level` of a per-level buffer list.
+#[cfg(feature = "webgpu")]
+fn level_buffer<'a>(
+    buffers: &'a [wgpu::Buffer],
+    level: usize,
+    what: &str,
+) -> Result<&'a wgpu::Buffer, WebGpuError> {
+    buffers
+        .get(level)
+        .ok_or_else(|| WebGpuError::Other(format!("ssm scan: missing {what} for level {level}")))
+}
+
+/// Byte size of `count` interleaved `(a, bu)` pairs.
+#[cfg(feature = "webgpu")]
+fn pair_bytes(count: u32) -> Result<u64, WebGpuError> {
+    u64::from(count)
+        .checked_mul(PAIR_BYTES as u64)
+        .ok_or_else(|| WebGpuError::Other(format!("ssm scan: size overflow for {count} elements")))
+}
+
+/// Narrow a host element count to the `u32` the shader indexes with.
+#[cfg(feature = "webgpu")]
+fn element_count(len: usize) -> Result<u32, WebGpuError> {
+    u32::try_from(len).map_err(|_| WebGpuError::DeviceLimitExceeded {
+        what: "ssm scan sequence length".into(),
+        required: len as u64,
+        limit: u64::from(u32::MAX),
+    })
+}
+
+/// Flatten `(a, bu)` pairs into the interleaved byte layout the kernel reads.
+#[cfg(feature = "webgpu")]
+fn pairs_to_bytes(elements: &[(f32, f32)]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(elements.len() * PAIR_BYTES);
+    for &(a, bu) in elements {
+        bytes.extend_from_slice(&a.to_ne_bytes());
+        bytes.extend_from_slice(&bu.to_ne_bytes());
+    }
+    bytes
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "webgpu")))]
 mod tests {
-    #[cfg(not(feature = "webgpu"))]
     use super::*;
+    use crate::backend::unavailable_backend;
 
     /// Without the `webgpu` feature, `ssm_scan_gpu` must return
-    /// `Err(WebGpuError::BackendUnavailable)`.
-    #[cfg(not(feature = "webgpu"))]
-    #[tokio::test]
-    async fn test_ssm_scan_gpu_unavailable_without_feature() {
-        // Without the `webgpu` feature the constructor returns
-        // `BackendUnavailable` immediately; verify the error variant is correct.
-        let result = WebGpuBackend::new().await;
+    /// `Err(WebGpuError::BackendUnavailable)` — exercised on the function
+    /// itself, not on the constructor.
+    #[test]
+    fn test_ssm_scan_gpu_unavailable_without_feature() {
+        let backend = unavailable_backend();
+        let result = ssm_scan_gpu(&backend, &[(0.9, 1.0), (0.8, 2.0)]);
+        assert!(
+            matches!(result, Err(WebGpuError::BackendUnavailable)),
+            "expected BackendUnavailable, got: {result:?}",
+        );
+    }
+
+    /// The device-resident variant must be unavailable too.
+    #[test]
+    fn test_ssm_scan_gpu_buf_unavailable_without_feature() {
+        let backend = unavailable_backend();
+        let buf = GpuBuffer::metadata_only(16, crate::GpuBufferUsage::Storage, "scan-in");
+        let result = ssm_scan_gpu_buf(&backend, &buf);
         assert!(
             matches!(result, Err(WebGpuError::BackendUnavailable)),
             "expected BackendUnavailable, got: {result:?}",
@@ -292,19 +408,18 @@ mod tests {
 #[cfg(all(test, feature = "webgpu"))]
 mod gpu_tests {
     use super::*;
+    use crate::test_support::{assert_pairs_close, try_backend};
     use kizzasi_core::ssm_backend::{CpuSsmBackend, SsmBackend};
 
-    /// Helper: obtain a backend or skip the test gracefully when no GPU is
-    /// available in the current CI / sandbox environment.
-    async fn try_backend() -> Option<WebGpuBackend> {
-        match WebGpuBackend::new().await {
-            Ok(b) => Some(b),
-            Err(WebGpuError::AdapterRequest(_)) => {
-                eprintln!("no GPU adapter found — skipping GPU test");
-                None
-            }
-            Err(e) => panic!("unexpected error creating WebGpuBackend: {e}"),
-        }
+    /// Deterministic, numerically well-behaved scan input.
+    fn sample_elements(n: usize) -> Vec<(f32, f32)> {
+        (0..n)
+            .map(|i| {
+                let a = 0.5 + 0.4 * ((i * 13 + 7) % 10) as f32 / 10.0;
+                let bu = ((i * 7 + 3) % 5) as f32 * 0.5;
+                (a, bu)
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -316,26 +431,7 @@ mod gpu_tests {
         let elements = [(0.9_f32, 1.0_f32), (0.8_f32, 2.0_f32)];
         let result = ssm_scan_gpu(&backend, &elements).expect("GPU scan failed");
         assert_eq!(result.len(), 2);
-        assert!(
-            (result[0].0 - 0.9).abs() < 1e-4,
-            "result[0].0: expected 0.9, got {}",
-            result[0].0
-        );
-        assert!(
-            (result[0].1 - 1.0).abs() < 1e-4,
-            "result[0].1: expected 1.0, got {}",
-            result[0].1
-        );
-        assert!(
-            (result[1].0 - 0.72).abs() < 1e-4,
-            "result[1].0: expected 0.72, got {}",
-            result[1].0
-        );
-        assert!(
-            (result[1].1 - 2.8).abs() < 1e-4,
-            "result[1].1: expected 2.8, got {}",
-            result[1].1
-        );
+        assert_pairs_close(&[(0.9, 1.0), (0.72, 2.8)], &result, 1e-4);
     }
 
     #[tokio::test]
@@ -347,26 +443,7 @@ mod gpu_tests {
         let elements = [(1.0_f32, 0.0_f32), (0.5_f32, 3.0_f32)];
         let result = ssm_scan_gpu(&backend, &elements).expect("GPU scan failed");
         assert_eq!(result.len(), 2);
-        assert!(
-            (result[0].0 - 1.0).abs() < 1e-4,
-            "result[0].0: expected 1.0, got {}",
-            result[0].0
-        );
-        assert!(
-            (result[0].1 - 0.0).abs() < 1e-4,
-            "result[0].1: expected 0.0, got {}",
-            result[0].1
-        );
-        assert!(
-            (result[1].0 - 0.5).abs() < 1e-4,
-            "result[1].0: expected 0.5, got {}",
-            result[1].0
-        );
-        assert!(
-            (result[1].1 - 3.0).abs() < 1e-4,
-            "result[1].1: expected 3.0, got {}",
-            result[1].1
-        );
+        assert_pairs_close(&[(1.0, 0.0), (0.5, 3.0)], &result, 1e-4);
     }
 
     #[tokio::test]
@@ -375,31 +452,95 @@ mod gpu_tests {
             return;
         };
 
-        // Generate 64 deterministic pseudo-random elements.
-        let elements: Vec<(f32, f32)> = (0..64_usize)
-            .map(|i| {
-                // Simple LCG-like pattern: values in (0,1) range.
-                let a = 0.5 + 0.4 * ((i * 13 + 7) % 10) as f32 / 10.0;
-                let bu = ((i * 7 + 3) % 5) as f32 * 0.5;
-                (a, bu)
-            })
-            .collect();
-
-        let cpu_backend = CpuSsmBackend;
-        let cpu_result = cpu_backend.ssm_scan(&elements).expect("CPU scan failed");
+        let elements = sample_elements(64);
+        let cpu_result = CpuSsmBackend.ssm_scan(&elements).expect("CPU scan failed");
         let gpu_result = ssm_scan_gpu(&backend, &elements).expect("GPU scan failed");
 
         assert_eq!(cpu_result.len(), gpu_result.len());
+        assert_pairs_close(&cpu_result, &gpu_result, 1e-4);
+    }
 
-        let max_diff = cpu_result
-            .iter()
-            .zip(gpu_result.iter())
-            .map(|(&(ca, cbu), &(ga, gbu))| (ca - ga).abs().max((cbu - gbu).abs()))
-            .fold(0.0_f32, f32::max);
+    /// Regression: sequences that span more than one work-group used to be
+    /// scanned as if the sequence restarted at every 256-element boundary.
+    #[tokio::test]
+    async fn test_ssm_scan_gpu_multi_block_boundaries() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
 
+        for n in [255_usize, 256, 257, 511, 512, 513, 1000] {
+            let elements = sample_elements(n);
+            let cpu_result = CpuSsmBackend.ssm_scan(&elements).expect("CPU scan failed");
+            let gpu_result = ssm_scan_gpu(&backend, &elements).expect("GPU scan failed");
+
+            assert_eq!(gpu_result.len(), n, "length mismatch at n={n}");
+            assert_pairs_close(&cpu_result, &gpu_result, 1e-3);
+        }
+    }
+
+    /// Three-level recursion: 66 000 elements → 258 aggregates → 2 aggregates.
+    #[tokio::test]
+    async fn test_ssm_scan_gpu_three_level_recursion() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
+
+        let n = 66_000_usize;
+        let elements = sample_elements(n);
+        let cpu_result = CpuSsmBackend.ssm_scan(&elements).expect("CPU scan failed");
+        let gpu_result = ssm_scan_gpu(&backend, &elements).expect("GPU scan failed");
+
+        assert_eq!(gpu_result.len(), n);
+        assert_pairs_close(&cpu_result, &gpu_result, 1e-3);
+    }
+
+    /// Empty and single-element inputs stay on the fast path.
+    #[tokio::test]
+    async fn test_ssm_scan_gpu_degenerate_lengths() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
+
+        assert!(ssm_scan_gpu(&backend, &[])
+            .expect("empty scan failed")
+            .is_empty());
+        let single = ssm_scan_gpu(&backend, &[(0.3, 1.5)]).expect("single-element scan failed");
+        assert_eq!(single, vec![(0.3, 1.5)]);
+    }
+
+    /// The device-resident variant must agree with the host-slice variant.
+    #[tokio::test]
+    async fn test_ssm_scan_gpu_buf_roundtrip() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
+
+        let elements = sample_elements(700);
+        let flat: Vec<f32> = elements.iter().flat_map(|&(a, bu)| [a, bu]).collect();
+
+        let input = backend.upload_f32(&flat, "scan-buf-in").expect("upload");
+        let output = ssm_scan_gpu_buf(&backend, &input).expect("resident scan failed");
+        let downloaded = backend.download_f32(&output).expect("download");
+
+        let expected = ssm_scan_gpu(&backend, &elements).expect("host scan failed");
+        let got: Vec<(f32, f32)> = downloaded.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        assert_pairs_close(&expected, &got, 1e-5);
+    }
+
+    /// A buffer whose byte size is not a whole number of pairs is rejected.
+    #[tokio::test]
+    async fn test_ssm_scan_gpu_buf_rejects_odd_size() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
+
+        let input = backend
+            .upload_f32(&[1.0, 2.0, 3.0], "scan-buf-odd")
+            .expect("upload");
+        let err = ssm_scan_gpu_buf(&backend, &input).expect_err("odd size must fail");
         assert!(
-            max_diff < 1e-4,
-            "max absolute difference between CPU and GPU scan: {max_diff}"
+            matches!(err, WebGpuError::BufferSizeMismatch { .. }),
+            "got: {err:?}"
         );
     }
 }

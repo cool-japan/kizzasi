@@ -2,7 +2,8 @@
 //!
 //! # SiLU
 //! Computes the Swish activation: `output[i] = input[i] / (1 + exp(-input[i]))`.
-//! Any input length is supported.
+//! Any input length is supported, up to the device's storage-binding and
+//! dispatch limits.
 //!
 //! # RMS Norm
 //! Computes: `output[i] = (input[i] / rms(input)) * weight[i]`
@@ -10,27 +11,32 @@
 //!
 //! The RMS Norm uses a single-pass, single-work-group kernel with a parallel
 //! tree reduction in shared memory. This limits it to at most
-//! [`MAX_RMS_NORM_LEN`] elements. Callers must fall back to a CPU path for
-//! larger inputs.
+//! [`MAX_RMS_NORM_LEN`] elements; longer inputs return
+//! [`WebGpuError::Other`] rather than a silently truncated result, so callers
+//! can route them to a CPU path.
 //!
 //! # Feature gate
 //! Without `--features webgpu`, all functions return
 //! [`WebGpuError::BackendUnavailable`].
 
+use crate::buffer::GpuBuffer;
 use crate::{WebGpuBackend, WebGpuError};
+
+#[cfg(feature = "webgpu")]
+use crate::backend::{decode_f32, f32_slice_as_bytes, read_staging, F32_BYTES};
+#[cfg(feature = "webgpu")]
+use crate::buffer::GpuBufferUsage;
+#[cfg(feature = "webgpu")]
+use crate::pipeline::KernelKind;
 
 /// Maximum input length supported by the GPU RMS Norm kernel.
 ///
 /// The single-pass kernel uses one work-group of 256 threads.
 pub const MAX_RMS_NORM_LEN: usize = 256;
 
-// ── Shader sources ────────────────────────────────────────────────────────────
-
+/// Work-group size shared by both elementwise kernels.
 #[cfg(feature = "webgpu")]
-const SILU_SHADER_SRC: &str = include_str!("shaders/silu.wgsl");
-
-#[cfg(feature = "webgpu")]
-const RMS_NORM_SHADER_SRC: &str = include_str!("shaders/rms_norm.wgsl");
+const WORKGROUP_SIZE: u32 = 256;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -39,6 +45,8 @@ const RMS_NORM_SHADER_SRC: &str = include_str!("shaders/rms_norm.wgsl");
 /// # Errors
 ///
 /// - [`WebGpuError::BackendUnavailable`] without `--features webgpu`.
+/// - [`WebGpuError::DeviceLimitExceeded`] if the input exceeds the device's
+///   storage-binding or dispatch limits.
 /// - [`WebGpuError::Other`] for wgpu pipeline or dispatch errors.
 pub fn silu_gpu(backend: &WebGpuBackend, input: &[f32]) -> Result<Vec<f32>, WebGpuError> {
     #[cfg(not(feature = "webgpu"))]
@@ -53,6 +61,30 @@ pub fn silu_gpu(backend: &WebGpuBackend, input: &[f32]) -> Result<Vec<f32>, WebG
             return Ok(Vec::new());
         }
         silu_impl(backend, input)
+    }
+}
+
+/// Device-resident variant of [`silu_gpu`].
+///
+/// Takes a GPU buffer and returns a new GPU buffer, so intermediates in a
+/// `matvec → silu → rms_norm` chain never round-trip through host memory.
+///
+/// # Errors
+///
+/// - [`WebGpuError::BackendUnavailable`] without `--features webgpu`.
+/// - [`WebGpuError::NoGpuAllocation`] if `input` is metadata-only.
+/// - [`WebGpuError::BufferSizeMismatch`] if `input` is empty or not a whole
+///   number of `f32` values.
+pub fn silu_gpu_buf(backend: &WebGpuBackend, input: &GpuBuffer) -> Result<GpuBuffer, WebGpuError> {
+    #[cfg(not(feature = "webgpu"))]
+    {
+        let _ = (backend, input);
+        Err(WebGpuError::BackendUnavailable)
+    }
+
+    #[cfg(feature = "webgpu")]
+    {
+        silu_buf_impl(backend, input)
     }
 }
 
@@ -90,163 +122,207 @@ pub fn rms_norm_gpu(
                 got: weight.len() as u64,
             });
         }
-        if input.len() > MAX_RMS_NORM_LEN {
-            return Err(WebGpuError::Other(format!(
-                "rms_norm_gpu: input length {} exceeds maximum {} for single-pass kernel; \
-                 use a CPU fallback for larger inputs",
-                input.len(),
-                MAX_RMS_NORM_LEN
-            )));
-        }
+        check_rms_norm_len(input.len())?;
         rms_norm_impl(backend, input, weight, eps)
+    }
+}
+
+/// Device-resident variant of [`rms_norm_gpu`].
+///
+/// # Errors
+///
+/// - [`WebGpuError::BackendUnavailable`] without `--features webgpu`.
+/// - [`WebGpuError::NoGpuAllocation`] if either buffer is metadata-only.
+/// - [`WebGpuError::BufferSizeMismatch`] if the buffers differ in size, are
+///   empty, or are not a whole number of `f32` values.
+/// - [`WebGpuError::Other`] if the element count exceeds [`MAX_RMS_NORM_LEN`].
+pub fn rms_norm_gpu_buf(
+    backend: &WebGpuBackend,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    eps: f32,
+) -> Result<GpuBuffer, WebGpuError> {
+    #[cfg(not(feature = "webgpu"))]
+    {
+        let _ = (backend, input, weight, eps);
+        Err(WebGpuError::BackendUnavailable)
+    }
+
+    #[cfg(feature = "webgpu")]
+    {
+        rms_norm_buf_impl(backend, input, weight, eps)
     }
 }
 
 // ── GPU implementation — only compiled with `--features webgpu` ──────────────
 
+/// Reject inputs the single-work-group RMS kernel cannot reduce exactly.
 #[cfg(feature = "webgpu")]
-fn silu_impl(backend: &WebGpuBackend, input: &[f32]) -> Result<Vec<f32>, WebGpuError> {
-    let (device, queue) = backend.device_and_queue();
-    let n = input.len() as u32;
+fn check_rms_norm_len(len: usize) -> Result<(), WebGpuError> {
+    if len > MAX_RMS_NORM_LEN {
+        return Err(WebGpuError::Other(format!(
+            "rms_norm_gpu: input length {len} exceeds maximum {MAX_RMS_NORM_LEN} for \
+             single-pass kernel; use a CPU fallback for larger inputs"
+        )));
+    }
+    Ok(())
+}
 
-    // ── Uniform buffer: { n: u32 } = 4 bytes ───────────────────────────────
-    let uniform_data = n.to_ne_bytes();
-    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("silu-params"),
-        size: 4,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&uniform_buf, 0, &uniform_data);
+/// Number of `f32` values in `buf`, rejecting empty or misaligned buffers.
+#[cfg(feature = "webgpu")]
+fn buffer_element_count(buf: &GpuBuffer) -> Result<u32, WebGpuError> {
+    let f32_bytes = F32_BYTES as u64;
+    if buf.size_bytes == 0 || !buf.size_bytes.is_multiple_of(f32_bytes) {
+        return Err(WebGpuError::BufferSizeMismatch {
+            expected: buf.size_bytes.next_multiple_of(f32_bytes).max(f32_bytes),
+            got: buf.size_bytes,
+        });
+    }
+    u32::try_from(buf.size_bytes / f32_bytes).map_err(|_| WebGpuError::DeviceLimitExceeded {
+        what: format!("buffer '{}' element count", buf.label),
+        required: buf.size_bytes / f32_bytes,
+        limit: u64::from(u32::MAX),
+    })
+}
 
-    // ── Input storage buffer (read-only) ────────────────────────────────────
-    let input_bytes = f32_slice_as_bytes(input);
-    let data_size = input_bytes.len() as u64;
+/// Narrow a host element count to the `u32` the shader indexes with.
+#[cfg(feature = "webgpu")]
+fn element_count(len: usize, what: &str) -> Result<u32, WebGpuError> {
+    u32::try_from(len).map_err(|_| WebGpuError::DeviceLimitExceeded {
+        what: what.to_string(),
+        required: len as u64,
+        limit: u64::from(u32::MAX),
+    })
+}
 
-    let input_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("silu-input"),
-        size: data_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&input_buf, 0, input_bytes);
+/// Resources kept alive until the encoded command buffer is submitted.
+#[cfg(feature = "webgpu")]
+struct KernelResources {
+    #[allow(dead_code, reason = "kept alive until the command buffer is submitted")]
+    uniform: wgpu::Buffer,
+    #[allow(dead_code, reason = "kept alive until the command buffer is submitted")]
+    bind_group: wgpu::BindGroup,
+}
 
-    // ── Output storage buffer (read-write) ──────────────────────────────────
-    let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("silu-output"),
-        size: data_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+/// Encode one SiLU dispatch over `n` elements.
+#[cfg(feature = "webgpu")]
+fn encode_silu(
+    backend: &WebGpuBackend,
+    encoder: &mut wgpu::CommandEncoder,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    n: u32,
+) -> Result<KernelResources, WebGpuError> {
+    let workgroups = n.div_ceil(WORKGROUP_SIZE);
+    backend.check_workgroups("silu", workgroups)?;
 
-    // ── Staging buffer for readback ─────────────────────────────────────────
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("silu-staging"),
-        size: data_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    // ── Shader + pipeline ───────────────────────────────────────────────────
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("silu-shader"),
-        source: wgpu::ShaderSource::Wgsl(SILU_SHADER_SRC.into()),
-    });
-
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("silu-bgl"),
-        entries: &[
-            // binding 0: uniform { n }
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // binding 1: input (read-only storage)
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // binding 2: output (read-write storage)
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("silu-pipeline-layout"),
-        bind_group_layouts: &[Some(&bind_group_layout)],
-        immediate_size: 0,
-    });
-
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("silu-pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
-    });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("silu-bg"),
-        layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: input_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: output_buf.as_entire_binding(),
-            },
-        ],
-    });
-
-    // ── Encode and dispatch ─────────────────────────────────────────────────
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("silu-encoder"),
-    });
+    let (device, _queue) = backend.device_and_queue();
+    let uniform = backend.create_uniform_buffer("silu-params", &n.to_ne_bytes());
+    let pipeline = backend.pipeline(KernelKind::Silu)?;
+    let bind_group = pipeline.bind_group(device, "silu-bg", &[&uniform, input, output]);
 
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("silu-pass"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&pipeline);
+        cpass.set_pipeline(&pipeline.pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        // Workgroup size = 256; dispatch enough workgroups to cover all elements.
-        let workgroups = n.div_ceil(256);
         cpass.dispatch_workgroups(workgroups, 1, 1);
     }
 
-    encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, data_size);
-    queue.submit(std::iter::once(encoder.finish()));
+    Ok(KernelResources {
+        uniform,
+        bind_group,
+    })
+}
 
-    readback_f32(device, &staging_buf, data_size)
+/// Encode one RMS-norm dispatch over `n` elements (single work-group).
+#[cfg(feature = "webgpu")]
+fn encode_rms_norm(
+    backend: &WebGpuBackend,
+    encoder: &mut wgpu::CommandEncoder,
+    input: &wgpu::Buffer,
+    weight: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    n: u32,
+    eps: f32,
+) -> Result<KernelResources, WebGpuError> {
+    let mut params = [0u8; 8];
+    params[0..4].copy_from_slice(&n.to_ne_bytes());
+    params[4..8].copy_from_slice(&eps.to_ne_bytes());
+
+    let (device, _queue) = backend.device_and_queue();
+    let uniform = backend.create_uniform_buffer("rms-norm-params", &params);
+    let pipeline = backend.pipeline(KernelKind::RmsNorm)?;
+    let bind_group = pipeline.bind_group(device, "rms-norm-bg", &[&uniform, input, weight, output]);
+
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("rms-norm-pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipeline.pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        // The tree reduction requires the whole input in one work-group.
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+
+    Ok(KernelResources {
+        uniform,
+        bind_group,
+    })
+}
+
+#[cfg(feature = "webgpu")]
+fn silu_impl(backend: &WebGpuBackend, input: &[f32]) -> Result<Vec<f32>, WebGpuError> {
+    let n = element_count(input.len(), "silu input length")?;
+    let bytes = f32_slice_as_bytes(input);
+    let size_bytes = bytes.len() as u64;
+
+    backend.run_scoped(|| {
+        let input_buf = backend.upload_bytes("silu-input", bytes)?;
+        let output_buf = backend.create_storage_buffer("silu-output", size_bytes)?;
+        let staging_buf = backend.create_staging_buffer("silu-staging", size_bytes)?;
+
+        let (device, queue) = backend.device_and_queue();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("silu-encoder"),
+        });
+
+        let _resources = encode_silu(backend, &mut encoder, &input_buf, &output_buf, n)?;
+
+        encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, size_bytes);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        read_staging(device, &staging_buf, size_bytes, decode_f32)
+    })
+}
+
+#[cfg(feature = "webgpu")]
+fn silu_buf_impl(backend: &WebGpuBackend, input: &GpuBuffer) -> Result<GpuBuffer, WebGpuError> {
+    let source = input.wgpu_buffer()?;
+    let n = buffer_element_count(input)?;
+    let size_bytes = input.size_bytes;
+
+    backend.run_scoped(|| {
+        let output_buf = backend.create_storage_buffer("silu-output", size_bytes)?;
+
+        let (device, queue) = backend.device_and_queue();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("silu-buf-encoder"),
+        });
+
+        let _resources = encode_silu(backend, &mut encoder, source, &output_buf, n)?;
+        queue.submit(std::iter::once(encoder.finish()));
+
+        Ok(GpuBuffer::from_wgpu(
+            output_buf,
+            size_bytes,
+            GpuBufferUsage::Storage,
+            "silu-output",
+        ))
+    })
 }
 
 #[cfg(feature = "webgpu")]
@@ -256,243 +332,86 @@ fn rms_norm_impl(
     weight: &[f32],
     eps: f32,
 ) -> Result<Vec<f32>, WebGpuError> {
-    let (device, queue) = backend.device_and_queue();
-    let n = input.len() as u32;
-
-    // ── Uniform buffer: { n: u32, eps: f32 } = 8 bytes ─────────────────────
-    let mut uniform_data = [0u8; 8];
-    uniform_data[0..4].copy_from_slice(&n.to_ne_bytes());
-    uniform_data[4..8].copy_from_slice(&eps.to_ne_bytes());
-
-    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rms-norm-params"),
-        size: 8,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&uniform_buf, 0, &uniform_data);
-
-    // ── Input and weight storage buffers (read-only) ────────────────────────
+    let n = element_count(input.len(), "rms norm input length")?;
     let input_bytes = f32_slice_as_bytes(input);
-    let data_size = input_bytes.len() as u64;
-
-    let input_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rms-norm-input"),
-        size: data_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&input_buf, 0, input_bytes);
-
     let weight_bytes = f32_slice_as_bytes(weight);
-    let weight_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rms-norm-weight"),
-        size: data_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&weight_buf, 0, weight_bytes);
+    let size_bytes = input_bytes.len() as u64;
 
-    // ── Output storage buffer (read-write) ──────────────────────────────────
-    let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rms-norm-output"),
-        size: data_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+    backend.run_scoped(|| {
+        let input_buf = backend.upload_bytes("rms-norm-input", input_bytes)?;
+        let weight_buf = backend.upload_bytes("rms-norm-weight", weight_bytes)?;
+        let output_buf = backend.create_storage_buffer("rms-norm-output", size_bytes)?;
+        let staging_buf = backend.create_staging_buffer("rms-norm-staging", size_bytes)?;
 
-    // ── Staging buffer for readback ─────────────────────────────────────────
-    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("rms-norm-staging"),
-        size: data_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    // ── Shader + pipeline ───────────────────────────────────────────────────
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("rms-norm-shader"),
-        source: wgpu::ShaderSource::Wgsl(RMS_NORM_SHADER_SRC.into()),
-    });
-
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("rms-norm-bgl"),
-        entries: &[
-            // binding 0: uniform { n, eps }
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // binding 1: input (read-only storage)
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // binding 2: weight (read-only storage)
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // binding 3: output (read-write storage)
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("rms-norm-pipeline-layout"),
-        bind_group_layouts: &[Some(&bind_group_layout)],
-        immediate_size: 0,
-    });
-
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("rms-norm-pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
-    });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("rms-norm-bg"),
-        layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: input_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: weight_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: output_buf.as_entire_binding(),
-            },
-        ],
-    });
-
-    // ── Encode and dispatch ─────────────────────────────────────────────────
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("rms-norm-encoder"),
-    });
-
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rms-norm-pass"),
-            timestamp_writes: None,
+        let (device, queue) = backend.device_and_queue();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rms-norm-encoder"),
         });
-        cpass.set_pipeline(&pipeline);
-        cpass.set_bind_group(0, &bind_group, &[]);
-        // Single work-group covers up to 256 elements.
-        cpass.dispatch_workgroups(1, 1, 1);
-    }
 
-    encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, data_size);
-    queue.submit(std::iter::once(encoder.finish()));
+        let _resources = encode_rms_norm(
+            backend,
+            &mut encoder,
+            &input_buf,
+            &weight_buf,
+            &output_buf,
+            n,
+            eps,
+        )?;
 
-    readback_f32(device, &staging_buf, data_size)
+        encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, size_bytes);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        read_staging(device, &staging_buf, size_bytes, decode_f32)
+    })
 }
 
-/// Poll GPU until complete, map staging buffer, and collect `Vec<f32>`.
 #[cfg(feature = "webgpu")]
-fn readback_f32(
-    device: &wgpu::Device,
-    staging_buf: &wgpu::Buffer,
-    data_size: u64,
-) -> Result<Vec<f32>, WebGpuError> {
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        })
-        .map_err(|e| WebGpuError::Other(format!("device poll error: {e:?}")))?;
+fn rms_norm_buf_impl(
+    backend: &WebGpuBackend,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    eps: f32,
+) -> Result<GpuBuffer, WebGpuError> {
+    let input_source = input.wgpu_buffer()?;
+    let weight_source = weight.wgpu_buffer()?;
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
-    staging_buf
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        })
-        .map_err(|e| WebGpuError::Other(format!("device poll error after map: {e:?}")))?;
-
-    rx.recv()
-        .map_err(|_| WebGpuError::MapBuffer("channel closed before map completed".into()))?
-        .map_err(|e| WebGpuError::MapBuffer(e.to_string()))?;
-
-    let mapped = staging_buf
-        .slice(..)
-        .get_mapped_range()
-        .map_err(|e| WebGpuError::MapBuffer(e.to_string()))?;
-    let result: Vec<f32> = mapped
-        .chunks_exact(4)
-        .map(|chunk| {
-            let arr: [u8; 4] = chunk.try_into().unwrap_or([0u8; 4]);
-            f32::from_ne_bytes(arr)
-        })
-        .collect();
-
-    drop(mapped);
-
-    // Size check: data_size bytes must correspond to a whole number of f32s.
-    let expected_count = (data_size / 4) as usize;
-    if result.len() != expected_count {
+    if input.size_bytes != weight.size_bytes {
         return Err(WebGpuError::BufferSizeMismatch {
-            expected: data_size,
-            got: (result.len() * 4) as u64,
+            expected: input.size_bytes,
+            got: weight.size_bytes,
         });
     }
 
-    staging_buf.unmap();
+    let n = buffer_element_count(input)?;
+    check_rms_norm_len(n as usize)?;
+    let size_bytes = input.size_bytes;
 
-    Ok(result)
-}
+    backend.run_scoped(|| {
+        let output_buf = backend.create_storage_buffer("rms-norm-output", size_bytes)?;
 
-/// Reinterpret a `&[f32]` as `&[u8]` without copying.
-///
-/// Safe because `f32` has no invalid byte representations and `u8` has
-/// alignment 1.
-#[cfg(feature = "webgpu")]
-fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
-    // SAFETY: f32 has no padding or invalid byte patterns; u8 has alignment 1.
-    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
+        let (device, queue) = backend.device_and_queue();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rms-norm-buf-encoder"),
+        });
+
+        let _resources = encode_rms_norm(
+            backend,
+            &mut encoder,
+            input_source,
+            weight_source,
+            &output_buf,
+            n,
+            eps,
+        )?;
+        queue.submit(std::iter::once(encoder.finish()));
+
+        Ok(GpuBuffer::from_wgpu(
+            output_buf,
+            size_bytes,
+            GpuBufferUsage::Storage,
+            "rms-norm-output",
+        ))
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -501,11 +420,13 @@ fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
 mod tests {
     use super::*;
 
-    /// Without the `webgpu` feature, `silu_gpu` must return `BackendUnavailable`.
+    /// Without the `webgpu` feature, `silu_gpu` must return `BackendUnavailable`
+    /// from the function itself.
     #[cfg(not(feature = "webgpu"))]
-    #[tokio::test]
-    async fn test_silu_unavailable_without_feature() {
-        let result = WebGpuBackend::new().await;
+    #[test]
+    fn test_silu_unavailable_without_feature() {
+        let backend = crate::backend::unavailable_backend();
+        let result = silu_gpu(&backend, &[1.0, 2.0, 3.0]);
         assert!(
             matches!(result, Err(WebGpuError::BackendUnavailable)),
             "expected BackendUnavailable, got: {result:?}"
@@ -514,13 +435,30 @@ mod tests {
 
     /// Without the `webgpu` feature, `rms_norm_gpu` must return `BackendUnavailable`.
     #[cfg(not(feature = "webgpu"))]
-    #[tokio::test]
-    async fn test_rms_norm_unavailable_without_feature() {
-        let result = WebGpuBackend::new().await;
+    #[test]
+    fn test_rms_norm_unavailable_without_feature() {
+        let backend = crate::backend::unavailable_backend();
+        let result = rms_norm_gpu(&backend, &[1.0, 2.0], &[1.0, 1.0], 1e-6);
         assert!(
             matches!(result, Err(WebGpuError::BackendUnavailable)),
             "expected BackendUnavailable, got: {result:?}"
         );
+    }
+
+    /// The device-resident variants must be unavailable too.
+    #[cfg(not(feature = "webgpu"))]
+    #[test]
+    fn test_buf_variants_unavailable_without_feature() {
+        let backend = crate::backend::unavailable_backend();
+        let buf = GpuBuffer::metadata_only(16, crate::GpuBufferUsage::Storage, "in");
+        assert!(matches!(
+            silu_gpu_buf(&backend, &buf),
+            Err(WebGpuError::BackendUnavailable)
+        ));
+        assert!(matches!(
+            rms_norm_gpu_buf(&backend, &buf, &buf, 1e-6),
+            Err(WebGpuError::BackendUnavailable)
+        ));
     }
 
     /// `rms_norm_gpu` must return `BufferSizeMismatch` when weight length differs.
@@ -574,17 +512,20 @@ mod tests {
 #[cfg(all(test, feature = "webgpu"))]
 mod gpu_tests {
     use super::*;
+    use crate::test_support::{assert_slices_close, try_backend};
 
-    /// Helper: obtain a backend or skip gracefully when no GPU adapter is present.
-    async fn try_backend() -> Option<WebGpuBackend> {
-        match WebGpuBackend::new().await {
-            Ok(b) => Some(b),
-            Err(WebGpuError::AdapterRequest(_)) => {
-                eprintln!("no GPU adapter found — skipping GPU test");
-                None
-            }
-            Err(e) => panic!("unexpected error creating WebGpuBackend: {e}"),
-        }
+    fn silu_reference(input: &[f32]) -> Vec<f32> {
+        input.iter().map(|&x| x / (1.0 + (-x).exp())).collect()
+    }
+
+    fn rms_norm_reference(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+        let sum_sq: f32 = input.iter().map(|&x| x * x).sum();
+        let rms = ((sum_sq / input.len() as f32) + eps).sqrt();
+        input
+            .iter()
+            .zip(weight.iter())
+            .map(|(&x, &w)| (x / rms) * w)
+            .collect()
     }
 
     /// Known SiLU values: silu(0) ≈ 0, silu(1) ≈ 0.7311, silu(-1) ≈ -0.2689.
@@ -598,29 +539,7 @@ mod gpu_tests {
         let result = silu_gpu(&backend, &input).expect("GPU silu failed");
 
         assert_eq!(result.len(), 3);
-
-        // silu(0) = 0 / (1 + 1) = 0
-        assert!(
-            result[0].abs() < 1e-5,
-            "silu(0): expected 0, got {}",
-            result[0]
-        );
-
-        // silu(1) = 1 / (1 + exp(-1)) ≈ 0.7311
-        let expected_1 = 1.0_f32 / (1.0 + (-1.0_f32).exp());
-        assert!(
-            (result[1] - expected_1).abs() < 1e-5,
-            "silu(1): expected {expected_1}, got {}",
-            result[1]
-        );
-
-        // silu(-1) = -1 / (1 + exp(1)) ≈ -0.2689
-        let expected_neg1 = -1.0_f32 / (1.0 + (1.0_f32).exp());
-        assert!(
-            (result[2] - expected_neg1).abs() < 1e-5,
-            "silu(-1): expected {expected_neg1}, got {}",
-            result[2]
-        );
+        assert_slices_close(&silu_reference(&input), &result, 1e-5);
     }
 
     /// SiLU on 64 values: max absolute diff vs CPU reference must be < 1e-5.
@@ -634,26 +553,43 @@ mod gpu_tests {
             .map(|i| (i as f32 - 32.0) / 8.0) // range [-4, 3.875]
             .collect();
 
-        let cpu: Vec<f32> = input.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
-
         let gpu = silu_gpu(&backend, &input).expect("GPU silu failed");
-
         assert_eq!(gpu.len(), 64);
+        assert_slices_close(&silu_reference(&input), &gpu, 1e-5);
+    }
 
-        let max_diff = cpu
-            .iter()
-            .zip(gpu.iter())
-            .map(|(&c, &g)| (c - g).abs())
-            .fold(0.0_f32, f32::max);
+    /// SiLU across the multi-work-group boundary (n = 255/256/257/1000).
+    #[tokio::test]
+    async fn test_silu_multi_workgroup_lengths() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
 
-        assert!(
-            max_diff < 1e-5,
-            "max absolute difference CPU vs GPU silu: {max_diff}"
-        );
+        for n in [255_usize, 256, 257, 1000] {
+            let input: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) / 32.0).collect();
+            let gpu = silu_gpu(&backend, &input).expect("GPU silu failed");
+            assert_eq!(gpu.len(), n, "length mismatch at n={n}");
+            assert_slices_close(&silu_reference(&input), &gpu, 1e-5);
+        }
+    }
+
+    /// Calling a kernel repeatedly must reuse the cached pipeline and keep
+    /// returning identical results.
+    #[tokio::test]
+    async fn test_silu_repeated_calls_are_stable() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
+
+        let input: Vec<f32> = (0..300).map(|i| (i as f32 - 150.0) / 40.0).collect();
+        let first = silu_gpu(&backend, &input).expect("first silu failed");
+        for _ in 0..3 {
+            let again = silu_gpu(&backend, &input).expect("repeat silu failed");
+            assert_eq!(first, again, "cached pipeline produced a different result");
+        }
     }
 
     /// Uniform input [1,…,1] with uniform weights [1,…,1] → output ≈ [1,…,1].
-    /// rms([1,1,...,1]) = 1, so output[i] = (1 / 1) * 1 = 1.
     #[tokio::test]
     async fn test_rms_norm_uniform_input() {
         let Some(backend) = try_backend().await else {
@@ -667,51 +603,121 @@ mod gpu_tests {
         let result = rms_norm_gpu(&backend, &input, &weight, 1e-6).expect("GPU rms_norm failed");
 
         assert_eq!(result.len(), n);
-        for (i, &v) in result.iter().enumerate() {
-            assert!(
-                (v - 1.0).abs() < 1e-4,
-                "rms_norm uniform: element {i} expected 1.0, got {v}"
-            );
-        }
+        assert_slices_close(&vec![1.0_f32; n], &result, 1e-4);
     }
 
-    /// RMS Norm: compare GPU output to CPU reference for 32 values.
+    /// RMS Norm: compare GPU output to CPU reference for 32 and 256 values.
     #[tokio::test]
     async fn test_rms_norm_matches_cpu() {
         let Some(backend) = try_backend().await else {
             return;
         };
 
-        let n = 32usize;
+        for n in [32_usize, MAX_RMS_NORM_LEN] {
+            let input: Vec<f32> = (0..n).map(|i| ((i * 3 + 1) % 7) as f32 / 3.0).collect();
+            let weight: Vec<f32> = (0..n)
+                .map(|i| 0.5 + ((i * 5 + 2) % 4) as f32 / 4.0)
+                .collect();
+            let eps = 1e-5_f32;
+
+            let gpu = rms_norm_gpu(&backend, &input, &weight, eps).expect("GPU rms_norm failed");
+            assert_eq!(gpu.len(), n);
+            assert_slices_close(&rms_norm_reference(&input, &weight, eps), &gpu, 1e-4);
+        }
+    }
+
+    /// One element past the kernel's capacity must be a typed error, never a
+    /// truncated result.
+    #[tokio::test]
+    async fn test_rms_norm_boundary_error() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
+
+        let n = MAX_RMS_NORM_LEN + 1;
+        let input = vec![0.5_f32; n];
+        let weight = vec![1.0_f32; n];
+        let err = rms_norm_gpu(&backend, &input, &weight, 1e-6).expect_err("must reject n=257");
+        assert!(matches!(err, WebGpuError::Other(_)), "got: {err:?}");
+    }
+
+    /// Device-resident SiLU must match the host-slice variant bit for bit.
+    #[tokio::test]
+    async fn test_silu_gpu_buf_matches_slice_variant() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
+
+        let input: Vec<f32> = (0..500).map(|i| (i as f32 - 250.0) / 50.0).collect();
+        let expected = silu_gpu(&backend, &input).expect("slice silu failed");
+
+        let uploaded = backend.upload_f32(&input, "silu-buf-in").expect("upload");
+        let resident = silu_gpu_buf(&backend, &uploaded).expect("resident silu failed");
+        let downloaded = backend.download_f32(&resident).expect("download");
+
+        assert_eq!(expected, downloaded);
+    }
+
+    /// Device-resident RMS norm must match the host-slice variant.
+    #[tokio::test]
+    async fn test_rms_norm_gpu_buf_matches_slice_variant() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
+
+        let n = 128usize;
         let input: Vec<f32> = (0..n).map(|i| ((i * 3 + 1) % 7) as f32 / 3.0).collect();
-        let weight: Vec<f32> = (0..n)
-            .map(|i| 0.5 + ((i * 5 + 2) % 4) as f32 / 4.0)
-            .collect();
+        let weight: Vec<f32> = (0..n).map(|i| 0.5 + (i % 4) as f32 / 4.0).collect();
         let eps = 1e-5_f32;
 
-        // CPU reference.
-        let sum_sq: f32 = input.iter().map(|&x| x * x).sum();
-        let mean_sq = sum_sq / n as f32;
-        let rms = (mean_sq + eps).sqrt();
-        let cpu: Vec<f32> = input
-            .iter()
-            .zip(weight.iter())
-            .map(|(&x, &w)| (x / rms) * w)
-            .collect();
+        let expected = rms_norm_gpu(&backend, &input, &weight, eps).expect("slice rms failed");
 
-        let gpu = rms_norm_gpu(&backend, &input, &weight, eps).expect("GPU rms_norm failed");
+        let input_buf = backend.upload_f32(&input, "rms-in").expect("upload input");
+        let weight_buf = backend.upload_f32(&weight, "rms-w").expect("upload weight");
+        let resident =
+            rms_norm_gpu_buf(&backend, &input_buf, &weight_buf, eps).expect("resident rms failed");
+        let downloaded = backend.download_f32(&resident).expect("download");
 
-        assert_eq!(gpu.len(), n);
+        assert_eq!(expected, downloaded);
+    }
 
-        let max_diff = cpu
-            .iter()
-            .zip(gpu.iter())
-            .map(|(&c, &g)| (c - g).abs())
-            .fold(0.0_f32, f32::max);
+    /// A metadata-only buffer must be rejected, not dereferenced.
+    #[tokio::test]
+    async fn test_silu_gpu_buf_rejects_metadata_only() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
 
+        let buf = GpuBuffer::metadata_only(16, GpuBufferUsage::Storage, "ghost");
+        let err = silu_gpu_buf(&backend, &buf).expect_err("metadata-only must fail");
         assert!(
-            max_diff < 1e-4,
-            "max absolute difference CPU vs GPU rms_norm: {max_diff}"
+            matches!(err, WebGpuError::NoGpuAllocation(_)),
+            "got: {err:?}"
         );
+    }
+
+    /// Chaining kernels on the device must equal chaining them on the host.
+    #[tokio::test]
+    async fn test_device_resident_chain() {
+        let Some(backend) = try_backend().await else {
+            return;
+        };
+
+        let n = 64usize;
+        let input: Vec<f32> = (0..n).map(|i| (i as f32 - 32.0) / 16.0).collect();
+        let weight = vec![1.0_f32; n];
+        let eps = 1e-6_f32;
+
+        let host_silu = silu_gpu(&backend, &input).expect("host silu");
+        let host_chain = rms_norm_gpu(&backend, &host_silu, &weight, eps).expect("host rms");
+
+        let input_buf = backend.upload_f32(&input, "chain-in").expect("upload");
+        let weight_buf = backend.upload_f32(&weight, "chain-w").expect("upload");
+        let silu_buf = silu_gpu_buf(&backend, &input_buf).expect("resident silu");
+        let rms_buf =
+            rms_norm_gpu_buf(&backend, &silu_buf, &weight_buf, eps).expect("resident rms");
+        let device_chain = backend.download_f32(&rms_buf).expect("download");
+
+        assert_eq!(host_chain, device_chain);
     }
 }

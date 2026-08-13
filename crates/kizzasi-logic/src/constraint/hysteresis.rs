@@ -169,7 +169,17 @@ mod tests {
         assert!(!c.check(15.0));
         assert_eq!(c.violation(5.0), 0.0);
         assert_eq!(c.violation(15.0), 5.0);
-        assert_eq!(c.project(15.0), 10.0 - f32::EPSILON);
+        // Regression (finding 124): the old assertion here was
+        // `10.0 - f32::EPSILON`, which is itself exactly `10.0` in f32
+        // arithmetic once the bound's own ULP (≈9.5e-7 at magnitude 10)
+        // exceeds `f32::EPSILON` (≈1.19e-7) — the old `project` had the
+        // identical bug, so both sides collapsed to `10.0` and the
+        // assertion passed for the wrong reason, on a value `check` itself
+        // rejects (`10.0 < 10.0` is `false`). `project` now returns the
+        // true adjacent representable value, which `check` accepts.
+        let projected = c.project(15.0);
+        assert_eq!(projected, 10.0_f32.next_down());
+        assert!(c.check(projected), "projected value must satisfy check()");
     }
 
     #[test]

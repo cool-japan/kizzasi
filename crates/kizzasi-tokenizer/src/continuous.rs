@@ -236,7 +236,7 @@ pub struct TrainableContinuousTokenizer {
     input_dim: usize,
     /// Embedding dimension
     embed_dim: usize,
-    /// Device (CPU or CUDA)
+    /// Device (CPU, or Metal with the crate's `metal` feature)
     device: Device,
 }
 
@@ -258,16 +258,20 @@ impl TrainableContinuousTokenizer {
             .affine(dec_scale as f64, 0.0)?;
         let decoder_var = Var::from_tensor(&decoder_init)?;
 
-        // Add variables to varmap
+        // Add variables to varmap.
+        //
+        // A poisoned lock means some other thread panicked while holding it;
+        // the map itself is still structurally sound, so recover the guard
+        // rather than turning an unrelated panic into a panic here.
         varmap
             .data()
             .lock()
-            .expect("VarMap lock should not be poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert("encoder".to_string(), encoder_var.clone());
         varmap
             .data()
             .lock()
-            .expect("VarMap lock should not be poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert("decoder".to_string(), decoder_var.clone());
 
         Ok(Self {
@@ -579,24 +583,22 @@ impl TrainableContinuousTokenizer {
         let encoder_weights = checkpoint.get_array2("encoder")?;
         let decoder_weights = checkpoint.get_array2("decoder")?;
 
-        // Set the weights by creating new tensors
-        let encoder_tensor = Tensor::from_slice(
-            encoder_weights
-                .as_slice()
-                .expect("Encoder weights must have contiguous layout"),
-            (input_dim, embed_dim),
-            &tokenizer.device,
-        )
-        .map_err(|e| TokenizerError::InternalError(e.to_string()))?;
+        // Set the weights by creating new tensors.
+        //
+        // `as_slice` only succeeds for standard-layout arrays, and a
+        // checkpoint loader has no control over the layout it is handed;
+        // iterating yields the elements in row-major logical order for any
+        // layout, which is exactly what `Tensor::from_slice` expects.
+        let encoder_flat: Vec<f32> = encoder_weights.iter().copied().collect();
+        let decoder_flat: Vec<f32> = decoder_weights.iter().copied().collect();
 
-        let decoder_tensor = Tensor::from_slice(
-            decoder_weights
-                .as_slice()
-                .expect("Decoder weights must have contiguous layout"),
-            (embed_dim, input_dim),
-            &tokenizer.device,
-        )
-        .map_err(|e| TokenizerError::InternalError(e.to_string()))?;
+        let encoder_tensor =
+            Tensor::from_slice(&encoder_flat, (input_dim, embed_dim), &tokenizer.device)
+                .map_err(|e| TokenizerError::InternalError(e.to_string()))?;
+
+        let decoder_tensor =
+            Tensor::from_slice(&decoder_flat, (embed_dim, input_dim), &tokenizer.device)
+                .map_err(|e| TokenizerError::InternalError(e.to_string()))?;
 
         // Update the variables
         tokenizer.encoder_var = Var::from_tensor(&encoder_tensor)
@@ -604,18 +606,18 @@ impl TrainableContinuousTokenizer {
         tokenizer.decoder_var = Var::from_tensor(&decoder_tensor)
             .map_err(|e| TokenizerError::InternalError(e.to_string()))?;
 
-        // Update varmap
+        // Update varmap (recovering the guard if another thread poisoned it)
         tokenizer
             .varmap
             .data()
             .lock()
-            .expect("VarMap lock should not be poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert("encoder".to_string(), tokenizer.encoder_var.clone());
         tokenizer
             .varmap
             .data()
             .lock()
-            .expect("VarMap lock should not be poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert("decoder".to_string(), tokenizer.decoder_var.clone());
 
         Ok(tokenizer)

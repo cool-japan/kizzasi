@@ -81,7 +81,7 @@ use kizzasi_core::{
 use safetensors::tensor::{Dtype, TensorView};
 use scirs2_core::ndarray::{Array1, Array2};
 use scirs2_core::random::{rng, RngExt};
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 /// Configuration for Mamba model
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -98,7 +98,8 @@ pub struct MambaConfig {
     pub conv_kernel_size: usize,
     /// Number of layers
     pub num_layers: usize,
-    /// Dropout rate
+    /// Dropout rate applied to each layer output while training mode is
+    /// enabled via `set_training(true)` (inverted dropout; inert at inference)
     pub dropout: f32,
     /// Use Mamba2 architecture (SSD)
     pub use_mamba2: bool,
@@ -400,48 +401,55 @@ impl SelectiveSSM {
         }
 
         // 2. Compute input-dependent B (input-to-state)
-        // B = Linear_B(x), not just copying weights
-        let mut b_vec = Array2::zeros((batch_size, self.state_dim));
-        for i in 0..batch_size {
-            for n in 0..self.state_dim {
-                let mut sum = 0.0;
-                for j in 0..batch_size {
-                    // Treat b_proj as weight matrix: b_vec[i, n] = sum_j b_proj[j, n] * x[j]
-                    sum += if j < self.b_proj.shape()[0] && n < self.b_proj.shape()[1] {
-                        self.b_proj[[j, n]] * x[j]
-                    } else {
-                        0.0
-                    };
-                }
-                b_vec[[i, n]] = sum;
+        // B = Linear_B(x), not just copying weights.
+        //
+        // `b_row[n] = sum_j b_proj[j, n] * x[j]` does not depend on the batch
+        // row `i` at all (see consumption below), so it is computed once as a
+        // length-`state_dim` row instead of redundantly recomputing the same
+        // value for every one of the `batch_size` rows of a
+        // `(batch_size, state_dim)` matrix. The bound checks are hoisted out
+        // of the inner loop too: `b_row[n]` for `n >= b_bound_n` stays at its
+        // zero-init value, matching the original `else { 0.0 }` branch.
+        let b_bound_j = self.b_proj.shape()[0].min(batch_size);
+        let b_bound_n = self.b_proj.shape()[1].min(self.state_dim);
+        let mut b_row = vec![0.0f32; self.state_dim];
+        for (n, slot) in b_row.iter_mut().enumerate().take(b_bound_n) {
+            let mut sum = 0.0;
+            for j in 0..b_bound_j {
+                sum += self.b_proj[[j, n]] * x[j];
             }
+            *slot = sum;
         }
 
         // 3. Compute input-dependent C (state-to-output)
-        // C = Linear_C(x), not just copying weights
-        let mut c_vec = Array2::zeros((batch_size, self.state_dim));
-        for i in 0..batch_size {
-            for n in 0..self.state_dim {
-                let mut sum = 0.0;
-                for j in 0..batch_size {
-                    // Treat c_proj as weight matrix: c_vec[i, n] = sum_j c_proj[j, n] * x[j]
-                    sum += if j < self.c_proj.shape()[0] && n < self.c_proj.shape()[1] {
-                        self.c_proj[[j, n]] * x[j]
-                    } else {
-                        0.0
-                    };
-                }
-                c_vec[[i, n]] = sum;
+        // C = Linear_C(x), not just copying weights. Same loop-invariance in
+        // `i` as `b_row` above.
+        let c_bound_j = self.c_proj.shape()[0].min(batch_size);
+        let c_bound_n = self.c_proj.shape()[1].min(self.state_dim);
+        let mut c_row = vec![0.0f32; self.state_dim];
+        for (n, slot) in c_row.iter_mut().enumerate().take(c_bound_n) {
+            let mut sum = 0.0;
+            for j in 0..c_bound_j {
+                sum += self.c_proj[[j, n]] * x[j];
             }
+            *slot = sum;
         }
 
         // 4. Discretize: A̅ = exp(Δ·A)
         // For diagonal A: A̅[n] = exp(Δ · A[n])
+        //
+        // `a_diag[n] = -exp(log_a[n])` depends only on `n`, not on the batch
+        // row `i` or on Δ, so it is computed once here instead of being
+        // re-evaluated (with a transcendental `exp()` call each time) inside
+        // both the a_bar loop and the b_bar loop below.
+        let a_diag: Vec<f32> = (0..self.state_dim)
+            .map(|n| -self.log_a[n].exp()) // A[n] = -exp(log_a[n])
+            .collect();
+
         let mut a_bar = Array2::zeros((batch_size, self.state_dim));
         for i in 0..batch_size {
             for n in 0..self.state_dim {
-                let a_n = -self.log_a[n].exp(); // A[n] = -exp(log_a[n])
-                let delta_a = delta[i] * a_n;
+                let delta_a = delta[i] * a_diag[n];
                 // Clamp to prevent numerical overflow
                 a_bar[[i, n]] = delta_a.clamp(-20.0, 20.0).exp();
             }
@@ -454,21 +462,21 @@ impl SelectiveSSM {
         let mut b_bar = Array2::zeros((batch_size, self.state_dim));
         for i in 0..batch_size {
             for n in 0..self.state_dim {
-                let a_n = -self.log_a[n].exp();
+                let a_n = a_diag[n];
 
                 // Use Taylor approximation for small delta (more numerically stable)
                 if delta[i].abs() < 0.001 {
                     // First-order: B̅ ≈ Δ·B
-                    b_bar[[i, n]] = delta[i] * b_vec[[i, n]];
+                    b_bar[[i, n]] = delta[i] * b_row[n];
                 } else {
                     // Exact ZOH discretization
                     // B̅[n] = (exp(Δ·A[n]) - 1) / A[n] · B[n]
                     // As A[n] → 0, L'Hôpital gives the limit (e^{Δa}-1)/a → Δ,
                     // so fall back to the Taylor approximation Δ·B.
                     if a_n.abs() < 1e-8 {
-                        b_bar[[i, n]] = delta[i] * b_vec[[i, n]];
+                        b_bar[[i, n]] = delta[i] * b_row[n];
                     } else {
-                        b_bar[[i, n]] = (a_bar[[i, n]] - 1.0) / a_n * b_vec[[i, n]];
+                        b_bar[[i, n]] = (a_bar[[i, n]] - 1.0) / a_n * b_row[n];
                     }
                 }
             }
@@ -498,7 +506,7 @@ impl SelectiveSSM {
         for i in 0..batch_size {
             let mut c_h = 0.0;
             for n in 0..self.state_dim {
-                c_h += c_vec[[i, n]] * new_state[[i, n]];
+                c_h += c_row[n] * new_state[[i, n]];
             }
             output[i] = c_h + self.d_skip[i] * x[i];
         }
@@ -582,17 +590,30 @@ impl MambaLayer {
         let x_norm = self.norm.forward(x);
 
         // 2. Expansion and gating
-        // Project to 2 * inner_dim, then split for SSM path and gate path
-        let mut projected = Array1::zeros(self.inner_dim * 2);
-        for i in 0..(self.inner_dim * 2) {
-            let mut sum = 0.0;
-            for j in 0..batch_size {
-                if i < self.in_proj.shape()[1] {
+        // Project to 2 * inner_dim, then split for SSM path and gate path.
+        //
+        // `x_norm.dot(&self.in_proj)` is bit-identical to the manual
+        // column-strided loop it replaces when `x_norm.len()` matches
+        // `in_proj`'s row count (the normal case: `hidden_dim`), and lets
+        // ndarray dispatch to a correctly-strided, blocked matmul instead of
+        // walking the row-major `in_proj` matrix one column-strided element
+        // at a time. `x_norm` is derived from the caller-supplied `x`
+        // (nothing upstream guarantees its length), so the original loop is
+        // kept as an exact-behavior fallback — it implicitly zero-pads `x`
+        // by only summing `j in 0..batch_size` — for the mismatched case.
+        let projected = if x_norm.len() == self.in_proj.shape()[0] {
+            x_norm.dot(&self.in_proj)
+        } else {
+            let mut projected = Array1::zeros(self.inner_dim * 2);
+            for i in 0..(self.inner_dim * 2).min(self.in_proj.shape()[1]) {
+                let mut sum = 0.0;
+                for j in 0..batch_size {
                     sum += self.in_proj[[j, i]] * x_norm[j];
                 }
+                projected[i] = sum;
             }
-            projected[i] = sum;
-        }
+            projected
+        };
 
         // Split: first half for SSM, second half for gate
         let mut x_ssm = Array1::zeros(self.inner_dim);
@@ -602,9 +623,14 @@ impl MambaLayer {
             x_gate[i] = projected[self.inner_dim + i];
         }
 
-        // 3. Short convolution on SSM path
-        let x_ssm_vec = x_ssm.to_vec();
-        let conv_out = self.conv.forward_step(&x_ssm_vec);
+        // 3. Short convolution on SSM path. `forward_step` takes `&[f32]`;
+        // borrow `x_ssm` directly instead of paying for an extra `to_vec()`
+        // allocation+copy when the array is contiguous (always true here,
+        // since `x_ssm` was just built via `Array1::zeros` + indexed writes).
+        let conv_out = match x_ssm.as_slice() {
+            Some(slice) => self.conv.forward_step(slice),
+            None => self.conv.forward_step(&x_ssm.to_vec()),
+        };
         x_ssm = Array1::from_vec(conv_out);
 
         // 4. Selective SSM
@@ -619,15 +645,26 @@ impl MambaLayer {
             gated[i] = ssm_out[i] * gate[i];
         }
 
-        // 6. Output projection
-        let mut output = Array1::zeros(batch_size);
-        for i in 0..batch_size {
-            let mut sum = 0.0;
-            for j in 0..gated.len().min(self.out_proj.shape()[0]) {
-                sum += self.out_proj[[j, i]] * gated[j];
-            }
-            output[i] = sum;
-        }
+        // 6. Output projection. Same traversal-order fix as step 2 above:
+        // `gated.dot(&self.out_proj)` is bit-identical to the manual
+        // column-strided loop when shapes line up exactly (the normal
+        // case), and correctly-strided; fall back to the original loop
+        // (which tolerates `gated`/`batch_size` being shorter than
+        // `out_proj`'s dimensions) otherwise.
+        let mut output =
+            if gated.len() == self.out_proj.shape()[0] && batch_size == self.out_proj.shape()[1] {
+                gated.dot(&self.out_proj)
+            } else {
+                let mut output = Array1::zeros(batch_size);
+                for i in 0..batch_size {
+                    let mut sum = 0.0;
+                    for j in 0..gated.len().min(self.out_proj.shape()[0]) {
+                        sum += self.out_proj[[j, i]] * gated[j];
+                    }
+                    output[i] = sum;
+                }
+                output
+            };
 
         // 7. Residual connection
         for i in 0..output.len().min(x.len()) {
@@ -649,6 +686,8 @@ pub struct Mamba {
     layers: Vec<MambaLayer>,
     input_proj: Array2<f32>,
     output_proj: Array2<f32>,
+    /// Whether `MambaConfig::dropout` is active (see [`Mamba::set_training`]).
+    training: bool,
 }
 
 impl Mamba {
@@ -684,6 +723,7 @@ impl Mamba {
             layers,
             input_proj,
             output_proj,
+            training: false,
         })
     }
 
@@ -785,7 +825,34 @@ impl Mamba {
     /// - `layers.{i}.in_proj`, `layers.{i}.out_proj`: layer projections
     /// - `layers.{i}.ssm.log_a`, `layers.{i}.ssm.delta_proj`, `layers.{i}.ssm.delta_bias`,
     ///   `layers.{i}.ssm.b_proj`, `layers.{i}.ssm.c_proj`, `layers.{i}.ssm.d_skip`
+    ///
+    /// # Limitation: `conv` and `norm` are not saved
+    ///
+    /// `MambaLayer::conv` (a [`kizzasi_core::conv::CausalConv1d`]) and
+    /// `MambaLayer::norm` (a [`kizzasi_core::LayerNorm`]) are **not**
+    /// included above, and [`Self::load_weights_json`] never touches them
+    /// either — `kizzasi-core` exposes `set_weights`/`set_bias` /
+    /// `set_gamma`/`set_beta` setters for both types but no matching
+    /// getters, so this crate has no way to read their *current* values
+    /// back out to serialize them.
+    ///
+    /// Both are deterministically derived from layer config at construction
+    /// time (Kaiming-style init for the conv kernel, ones/zeros for the norm
+    /// gain/bias — no randomness involved), so a save→load round trip
+    /// reproduces them correctly *only if* they were never modified after
+    /// construction. For a model whose `conv`/`norm` **were** customized
+    /// (e.g. loaded from a real trained checkpoint via
+    /// [`kizzasi_core::conv::CausalConv1d::set_weights_checked`] or
+    /// [`kizzasi_core::LayerNorm::set_gamma`]/`set_beta`), a save→load round
+    /// trip silently discards that customization and the reloaded model
+    /// reverts to the fresh from-config default instead.
     pub fn save_weights_json<P: AsRef<std::path::Path>>(&self, path: P) -> ModelResult<()> {
+        warn!(
+            "Mamba::save_weights_json does not persist conv/norm parameters \
+             (kizzasi-core exposes no getters for CausalConv1d/LayerNorm); a \
+             save\u{2192}load round trip silently drops any conv/norm \
+             customization made after construction. See this method's docs."
+        );
         let mut weights: std::collections::HashMap<String, Vec<f32>> =
             std::collections::HashMap::new();
 
@@ -848,10 +915,29 @@ impl Mamba {
         Ok(())
     }
 
+    /// Enable or disable training mode.
+    ///
+    /// Models are created in inference mode, where `MambaConfig::dropout` is inert
+    /// and [`step`](crate::SignalPredictor::step) is deterministic. Set this to
+    /// `true` during training so the configured dropout rate is applied to each
+    /// layer output (inverted dropout — no rescale is needed when switching
+    /// back to inference).
+    pub fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
+    /// Whether the model is currently in training mode (dropout active).
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
     /// Load weights from a JSON file previously written by `save_weights_json`.
     ///
     /// Only keys present in the file are applied; missing keys leave the current
     /// randomly-initialized values in place (graceful partial loading).
+    ///
+    /// Note: `conv`/`norm` are never among the applied keys, since
+    /// `save_weights_json` never writes them — see that method's doc for why.
     pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
         let file = std::fs::File::open(path.as_ref()).map_err(|e| {
             ModelError::load_error("mamba load_weights", format!("failed to open file: {e}"))
@@ -863,7 +949,23 @@ impl Mamba {
                     format!("JSON deserialization failed: {e}"),
                 )
             })?;
+        self.load_weights_map(&weights).map(|_| ())
+    }
 
+    /// Load weights from an in-memory `name → flat f32 values` map.
+    ///
+    /// This is the in-process counterpart of [`Self::load_weights_json`]: it
+    /// applies exactly the same shape checks and partial-loading semantics
+    /// without routing the parameters through a serialized file.
+    pub fn load_weights_map(
+        &mut self,
+        weights: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> ModelResult<usize> {
+        // Number of tensors actually applied. The caller needs this to tell a
+        // genuine partial load from a weight map whose names match nothing at
+        // all — the latter would otherwise leave the model randomly
+        // initialised while reporting success.
+        let applied = std::cell::Cell::new(0usize);
         let load_array2 = |map: &std::collections::HashMap<String, Vec<f32>>,
                            key: &str,
                            rows: usize,
@@ -889,6 +991,7 @@ impl Mamba {
                         format!("failed to reshape '{}': {e}", key),
                     )
                 })?;
+                applied.set(applied.get() + 1);
                 Ok(Some(arr))
             } else {
                 Ok(None)
@@ -911,6 +1014,7 @@ impl Mamba {
                         ),
                     ));
                 }
+                applied.set(applied.get() + 1);
                 Ok(Some(Array1::from_vec(data.clone())))
             } else {
                 Ok(None)
@@ -919,12 +1023,12 @@ impl Mamba {
 
         let in_rows = self.config.input_dim;
         let in_cols = self.config.hidden_dim;
-        if let Some(arr) = load_array2(&weights, "input_proj", in_rows, in_cols)? {
+        if let Some(arr) = load_array2(weights, "input_proj", in_rows, in_cols)? {
             self.input_proj = arr;
         }
         let out_rows = self.config.hidden_dim;
         let out_cols = self.config.input_dim;
-        if let Some(arr) = load_array2(&weights, "output_proj", out_rows, out_cols)? {
+        if let Some(arr) = load_array2(weights, "output_proj", out_rows, out_cols)? {
             self.output_proj = arr;
         }
 
@@ -935,7 +1039,7 @@ impl Mamba {
             let prefix = format!("layers.{}", i);
 
             if let Some(arr) = load_array2(
-                &weights,
+                weights,
                 &format!("{}.in_proj", prefix),
                 self.config.hidden_dim,
                 inner_dim * 2,
@@ -943,18 +1047,18 @@ impl Mamba {
                 layer.in_proj = arr;
             }
             if let Some(arr) = load_array2(
-                &weights,
+                weights,
                 &format!("{}.out_proj", prefix),
                 inner_dim,
                 self.config.hidden_dim,
             )? {
                 layer.out_proj = arr;
             }
-            if let Some(arr) = load_array1(&weights, &format!("{}.ssm.log_a", prefix), state_dim)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.ssm.log_a", prefix), state_dim)? {
                 layer.ssm.log_a = arr;
             }
             if let Some(arr) = load_array2(
-                &weights,
+                weights,
                 &format!("{}.ssm.delta_proj", prefix),
                 inner_dim,
                 inner_dim,
@@ -962,12 +1066,12 @@ impl Mamba {
                 layer.ssm.delta_proj = arr;
             }
             if let Some(arr) =
-                load_array1(&weights, &format!("{}.ssm.delta_bias", prefix), inner_dim)?
+                load_array1(weights, &format!("{}.ssm.delta_bias", prefix), inner_dim)?
             {
                 layer.ssm.delta_bias = arr;
             }
             if let Some(arr) = load_array2(
-                &weights,
+                weights,
                 &format!("{}.ssm.b_proj", prefix),
                 inner_dim,
                 state_dim,
@@ -975,20 +1079,19 @@ impl Mamba {
                 layer.ssm.b_proj = arr;
             }
             if let Some(arr) = load_array2(
-                &weights,
+                weights,
                 &format!("{}.ssm.c_proj", prefix),
                 inner_dim,
                 state_dim,
             )? {
                 layer.ssm.c_proj = arr;
             }
-            if let Some(arr) = load_array1(&weights, &format!("{}.ssm.d_skip", prefix), inner_dim)?
-            {
+            if let Some(arr) = load_array1(weights, &format!("{}.ssm.d_skip", prefix), inner_dim)? {
                 layer.ssm.d_skip = arr;
             }
         }
 
-        Ok(())
+        Ok(applied.get())
     }
 
     /// Save model weights to SafeTensors format.
@@ -1103,6 +1206,7 @@ impl Mamba {
 impl SignalPredictor for Mamba {
     #[instrument(skip(self, input), fields(input_size = input.len()))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.input_proj.shape()[0])?;
         trace!(
             "Mamba step input range: [{}, {}]",
             input.iter().cloned().fold(f32::INFINITY, f32::min),
@@ -1114,9 +1218,12 @@ impl SignalPredictor for Mamba {
         trace!("After input projection: hidden_dim={}", hidden.len());
 
         // Pass through each layer
+        let dropout_rate = self.config.dropout;
+        let training = self.training;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             trace!("Processing Mamba layer {}", layer_idx);
             hidden = layer.forward(&hidden)?;
+            crate::dropout::apply_dropout(&mut hidden, dropout_rate, training);
         }
 
         // Project back to input dimension
@@ -1191,9 +1298,12 @@ impl AutoregressiveModel for Mamba {
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             layer.ssm.state = states[layer_idx].state().clone();
-            // Also restore convolution history if available
+            // Also restore convolution history if available. `set_history`
+            // validates the history against this layer's kernel size and
+            // channel count; propagate a mismatch instead of silently
+            // leaving the layer's old (stale or zeroed) history in place.
             if let Some(conv_history) = states[layer_idx].conv_history() {
-                let _ = layer.conv.set_history(conv_history.clone());
+                layer.conv.set_history(conv_history.clone())?;
             }
         }
 
@@ -1212,6 +1322,114 @@ impl AutoregressiveModel for Mamba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_load_weights_map_applies_values_in_memory() {
+        let config = MambaConfig::new()
+            .input_dim(2)
+            .hidden_dim(8)
+            .state_dim(4)
+            .num_layers(1);
+        let mut model = Mamba::new(config).expect("Mamba::new");
+
+        let before = model.input_proj.clone();
+        let values: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
+        let mut weights = std::collections::HashMap::new();
+        weights.insert("input_proj".to_string(), values.clone());
+
+        model.load_weights_map(&weights).expect("load_weights_map");
+
+        assert_ne!(
+            model.input_proj, before,
+            "load_weights_map must actually replace the projection"
+        );
+        for (i, v) in model.input_proj.iter().enumerate() {
+            assert!(
+                (v - values[i]).abs() < 1e-6,
+                "element {i}: {v} != {}",
+                values[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_weights_map_reports_shape_mismatch() {
+        let config = MambaConfig::new()
+            .input_dim(2)
+            .hidden_dim(8)
+            .state_dim(4)
+            .num_layers(1);
+        let mut model = Mamba::new(config).expect("Mamba::new");
+
+        let mut weights = std::collections::HashMap::new();
+        weights.insert("input_proj".to_string(), vec![0.0f32; 5]);
+        let err = model
+            .load_weights_map(&weights)
+            .expect_err("wrong-sized weight must be rejected");
+        assert!(err.to_string().contains("input_proj"), "got: {err}");
+    }
+
+    #[test]
+    fn test_dropout_is_applied_only_in_training_mode() {
+        let mut config = MambaConfig::tiny(4);
+        config.dropout = 0.5;
+        let mut model = Mamba::new(config).expect("Mamba::new");
+        let input = Array1::from_elem(4, 1.0f32);
+
+        // Inference mode (the default): dropout is inert, `step` is deterministic.
+        assert!(!model.is_training());
+        let reference = model.step(&input).expect("step");
+        model.reset();
+        let repeat = model.step(&input).expect("step");
+        for (i, (a, b)) in reference.iter().zip(repeat.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "inference must be deterministic; component {i}: {a} != {b}"
+            );
+        }
+
+        // Training mode: the configured rate must actually perturb the forward
+        // pass, *and* the mask must be resampled each time — a fixed mask would
+        // be a constant reweighting, not a regularizer.
+        model.set_training(true);
+        assert!(model.is_training());
+        let mut perturbed = false;
+        let mut samples: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..32 {
+            model.reset();
+            let out = model.step(&input).expect("step");
+            if out
+                .iter()
+                .zip(reference.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6)
+            {
+                perturbed = true;
+            }
+            samples.push(out.to_vec());
+        }
+        assert!(
+            perturbed,
+            "config.dropout = 0.5 was set but no forward pass was ever affected"
+        );
+        let varies = samples
+            .iter()
+            .any(|s| s.iter().zip(samples[0].iter()).any(|(a, b)| a != b));
+        assert!(
+            varies,
+            "every training-mode step produced an identical result; the dropout mask is not resampled"
+        );
+
+        // Switching back restores the deterministic inference path.
+        model.set_training(false);
+        model.reset();
+        let restored = model.step(&input).expect("step");
+        for (i, (a, b)) in reference.iter().zip(restored.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "disabling training must restore inference output; component {i}: {a} != {b}"
+            );
+        }
+    }
 
     #[test]
     fn test_mamba_creation() {

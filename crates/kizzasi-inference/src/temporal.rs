@@ -206,30 +206,31 @@ impl STLFormula {
                 .robustness(trace, time)
                 .max(phi2.robustness(trace, time)),
             STLFormula::Always { formula, bound } => {
-                let start = (time + bound.lower) as usize;
-                let end = (time + bound.upper) as usize;
-                let end = end.min(trace.len());
+                // `bound` is inclusive on both ends (`TemporalBound::contains`
+                // uses `>=`/`<=`), so the window is `start..=end`, clamped to
+                // the last valid trace index rather than excluded at
+                // `trace.len()`.
+                let start = (time + bound.lower).max(0.0) as usize;
+                let end = ((time + bound.upper) as usize).min(trace.len().saturating_sub(1));
 
-                (start..end)
+                (start..=end)
                     .map(|i| formula.robustness(trace, i as f32))
                     .fold(f32::INFINITY, f32::min)
             }
             STLFormula::Eventually { formula, bound } => {
-                let start = (time + bound.lower) as usize;
-                let end = (time + bound.upper) as usize;
-                let end = end.min(trace.len());
+                let start = (time + bound.lower).max(0.0) as usize;
+                let end = ((time + bound.upper) as usize).min(trace.len().saturating_sub(1));
 
-                (start..end)
+                (start..=end)
                     .map(|i| formula.robustness(trace, i as f32))
                     .fold(f32::NEG_INFINITY, f32::max)
             }
             STLFormula::Until { phi1, phi2, bound } => {
-                let start = (time + bound.lower) as usize;
-                let end = (time + bound.upper) as usize;
-                let end = end.min(trace.len());
+                let start = (time + bound.lower).max(0.0) as usize;
+                let end = ((time + bound.upper) as usize).min(trace.len().saturating_sub(1));
 
                 let mut max_rob = f32::NEG_INFINITY;
-                for i in start..end {
+                for i in start..=end {
                     let rob2 = phi2.robustness(trace, i as f32);
                     // Standard quantitative STL until semantics (Donzé & Maler 2010):
                     // phi1 must hold over the entire prefix [t, t'], not just [t+a, t']
@@ -247,6 +248,36 @@ impl STLFormula {
     /// Check if formula is satisfied (robustness >= 0)
     pub fn is_satisfied(&self, trace: &[Array1<f32>], time: f32) -> bool {
         self.robustness(trace, time) >= 0.0
+    }
+
+    /// The largest forward time-shift this formula (or any subformula) can
+    /// reference, relative to the time it is evaluated at.
+    ///
+    /// A plain `Predicate` looks only at the exact time it is evaluated at
+    /// (shift `0.0`). `Always`/`Eventually` shift by `bound.upper` before
+    /// evaluating their subformula, and `Until` by `bound.upper` before
+    /// evaluating either subformula; nested bounded operators compound.
+    ///
+    /// Used by [`TemporalConstraintEnforcer`] to pick an evaluation time
+    /// early enough in a live (append-only, sliding-window) trace that a
+    /// bounded formula's window is fully populated instead of silently empty
+    /// — evaluating a `□[a,b]` formula at the very latest observed sample
+    /// leaves no room for the `[a,b]` window to look forward into, which
+    /// made every bounded constraint vacuously true.
+    pub fn max_upper_bound(&self) -> f32 {
+        match self {
+            STLFormula::Predicate(_) => 0.0,
+            STLFormula::Not(phi) => phi.max_upper_bound(),
+            STLFormula::And(phi1, phi2) | STLFormula::Or(phi1, phi2) => {
+                phi1.max_upper_bound().max(phi2.max_upper_bound())
+            }
+            STLFormula::Always { formula, bound } | STLFormula::Eventually { formula, bound } => {
+                bound.upper.max(0.0) + formula.max_upper_bound()
+            }
+            STLFormula::Until { phi1, phi2, bound } => {
+                bound.upper.max(0.0) + phi1.max_upper_bound().max(phi2.max_upper_bound())
+            }
+        }
     }
 }
 
@@ -312,31 +343,46 @@ impl TemporalConstraintEnforcer {
     }
 
     /// Check if all STL constraints are satisfied
+    ///
+    /// Each formula is evaluated at `latest - formula.max_upper_bound()`
+    /// (clamped to `0.0`), not uniformly at the latest sample: a bounded
+    /// formula (e.g. `□[0,2] φ`) needs `bound.upper` samples *beyond* its
+    /// evaluation point to have a non-vacuous window, which a live,
+    /// append-only trace can only supply by evaluating that many samples
+    /// back from the most recent one. A plain, unbounded `Predicate` has
+    /// `max_upper_bound() == 0.0` and is still evaluated at the latest
+    /// sample, exactly as before.
     pub fn check_stl(&self) -> bool {
         if self.trace.is_empty() {
             return true;
         }
 
         let trace_vec: Vec<_> = self.trace.iter().cloned().collect();
-        // Check at the most recent time point
         let latest_time = (trace_vec.len() - 1) as f32;
-        self.stl_formulas
-            .iter()
-            .all(|formula| formula.is_satisfied(&trace_vec, latest_time))
+        self.stl_formulas.iter().all(|formula| {
+            let eval_time = (latest_time - formula.max_upper_bound()).max(0.0);
+            formula.is_satisfied(&trace_vec, eval_time)
+        })
     }
 
     /// Get STL robustness values
+    ///
+    /// See [`TemporalConstraintEnforcer::check_stl`]: each formula is
+    /// evaluated at its own bound-aware time, not uniformly at the latest
+    /// sample.
     pub fn stl_robustness(&self) -> Vec<f32> {
         if self.trace.is_empty() {
             return vec![];
         }
 
         let trace_vec: Vec<_> = self.trace.iter().cloned().collect();
-        // Get robustness at the most recent time point
         let latest_time = (trace_vec.len() - 1) as f32;
         self.stl_formulas
             .iter()
-            .map(|formula| formula.robustness(&trace_vec, latest_time))
+            .map(|formula| {
+                let eval_time = (latest_time - formula.max_upper_bound()).max(0.0);
+                formula.robustness(&trace_vec, eval_time)
+            })
             .collect()
     }
 
@@ -354,6 +400,17 @@ impl TemporalConstraintEnforcer {
     /// Get current trace length
     pub fn trace_length(&self) -> usize {
         self.trace.len()
+    }
+
+    /// Total number of observations fed via
+    /// [`TemporalConstraintEnforcer::update`] since creation or the last
+    /// [`TemporalConstraintEnforcer::reset`].
+    ///
+    /// Unlike [`TemporalConstraintEnforcer::trace_length`], this does not
+    /// shrink when the sliding window (`max_trace_len`) evicts old samples —
+    /// it is a monotonic step counter.
+    pub fn current_time(&self) -> usize {
+        self.current_time
     }
 }
 
@@ -598,6 +655,100 @@ mod tests {
             "phi2 never holds → should be unsatisfied, got rob={}",
             rob
         );
+    }
+
+    /// Regression: bounded operators used an exclusive upper end
+    /// (`start..end`), so a violating sample at exactly index `bound.upper`
+    /// was silently excluded from the checked window.
+    #[test]
+    fn test_stl_always_bounded_window_includes_upper_index() {
+        let bound = TemporalBound::new(0.0, 2.0);
+        let always = STLFormula::Always {
+            formula: Box::new(STLFormula::Predicate(|x| x[0])), // satisfied when x >= 0
+            bound,
+        };
+
+        // Indices 0,1 are non-negative; index 2 (== bound.upper) is negative.
+        let trace = vec![
+            Array1::from_vec(vec![1.0_f32]),
+            Array1::from_vec(vec![1.0_f32]),
+            Array1::from_vec(vec![-1.0_f32]),
+            Array1::from_vec(vec![1.0_f32]),
+            Array1::from_vec(vec![1.0_f32]),
+        ];
+
+        assert!(
+            !always.is_satisfied(&trace, 0.0),
+            "a violation at exactly index `upper` must be caught by the bounded window"
+        );
+        assert!(
+            always.robustness(&trace, 0.0) < 0.0,
+            "robustness must reflect the violation at index upper, got {}",
+            always.robustness(&trace, 0.0)
+        );
+    }
+
+    /// Regression: `check_stl`/`stl_robustness` used to evaluate every
+    /// formula at the trace's latest sample, so any bounded window
+    /// (`bound.upper > 0`) looked forward past the end of the trace and
+    /// folded over an empty range — vacuously satisfied (`Always`) no matter
+    /// what the trace contained. A bounded `Always` violated within the
+    /// available trace must now actually be detected.
+    #[test]
+    fn test_check_stl_detects_bounded_violation_not_vacuous() {
+        let mut enforcer = TemporalConstraintEnforcer::new(10);
+        enforcer.add_stl(STLFormula::Always {
+            formula: Box::new(STLFormula::Predicate(|x| x[0])),
+            bound: TemporalBound::new(0.0, 2.0),
+        });
+
+        for v in [1.0_f32, 1.0, -1.0, 1.0, 1.0] {
+            enforcer.update(Array1::from_vec(vec![v]));
+        }
+
+        assert!(
+            !enforcer.check_stl(),
+            "a bounded Always window containing a violation must not be vacuously satisfied"
+        );
+        let robustness = enforcer.stl_robustness();
+        assert_eq!(robustness.len(), 1);
+        assert!(
+            robustness[0] < 0.0,
+            "robustness must reflect the violation, got {}",
+            robustness[0]
+        );
+    }
+
+    /// An unbounded `Predicate` (the common case) must still be evaluated at
+    /// the most recent sample, exactly as before — `max_upper_bound() == 0`
+    /// means the bound-aware eval time collapses to the latest index.
+    #[test]
+    fn test_check_stl_unbounded_predicate_still_uses_latest_sample() {
+        let mut enforcer = TemporalConstraintEnforcer::new(10);
+        enforcer.add_stl(STLFormula::Predicate(|x| x[0] - 5.0));
+
+        enforcer.update(Array1::from_vec(vec![10.0]));
+        assert!(enforcer.check_stl());
+
+        enforcer.update(Array1::from_vec(vec![3.0]));
+        assert!(!enforcer.check_stl());
+    }
+
+    /// Regression: `current_time` was incremented and reset but never read
+    /// anywhere. It must now be a real, monotonic step counter distinct from
+    /// `trace_length` (which shrinks once the sliding window evicts old
+    /// samples).
+    #[test]
+    fn test_current_time_tracks_total_updates_beyond_window() {
+        let mut enforcer = TemporalConstraintEnforcer::new(3);
+        for i in 0..7 {
+            enforcer.update(Array1::from_vec(vec![i as f32]));
+        }
+        assert_eq!(enforcer.current_time(), 7);
+        assert_eq!(enforcer.trace_length(), 3); // capped by max_trace_len
+
+        enforcer.reset();
+        assert_eq!(enforcer.current_time(), 0);
     }
 
     #[test]

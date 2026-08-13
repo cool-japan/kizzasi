@@ -1,3 +1,4 @@
+use crate::error::{LogicError, LogicResult};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -36,53 +37,100 @@ pub enum GeometricSet {
 
 impl GeometricSet {
     /// Create a box constraint
-    pub fn box_constraint(lower: Vec<f32>, upper: Vec<f32>) -> Self {
-        assert_eq!(
-            lower.len(),
-            upper.len(),
-            "Lower and upper bounds must have same dimension"
-        );
-        Self::Box { lower, upper }
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidConstraint`] when `lower` and `upper` have
+    /// different lengths.
+    pub fn box_constraint(lower: Vec<f32>, upper: Vec<f32>) -> LogicResult<Self> {
+        if lower.len() != upper.len() {
+            return Err(LogicError::InvalidConstraint(format!(
+                "box bounds must have the same dimension, got {} and {}",
+                lower.len(),
+                upper.len()
+            )));
+        }
+        Ok(Self::Box { lower, upper })
     }
 
     /// Create a ball constraint
-    pub fn ball(center: Vec<f32>, radius: f32) -> Self {
-        assert!(radius > 0.0, "Radius must be positive");
-        Self::Ball { center, radius }
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidConstraint`] when `radius` is not strictly positive.
+    pub fn ball(center: Vec<f32>, radius: f32) -> LogicResult<Self> {
+        if radius.is_nan() || radius <= 0.0 {
+            return Err(LogicError::InvalidConstraint(format!(
+                "ball radius must be positive, got {radius}"
+            )));
+        }
+        Ok(Self::Ball { center, radius })
     }
 
     /// Create an ellipsoid constraint
-    pub fn ellipsoid(center: Vec<f32>, shape_inv: Vec<f32>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidConstraint`] when `shape_inv` is not a
+    /// `dim × dim` matrix for the given `center`.
+    pub fn ellipsoid(center: Vec<f32>, shape_inv: Vec<f32>) -> LogicResult<Self> {
         let dim = center.len();
-        assert_eq!(shape_inv.len(), dim * dim, "Shape matrix must be dim × dim");
-        Self::Ellipsoid { center, shape_inv }
+        if shape_inv.len() != dim * dim {
+            return Err(LogicError::InvalidConstraint(format!(
+                "ellipsoid shape matrix must hold {} entries (dim × dim), got {}",
+                dim * dim,
+                shape_inv.len()
+            )));
+        }
+        Ok(Self::Ellipsoid { center, shape_inv })
     }
 
     /// Create a polytope constraint Ax <= b
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidConstraint`] when `a_matrix` or `b_vector` do not
+    /// match `num_constraints` and `dimension`.
     pub fn polytope(
         a_matrix: Vec<f32>,
         b_vector: Vec<f32>,
         num_constraints: usize,
         dimension: usize,
-    ) -> Self {
-        assert_eq!(
-            a_matrix.len(),
-            num_constraints * dimension,
-            "A matrix size mismatch"
-        );
-        assert_eq!(b_vector.len(), num_constraints, "b vector size mismatch");
-        Self::Polytope {
+    ) -> LogicResult<Self> {
+        if a_matrix.len() != num_constraints * dimension {
+            return Err(LogicError::InvalidConstraint(format!(
+                "polytope matrix must hold {} entries, got {}",
+                num_constraints * dimension,
+                a_matrix.len()
+            )));
+        }
+        if b_vector.len() != num_constraints {
+            return Err(LogicError::InvalidConstraint(format!(
+                "polytope right-hand side must hold {} entries, got {}",
+                num_constraints,
+                b_vector.len()
+            )));
+        }
+        Ok(Self::Polytope {
             a_matrix,
             b_vector,
             num_constraints,
             dimension,
-        }
+        })
     }
 
     /// Create an L-infinity ball
-    pub fn l_inf_ball(center: Vec<f32>, radius: f32) -> Self {
-        assert!(radius > 0.0, "Radius must be positive");
-        Self::LInfBall { center, radius }
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidConstraint`] when `radius` is not strictly positive.
+    pub fn l_inf_ball(center: Vec<f32>, radius: f32) -> LogicResult<Self> {
+        if radius.is_nan() || radius <= 0.0 {
+            return Err(LogicError::InvalidConstraint(format!(
+                "L-infinity ball radius must be positive, got {radius}"
+            )));
+        }
+        Ok(Self::LInfBall { center, radius })
     }
 
     /// Create a simplex constraint
@@ -339,5 +387,49 @@ impl SetMembershipConstraint {
     /// Get the geometric set
     pub fn set(&self) -> &GeometricSet {
         &self.set
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (finding 140): invalid geometric-set inputs must return a
+    /// recoverable error instead of panicking inside a public constructor.
+    #[test]
+    fn test_geometric_set_constructors_reject_invalid_input() {
+        assert!(matches!(
+            GeometricSet::box_constraint(vec![0.0, 0.0], vec![1.0]),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+        assert!(matches!(
+            GeometricSet::ball(vec![0.0], 0.0),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+        assert!(matches!(
+            GeometricSet::ellipsoid(vec![0.0, 0.0], vec![1.0, 0.0, 0.0]),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+        assert!(matches!(
+            GeometricSet::polytope(vec![1.0, 0.0], vec![1.0], 2, 2),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+        assert!(matches!(
+            GeometricSet::polytope(vec![1.0, 0.0, 0.0, 1.0], vec![1.0], 2, 2),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+        assert!(matches!(
+            GeometricSet::l_inf_ball(vec![0.0], -1.0),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+    }
+
+    #[test]
+    fn test_geometric_set_constructors_accept_valid_input() {
+        assert!(GeometricSet::box_constraint(vec![0.0, 0.0], vec![1.0, 1.0]).is_ok());
+        assert!(GeometricSet::ball(vec![0.0, 0.0], 1.0).is_ok());
+        assert!(GeometricSet::ellipsoid(vec![0.0, 0.0], vec![1.0, 0.0, 0.0, 1.0]).is_ok());
+        assert!(GeometricSet::polytope(vec![1.0, 0.0, 0.0, 1.0], vec![1.0, 1.0], 2, 2).is_ok());
+        assert!(GeometricSet::l_inf_ball(vec![0.0, 0.0], 2.0).is_ok());
     }
 }

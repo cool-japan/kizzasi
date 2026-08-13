@@ -134,17 +134,41 @@ pub enum DeploymentStrategy {
     Rolling { batch_size: usize },
 }
 
+/// SplitMix64 finalizer: decorrelates sequential request ids so a modulo
+/// bucket does not band consecutive requests into the same arm.
+fn mix64(value: u64) -> u64 {
+    let mut z = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 impl DeploymentStrategy {
     /// Check if a request should use the new version based on strategy.
+    ///
+    /// For [`Self::Rolling`] this answers for a rollout that has not been
+    /// advanced yet; use [`ModelRegistry::select_for_request`], which knows
+    /// how far the rollout has progressed.
     pub fn should_use_new_version(&self, request_id: u64) -> bool {
+        self.should_use_new_version_at(request_id, 0.0)
+    }
+
+    /// Traffic-splitting decision, given how far a rolling deployment has
+    /// progressed (`rolled_fraction` in `0.0..=1.0`).
+    pub fn should_use_new_version_at(&self, request_id: u64, rolled_fraction: f64) -> bool {
         match self {
             DeploymentStrategy::Immediate => true,
             DeploymentStrategy::Canary { traffic_percent } => {
-                // Simple hash-based traffic splitting
-                (request_id % 100) < (*traffic_percent as u64)
+                // Hash first: the raw request id is usually sequential, which
+                // makes `id % 100` allocate long runs to the same arm.
+                let percent = (*traffic_percent).min(100) as u64;
+                (mix64(request_id) % 100) < percent
             }
             DeploymentStrategy::BlueGreen => false, // Manual switch
-            DeploymentStrategy::Rolling { .. } => false, // Gradual rollout
+            DeploymentStrategy::Rolling { .. } => {
+                let fraction = rolled_fraction.clamp(0.0, 1.0);
+                ((mix64(request_id) % 10_000) as f64) < fraction * 10_000.0
+            }
         }
     }
 }
@@ -263,7 +287,15 @@ pub struct ModelRegistry {
     versions: HashMap<SemanticVersion, ModelVersion>,
     active_version: Option<SemanticVersion>,
     canary_version: Option<SemanticVersion>,
+    /// Instances already migrated by a `Rolling` deployment.
+    rolled_instances: usize,
+    /// Total instances a `Rolling` deployment must migrate.
+    total_instances: usize,
 }
+
+/// Default instance count assumed by a rolling deployment when the caller has
+/// not called [`ModelRegistry::set_rollout_instances`].
+pub const DEFAULT_ROLLOUT_INSTANCES: usize = 10;
 
 impl ModelRegistry {
     /// Create a new empty registry.
@@ -354,8 +386,15 @@ impl ModelRegistry {
             DeploymentStrategy::Immediate => {
                 self.active_version = Some(version);
                 self.canary_version = None;
+                self.rolled_instances = 0;
+                self.total_instances = 0;
             }
-            DeploymentStrategy::Canary { .. } => {
+            DeploymentStrategy::Canary { traffic_percent } => {
+                if traffic_percent > 100 {
+                    return Err(KizzasiError::config(format!(
+                        "Canary traffic_percent must be 0..=100, got {traffic_percent}"
+                    )));
+                }
                 self.canary_version = Some(version);
                 // Keep current active version
             }
@@ -363,10 +402,18 @@ impl ModelRegistry {
                 self.canary_version = Some(version);
                 // Switch is manual via promote_canary()
             }
-            DeploymentStrategy::Rolling { .. } => {
-                // Simplified: treat as immediate for now
-                self.active_version = Some(version);
-                self.canary_version = None;
+            DeploymentStrategy::Rolling { batch_size } => {
+                if batch_size == 0 {
+                    return Err(KizzasiError::config("Rolling batch_size must be > 0"));
+                }
+                // A staged rollout starts with *no* traffic on the new
+                // version and advances in batches via `advance_rollout`.
+                // Treating it as an immediate cutover (as this arm used to)
+                // gave a caller who explicitly asked for a gradual rollout a
+                // 100% instant switch, recorded in the metadata as "Rolling".
+                self.canary_version = Some(version);
+                self.rolled_instances = 0;
+                self.total_instances = self.total_instances.max(DEFAULT_ROLLOUT_INSTANCES);
             }
         }
 
@@ -408,13 +455,17 @@ impl ModelRegistry {
     }
 
     /// Select a version for a given request (respects deployment strategy).
+    ///
+    /// Under [`DeploymentStrategy::Rolling`] the share of requests routed to
+    /// the new version equals the share of instances already migrated; see
+    /// [`Self::advance_rollout`].
     pub fn select_for_request(&self, request_id: u64) -> KizzasiResult<&ModelVersion> {
         if let Some(canary_version) = self.canary_version {
             if let Some(canary) = self.versions.get(&canary_version) {
                 if canary
                     .metadata
                     .deployment
-                    .should_use_new_version(request_id)
+                    .should_use_new_version_at(request_id, self.rolled_fraction())
                 {
                     return Ok(canary);
                 }
@@ -422,6 +473,65 @@ impl ModelRegistry {
         }
 
         self.get_active()
+    }
+
+    /// Fraction of instances already migrated by a rolling deployment.
+    pub fn rolled_fraction(&self) -> f64 {
+        if self.total_instances == 0 {
+            return 0.0;
+        }
+        self.rolled_instances as f64 / self.total_instances as f64
+    }
+
+    /// Set how many instances a rolling deployment has to migrate.
+    ///
+    /// Defaults to [`DEFAULT_ROLLOUT_INSTANCES`]; set it to the real fleet
+    /// size before deploying so each batch corresponds to real instances.
+    pub fn set_rollout_instances(&mut self, total_instances: usize) -> KizzasiResult<()> {
+        if total_instances == 0 {
+            return Err(KizzasiError::config("total_instances must be > 0"));
+        }
+        self.total_instances = total_instances;
+        self.rolled_instances = self.rolled_instances.min(total_instances);
+        Ok(())
+    }
+
+    /// Advance a rolling deployment by one batch.
+    ///
+    /// Returns the fraction of instances migrated so far. When every instance
+    /// has been migrated the new version becomes active and the rollout ends.
+    pub fn advance_rollout(&mut self) -> KizzasiResult<f64> {
+        let canary = self
+            .canary_version
+            .ok_or_else(|| KizzasiError::invalid_state("No rolling deployment in progress"))?;
+
+        let batch_size = match self.versions.get(&canary).map(|m| m.metadata.deployment) {
+            Some(DeploymentStrategy::Rolling { batch_size }) => batch_size,
+            _ => {
+                return Err(KizzasiError::invalid_state(
+                    "The pending deployment is not a Rolling deployment",
+                ))
+            }
+        };
+
+        if self.total_instances == 0 {
+            self.total_instances = DEFAULT_ROLLOUT_INSTANCES;
+        }
+
+        self.rolled_instances = self
+            .rolled_instances
+            .saturating_add(batch_size)
+            .min(self.total_instances);
+
+        if self.rolled_instances >= self.total_instances {
+            self.active_version = Some(canary);
+            self.canary_version = None;
+            self.rolled_instances = 0;
+            self.total_instances = 0;
+            return Ok(1.0);
+        }
+
+        Ok(self.rolled_fraction())
     }
 
     /// Remove a version from the registry.
@@ -464,6 +574,118 @@ pub struct RegistryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registry_with_two_versions() -> ModelRegistry {
+        let mut registry = ModelRegistry::new();
+        let config = KizzasiConfig::new()
+            .input_dim(2)
+            .output_dim(2)
+            .hidden_dim(16);
+        registry
+            .register(ModelVersion::new("1.0.0", config.clone(), "initial").unwrap())
+            .unwrap();
+        registry
+            .register(ModelVersion::new("2.0.0", config, "next").unwrap())
+            .unwrap();
+        registry
+            .deploy("1.0.0", DeploymentStrategy::Immediate)
+            .unwrap();
+        registry
+    }
+
+    #[test]
+    fn test_rolling_deployment_is_gradual_not_immediate() {
+        // Regression: the Rolling arm was `// Simplified: treat as immediate`
+        // and did a 100% instant cutover, while `should_use_new_version`
+        // returned false for Rolling so the router refused to route to it.
+        let mut registry = registry_with_two_versions();
+        registry.set_rollout_instances(10).unwrap();
+        registry
+            .deploy("2.0.0", DeploymentStrategy::Rolling { batch_size: 5 })
+            .unwrap();
+
+        // No instant cutover: 1.0.0 is still the active version.
+        assert_eq!(
+            registry.get_active().unwrap().version().to_string(),
+            "1.0.0"
+        );
+        assert_eq!(registry.rolled_fraction(), 0.0);
+
+        let new_version_share = |registry: &ModelRegistry| {
+            let hits = (0..2000)
+                .filter(|id| {
+                    registry
+                        .select_for_request(*id)
+                        .map(|m| m.version().to_string() == "2.0.0")
+                        .unwrap_or(false)
+                })
+                .count();
+            hits as f64 / 2000.0
+        };
+
+        assert_eq!(new_version_share(&registry), 0.0);
+
+        // First batch: half the fleet migrated, roughly half the traffic.
+        let fraction = registry.advance_rollout().unwrap();
+        assert!((fraction - 0.5).abs() < 1e-9);
+        let share = new_version_share(&registry);
+        assert!(
+            (0.4..0.6).contains(&share),
+            "rolling traffic share was {share}"
+        );
+
+        // Final batch completes the rollout.
+        let fraction = registry.advance_rollout().unwrap();
+        assert!((fraction - 1.0).abs() < 1e-9);
+        assert_eq!(
+            registry.get_active().unwrap().version().to_string(),
+            "2.0.0"
+        );
+        assert!(registry.get_canary().is_none());
+    }
+
+    #[test]
+    fn test_canary_percent_over_100_is_rejected() {
+        let mut registry = registry_with_two_versions();
+        assert!(registry
+            .deploy(
+                "2.0.0",
+                DeploymentStrategy::Canary {
+                    traffic_percent: 150
+                }
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_rolling_batch_size_zero_is_rejected() {
+        let mut registry = registry_with_two_versions();
+        assert!(registry
+            .deploy("2.0.0", DeploymentStrategy::Rolling { batch_size: 0 })
+            .is_err());
+    }
+
+    #[test]
+    fn test_canary_split_is_hashed_not_banded() {
+        // Sequential request ids used to map straight onto `id % 100`, so a
+        // 10% canary took ids 0..9 of every hundred - a deterministic band
+        // rather than a sample.
+        let strategy = DeploymentStrategy::Canary {
+            traffic_percent: 10,
+        };
+        let hits = (0..10_000)
+            .filter(|id| strategy.should_use_new_version(*id))
+            .count();
+        let share = hits as f64 / 10_000.0;
+        assert!((0.08..0.12).contains(&share), "canary share was {share}");
+
+        // The first hundred sequential ids must not all land in one arm.
+        let head: Vec<bool> = (0..100)
+            .map(|id| strategy.should_use_new_version(id))
+            .collect();
+        assert!(head.iter().any(|hit| *hit));
+        assert!(head.iter().any(|hit| !*hit));
+    }
 
     #[test]
     fn test_semantic_version() {

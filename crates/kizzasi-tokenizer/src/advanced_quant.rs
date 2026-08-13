@@ -176,26 +176,47 @@ impl DeadZoneQuantizer {
 
 impl Quantizer for DeadZoneQuantizer {
     fn quantize(&self, value: f32) -> i32 {
-        // Apply dead zone
+        // The dead-zone sentinel must be a code the ordinary path can never
+        // produce, otherwise `dequantize` cannot tell "genuinely zero" apart
+        // from "an ordinary value that happened to quantize to the same
+        // level". Reserve the top code (`levels - 1`) exclusively for the
+        // dead zone, and confine the ordinary linear path to the remaining
+        // `levels - 1` codes (`0..=levels-2`).
         if value.abs() < self.dead_zone {
-            return (self.levels / 2) as i32; // Zero point
+            return (self.levels - 1) as i32;
         }
 
-        // Quantize non-dead-zone values
         let clamped = value.clamp(self.min, self.max);
+        let ordinary_span = self.levels.saturating_sub(2);
+        if ordinary_span == 0 {
+            // Only one ordinary code available (degenerate 1-bit case): no
+            // room to encode position, so it collapses to code 0.
+            return 0;
+        }
         let normalized = (clamped - self.min) / (self.max - self.min);
-        (normalized * (self.levels - 1) as f32).round() as i32
+        (normalized * ordinary_span as f32)
+            .round()
+            .clamp(0.0, ordinary_span as f32) as i32
     }
 
     fn dequantize(&self, level: i32) -> f32 {
-        let clamped_level = level.clamp(0, (self.levels - 1) as i32);
+        let max_level = (self.levels - 1) as i32;
+        let clamped_level = level.clamp(0, max_level);
 
-        // Check if it's the zero point
-        if clamped_level == (self.levels / 2) as i32 {
+        // The dead-zone sentinel is always the top code; it never collides
+        // with an ordinary code because `quantize` never emits it.
+        if clamped_level == max_level {
             return 0.0;
         }
 
-        let normalized = clamped_level as f32 / (self.levels - 1) as f32;
+        let ordinary_span = self.levels.saturating_sub(2);
+        if ordinary_span == 0 {
+            // Degenerate 1-bit case: the single ordinary code carries no
+            // position information, so reconstruct the range midpoint.
+            return (self.min + self.max) / 2.0;
+        }
+
+        let normalized = clamped_level as f32 / ordinary_span as f32;
         self.min + normalized * (self.max - self.min)
     }
 
@@ -1108,6 +1129,43 @@ mod tests {
         // Large values should be preserved (approximately)
         assert!(decoded[1] > 0.3);
         assert!(decoded[3] > 0.6);
+    }
+
+    /// Regression: on an asymmetric range the dead-zone sentinel used to be
+    /// the ordinary mid-range code (`levels / 2`), which `dequantize` mapped
+    /// to exactly `0.0` even though `0.0` is outside `[min, max]` and thus
+    /// not a value the quantizer can legally represent. Every `quantize` ->
+    /// `dequantize` round trip must stay within `[min, max]`, and dead-zone
+    /// inputs must decode to the same `0.0` sentinel as before.
+    #[test]
+    fn test_dead_zone_asymmetric_range_stays_in_bounds() {
+        let quant = DeadZoneQuantizer::new(8, 0.1, 10.0, 100.0).unwrap();
+
+        // This value used to collide with the dead-zone sentinel level
+        // (levels/2 = 128) purely by construction of the ordinary formula,
+        // even though it is far outside the dead zone.
+        let level = quant.quantize(55.0);
+        let recovered = quant.dequantize(level);
+        assert!(
+            (10.0..=100.0).contains(&recovered),
+            "recovered value {recovered} escaped the quantizer's declared range [10, 100]"
+        );
+
+        // Sweep a range of values and confirm every round trip stays in bounds.
+        for i in 0..=200 {
+            let value = 10.0 + i as f32 * 0.45; // spans [10, 100]
+            let level = quant.quantize(value);
+            let recovered = quant.dequantize(level);
+            assert!(
+                (10.0..=100.0).contains(&recovered),
+                "value {value} -> level {level} -> {recovered} escaped [10, 100]"
+            );
+        }
+
+        // A genuine dead-zone value (|x| < 0.1) still decodes to the 0.0
+        // sentinel, even though 0.0 itself is outside [min, max].
+        let dead_zone_level = quant.quantize(0.05);
+        assert_eq!(quant.dequantize(dead_zone_level), 0.0);
     }
 
     #[test]

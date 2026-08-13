@@ -137,7 +137,8 @@ fn test_geometric_set_numerical_precision() {
     // Test box constraint with values near boundaries
     let lower = vec![0.0, 0.0];
     let upper = vec![1.0, 1.0];
-    let box_set = GeometricSet::box_constraint(lower.clone(), upper.clone());
+    let box_set =
+        GeometricSet::box_constraint(lower.clone(), upper.clone()).expect("valid box set");
 
     // Test values exactly on boundary
     assert!(box_set.contains(&[0.0, 0.5]));
@@ -160,7 +161,7 @@ fn test_ball_constraint_numerical_accuracy() {
     // Test ball constraint projection accuracy
     let center = vec![0.0, 0.0];
     let radius = 1.0;
-    let ball = GeometricSet::ball(center.clone(), radius);
+    let ball = GeometricSet::ball(center.clone(), radius).expect("valid ball set");
 
     // Test point outside the ball
     let x_far = vec![10.0, 10.0]; // Outside ball of radius 1

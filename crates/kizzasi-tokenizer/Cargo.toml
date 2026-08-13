@@ -16,13 +16,19 @@ homepage = "https://github.com/cool-japan/kizzasi"
 [features]
 default = ["std"]
 std = []
-# GPU features (optional)
-# Note: cuda feature only works on Linux/Windows, ignored on macOS
-cuda = ["kizzasi-core/cuda"]
+# GPU acceleration (optional, off by default). Forwards candle's Metal
+# backend through `kizzasi-core/metal`, which is live on Apple targets and
+# inert -- but still buildable -- everywhere else, so `--all-features` works on
+# every host; the `kizzasi-metal` crate explains how that target gating is
+# done. There is no `cuda` counterpart -- see kizzasi-core's `[features]` for
+# why a CUDA flag cannot be offered without breaking every non-CUDA build.
 metal = ["kizzasi-core/metal"]
 # Tokenizer features
 vqvae = []
-mulaw = []
+# NOTE: there is no `mulaw` feature. `mod mulaw` (MuLawCodec) is always
+# compiled in, unconditionally — a `mulaw = []` feature used to exist here
+# but gated nothing (every `mulaw.rs` symbol was reachable regardless of
+# whether it was enabled), which looked like an opt-in that didn't exist.
 parallel = ["dep:rayon"]
 # WebAssembly support (opt-in, exposes JS bindings via wasm-bindgen)
 wasm = ["dep:wasm-bindgen", "dep:js-sys"]
@@ -45,35 +51,28 @@ safetensors.workspace = true
 rayon = { workspace = true, optional = true }
 
 # WebAssembly bindings (optional, only meaningful for wasm32 target)
-wasm-bindgen = { version = "0.2.126", optional = true }
-js-sys = { version = "0.3.103", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
 kizzasi-inference = { path = "../kizzasi-inference" }
 
-# Platform-specific Candle dependencies
-# CUDA is only supported on Linux and Windows (not macOS), and never on wasm32
-[target.'cfg(all(any(target_os = "linux", target_os = "windows"), not(target_arch = "wasm32")))'.dependencies]
-candle-core = { version = "0.11.0", default-features = false, features = [] }
-candle-nn = { version = "0.11.0", default-features = false, features = [] }
-
-# macOS uses Metal (or CPU-only by default), never on wasm32
-[target.'cfg(all(target_os = "macos", not(target_arch = "wasm32")))'.dependencies]
-candle-core = { version = "0.11.0", default-features = false, features = [] }
-candle-nn = { version = "0.11.0", default-features = false, features = [] }
-
-# kizzasi-core is not wasm32-compatible (uses candle, std::fs, std::thread)
-# Include it only on native targets
+# candle and kizzasi-core are not wasm32-compatible (candle uses std::fs /
+# std::thread), so both are native-only. The `metal` feature above turns on
+# candle's Metal backend through kizzasi-core; no target-specific candle
+# entries are needed for that, and CUDA is not offered at all.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
 kizzasi-core.workspace = true
 
 # wasm32 requires special RNG backends — uuid needs the `js` feature for wasm32-unknown-unknown
 # getrandom needs `wasm_js` for rand_core. Cargo unifies these features at resolution time.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.4", features = ["wasm_js"] }
-uuid = { version = "1", features = ["v4", "serde", "js"] }
+getrandom.workspace = true
+uuid.workspace = true
 
 [[bench]]
 name = "tokenizer_benchmarks"

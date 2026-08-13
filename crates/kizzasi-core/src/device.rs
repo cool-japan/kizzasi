@@ -1,11 +1,40 @@
 //! Device selection and GPU acceleration utilities
 //!
-//! Provides automatic device detection (CUDA/Metal/CPU) and device management
-//! for efficient model training and inference on GPUs.
+//! Provides a device-selection API (Metal/CPU) and device management for
+//! efficient model training and inference.
+//!
+//! # GPU status
+//!
+//! - **CPU** — always available.
+//! - **Metal** — real, behind the off-by-default `metal` Cargo feature, which
+//!   forwards to candle's own Metal backend through the `kizzasi-metal` shim.
+//!   With `metal` enabled on an Apple machine, [`DeviceType::Metal`] creates a
+//!   live GPU device, [`is_metal_available`] reports `true` and
+//!   [`get_best_device`] returns it. Without the feature the
+//!   [`DeviceType::Metal`] variant does not exist, so there is no code path
+//!   that can silently pretend a GPU is present.
+//!
+//!   Enabling `metal` on a *non*-Apple target (which is what `--all-features`
+//!   does on Linux and Windows) is buildable but inert, because Cargo features
+//!   are not target-aware and candle's Metal backend does not compile off
+//!   Apple — see the `kizzasi-metal` crate docs. Inert means loud, not silent:
+//!   the [`DeviceType::Metal`] variant exists, but [`is_metal_available`]
+//!   returns `false`, [`get_best_device`] stays on CPU, and
+//!   [`DeviceConfig::create_device`] returns a [`CoreError::DeviceError`]
+//!   naming the target instead of handing back a CPU device in disguise.
+//! - **CUDA** — not offered. There is no `cuda` Cargo feature and no
+//!   `DeviceType::Cuda` variant: candle's CUDA backend requires an installed
+//!   NVIDIA toolkit at *build* time (its build scripts abort without one), and
+//!   Cargo cannot make a feature conditional on the host toolchain, so such a
+//!   flag would break `--all-features` builds everywhere else. See
+//!   `Cargo.toml` for the full rationale, including the target-scoped
+//!   dependency-alias workaround that Cargo's own `cargo metadata` rejects.
+//!   For portable GPU acceleration use the `kizzasi-webgpu` backend (the
+//!   `webgpu` feature of the `kizzasi` facade crate).
 //!
 //! # Features
 //!
-//! - **Auto-detection**: Automatically detects available CUDA/Metal devices
+//! - **Auto-detection**: Tries Metal (when compiled in), then falls back to CPU
 //! - **Fallback**: Gracefully falls back to CPU if GPU is unavailable
 //! - **Memory Management**: Utilities for efficient GPU memory usage
 //! - **Multi-GPU**: Support for selecting specific GPU devices
@@ -26,7 +55,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 use crate::error::CoreError;
 use crate::error::CoreResult;
 use candle_core::Device;
@@ -34,14 +63,15 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Device type for model execution
+///
+/// `Metal` only exists when the `metal` feature is enabled, so a build that
+/// cannot reach a GPU cannot even name one. There is no `Cuda` variant — see
+/// the module documentation for why CUDA is not offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceType {
     /// CPU execution (always available)
     Cpu,
-    /// NVIDIA CUDA GPU (requires cuda feature)
-    #[cfg(feature = "cuda")]
-    Cuda,
-    /// Apple Metal GPU
+    /// Apple Metal GPU (requires the `metal` feature, Apple platforms only)
     #[cfg(feature = "metal")]
     Metal,
 }
@@ -50,8 +80,6 @@ impl fmt::Display for DeviceType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DeviceType::Cpu => write!(f, "CPU"),
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda => write!(f, "CUDA"),
             #[cfg(feature = "metal")]
             DeviceType::Metal => write!(f, "Metal"),
         }
@@ -67,7 +95,8 @@ pub struct DeviceConfig {
     pub device_id: usize,
     /// Enable mixed precision (FP16)
     pub use_fp16: bool,
-    /// Enable TF32 for matmul (CUDA only)
+    /// Requested TF32 matmul. Recorded only -- see [`DeviceConfig::with_tf32`];
+    /// TF32 is a CUDA tensor-core setting and kizzasi ships no CUDA backend.
     pub use_tf32: bool,
 }
 
@@ -106,7 +135,11 @@ impl DeviceConfig {
         self
     }
 
-    /// Enable TF32 precision (CUDA only)
+    /// Enable TF32 precision
+    ///
+    /// Recorded for forward compatibility only: TF32 is a CUDA-tensor-core
+    /// setting and kizzasi ships no CUDA backend, so no backend reads this
+    /// flag today.
     pub fn with_tf32(mut self, enabled: bool) -> Self {
         self.use_tf32 = enabled;
         self
@@ -117,28 +150,8 @@ impl DeviceConfig {
         match self.device_type {
             DeviceType::Cpu => Ok(Device::Cpu),
 
-            #[cfg(feature = "cuda")]
-            DeviceType::Cuda => {
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
-                {
-                    Device::new_cuda(self.device_id).map_err(|e| {
-                        CoreError::DeviceError(format!(
-                            "Failed to create CUDA device {}: {}",
-                            self.device_id, e
-                        ))
-                    })
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-                {
-                    Err(CoreError::DeviceError(
-                        "CUDA is not supported on this platform (requires Linux or Windows)"
-                            .to_string(),
-                    ))
-                }
-            }
-
             #[cfg(feature = "metal")]
-            DeviceType::Metal => Device::new_metal(self.device_id).map_err(|e| {
+            DeviceType::Metal => kizzasi_metal::new_device(self.device_id).map_err(|e| {
                 CoreError::DeviceError(format!(
                     "Failed to create Metal device {}: {}",
                     self.device_id, e
@@ -148,23 +161,15 @@ impl DeviceConfig {
     }
 }
 
-/// Check if CUDA is available
-pub fn is_cuda_available() -> bool {
-    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-    {
-        Device::new_cuda(0).is_ok()
-    }
-    #[cfg(not(all(feature = "cuda", any(target_os = "linux", target_os = "windows"))))]
-    {
-        false
-    }
-}
-
 /// Check if Metal is available
+///
+/// `false` whenever no Metal device can be opened — including a build that
+/// enabled the `metal` feature on a non-Apple target, where the backend was
+/// never compiled in.
 pub fn is_metal_available() -> bool {
     #[cfg(feature = "metal")]
     {
-        Device::new_metal(0).is_ok()
+        kizzasi_metal::is_available()
     }
     #[cfg(not(feature = "metal"))]
     {
@@ -172,21 +177,16 @@ pub fn is_metal_available() -> bool {
     }
 }
 
-/// Get the best available device (CUDA > Metal > CPU)
+/// Get the best available device (Metal > CPU)
 pub fn get_best_device() -> Device {
-    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-    {
-        if let Ok(device) = Device::new_cuda(0) {
-            tracing::info!("Using CUDA device 0");
-            return device;
-        }
-    }
-
     #[cfg(feature = "metal")]
     {
-        if let Ok(device) = Device::new_metal(0) {
-            tracing::info!("Using Metal device 0");
-            return device;
+        match kizzasi_metal::new_device(0) {
+            Ok(device) => {
+                tracing::info!("Using Metal device 0");
+                return device;
+            }
+            Err(e) => tracing::debug!("Metal device 0 unavailable, falling back to CPU: {e}"),
         }
     }
 
@@ -194,31 +194,14 @@ pub fn get_best_device() -> Device {
     Device::Cpu
 }
 
-/// Get available CUDA devices
-#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-pub fn get_cuda_devices() -> Vec<usize> {
-    let mut devices = Vec::new();
-    for id in 0..16 {
-        // Check up to 16 devices
-        if Device::new_cuda(id).is_ok() {
-            devices.push(id);
-        } else {
-            break;
-        }
-    }
-    devices
-}
-
 /// Get available Metal devices
+///
+/// Only device 0 is probed: candle's Metal backend indexes an internal `Vec`
+/// without bounds-checking on some paths, so walking ordinals upward can panic
+/// rather than return an error on multi-GPU Macs.
 #[cfg(feature = "metal")]
 pub fn get_metal_devices() -> Vec<usize> {
-    let mut devices = Vec::new();
-    // Only check device 0 to avoid candle-core Metal backend panics with multiple devices
-    // See: https://github.com/huggingface/candle/issues (Metal backend has Vec index issues)
-    if Device::new_metal(0).is_ok() {
-        devices.push(0);
-    }
-    devices
+    kizzasi_metal::device_ordinals()
 }
 
 /// Device information
@@ -263,20 +246,6 @@ pub fn get_device_info(device: &Device) -> DeviceInfo {
             available_memory: None,
         },
 
-        #[cfg(feature = "cuda")]
-        Device::Cuda(_cuda_device) => {
-            // Note: CudaDevice no longer has ordinal() method in candle-core 0.9.1
-            // Using 0 as default device ID. For actual device ID, would need to track
-            // it separately or use CUDA runtime API directly.
-            DeviceInfo {
-                device_type: DeviceType::Cuda,
-                device_id: 0,
-                name: None,             // Could query via CUDA API
-                total_memory: None,     // Could query via CUDA API
-                available_memory: None, // Could query via CUDA API
-            }
-        }
-
         #[cfg(feature = "metal")]
         Device::Metal(_metal_device) => {
             DeviceInfo {
@@ -288,8 +257,11 @@ pub fn get_device_info(device: &Device) -> DeviceInfo {
             }
         }
 
-        // Catch-all for unhandled device variants (e.g., Metal when only cuda feature is enabled)
-        // This is needed because candle_core::Device always has all variants regardless of features
+        // Catch-all for candle device variants this build cannot describe:
+        // `candle_core::Device` always carries every variant regardless of the
+        // backend features compiled in, so a `Device::Metal` handed to a build
+        // without the `metal` feature lands here rather than being reported as
+        // a device type that does not exist in this build's `DeviceType`.
         #[allow(unreachable_patterns)]
         _ => DeviceInfo {
             device_type: DeviceType::Cpu,
@@ -312,19 +284,10 @@ pub fn list_devices() -> Vec<DeviceInfo> {
         available_memory: None,
     }];
 
-    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-    {
-        for id in get_cuda_devices() {
-            if let Ok(device) = Device::new_cuda(id) {
-                result.push(get_device_info(&device));
-            }
-        }
-    }
-
     #[cfg(feature = "metal")]
     {
         for id in get_metal_devices() {
-            if let Ok(device) = Device::new_metal(id) {
+            if let Ok(device) = kizzasi_metal::new_device(id) {
                 result.push(get_device_info(&device));
             }
         }
@@ -369,7 +332,7 @@ mod tests {
     fn test_get_best_device() {
         let device = get_best_device();
         // Should always succeed - just check that we got a valid device
-        // (Could be CPU, CUDA, or Metal depending on features/hardware)
+        // (CPU, or Metal when the `metal` feature is on and a GPU is present)
         let _ = device; // Valid device was created
     }
 
@@ -396,17 +359,36 @@ mod tests {
         assert!(display.contains("16 GB"));
     }
 
-    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-    #[test]
-    fn test_cuda_available() {
-        // Just test that the function doesn't panic
-        let _ = is_cuda_available();
-    }
-
     #[cfg(feature = "metal")]
     #[test]
     fn test_metal_available() {
         // Just test that the function doesn't panic
         let _ = is_metal_available();
+    }
+
+    /// The `metal` feature can be enabled on a target that cannot compile
+    /// candle's Metal backend (`--all-features` on Linux/Windows does exactly
+    /// that). Such a build must fail loudly rather than quietly hand back a
+    /// CPU device labelled `Metal`.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_without_backend_fails_loudly() {
+        if kizzasi_metal::BACKEND_COMPILED {
+            return;
+        }
+
+        assert!(!is_metal_available());
+        assert!(get_metal_devices().is_empty());
+        assert!(matches!(get_best_device(), Device::Cpu));
+
+        let err = DeviceConfig::new()
+            .with_device_type(DeviceType::Metal)
+            .create_device()
+            .expect_err("a build without the Metal backend must not create a Metal device");
+        assert!(matches!(err, CoreError::DeviceError(_)));
+        assert!(
+            err.to_string().contains("Apple"),
+            "the error must name the cause, got: {err}"
+        );
     }
 }

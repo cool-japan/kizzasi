@@ -5,7 +5,7 @@
 
 use crate::error::{TokenizerError, TokenizerResult};
 use crate::SignalTokenizer;
-use scirs2_core::ndarray::{Array1, Array2};
+use scirs2_core::ndarray::{s, Array1, Array2};
 
 /// Trait for batch tokenization operations
 pub trait BatchTokenizer: SignalTokenizer {
@@ -13,11 +13,30 @@ pub trait BatchTokenizer: SignalTokenizer {
     ///
     /// Input: batch of signals [batch_size, signal_length]
     /// Output: batch of encodings [batch_size, embed_dim]
+    ///
+    /// Dispatches internally to the `rayon`-backed parallel path when the
+    /// `parallel` feature is enabled (see
+    /// [`BatchTokenizer::encode_batch_parallel`], still callable directly
+    /// too), so callers get the speedup without needing to know about a
+    /// separate method name.
+    #[cfg(feature = "parallel")]
+    fn encode_batch(&self, signals: &Array2<f32>) -> TokenizerResult<Array2<f32>>
+    where
+        Self: Sync,
+    {
+        self.encode_batch_parallel(signals)
+    }
+
+    /// Encode multiple signals in batch (see the `feature = "parallel"`
+    /// version's docs above).
+    #[cfg(not(feature = "parallel"))]
     fn encode_batch(&self, signals: &Array2<f32>) -> TokenizerResult<Array2<f32>> {
         let batch_size = signals.shape()[0];
         let mut results = Vec::with_capacity(batch_size);
 
         for i in 0..batch_size {
+            // `SignalTokenizer::encode` takes `&Array1<f32>`, so a row view
+            // still needs to be materialized into an owned array here.
             let signal = signals.row(i).to_owned();
             let encoded = self.encode(&signal)?;
             results.push(encoded);
@@ -31,6 +50,21 @@ pub trait BatchTokenizer: SignalTokenizer {
     ///
     /// Input: batch of tokens [batch_size, embed_dim]
     /// Output: batch of signals [batch_size, signal_length]
+    ///
+    /// Dispatches internally to the `rayon`-backed parallel path when the
+    /// `parallel` feature is enabled (see
+    /// [`BatchTokenizer::decode_batch_parallel`]).
+    #[cfg(feature = "parallel")]
+    fn decode_batch(&self, tokens: &Array2<f32>) -> TokenizerResult<Array2<f32>>
+    where
+        Self: Sync,
+    {
+        self.decode_batch_parallel(tokens)
+    }
+
+    /// Decode multiple token sequences in batch (see the `feature =
+    /// "parallel"` version's docs above).
+    #[cfg(not(feature = "parallel"))]
     fn decode_batch(&self, tokens: &Array2<f32>) -> TokenizerResult<Array2<f32>> {
         let batch_size = tokens.shape()[0];
         let mut results = Vec::with_capacity(batch_size);
@@ -67,9 +101,9 @@ pub trait BatchTokenizer: SignalTokenizer {
             // Pad or truncate to target length
             let mut padded = Array1::zeros(target_len);
             let copy_len = signal.len().min(target_len);
-            for i in 0..copy_len {
-                padded[i] = signal[i];
-            }
+            padded
+                .slice_mut(s![..copy_len])
+                .assign(&signal.slice(s![..copy_len]));
 
             let encoded = self.encode(&padded)?;
             results.push(encoded);
@@ -146,9 +180,7 @@ fn batch_from_vec(arrays: Vec<Array1<f32>>) -> TokenizerResult<Array2<f32>> {
 
     let mut batch = Array2::zeros((batch_size, elem_len));
     for (i, arr) in arrays.iter().enumerate() {
-        for (j, &val) in arr.iter().enumerate() {
-            batch[[i, j]] = val;
-        }
+        batch.row_mut(i).assign(arr);
     }
 
     Ok(batch)
@@ -310,6 +342,28 @@ mod tests {
 
         let encoded = tokenizer.encode_batch(&signals).unwrap();
         assert_eq!(encoded.shape(), &[3, 8]);
+    }
+
+    /// Regression: with the `parallel` feature enabled, the default
+    /// `encode_batch`/`decode_batch` must dispatch to the same rayon-backed
+    /// implementation as `encode_batch_parallel`/`decode_batch_parallel`
+    /// (previously two unrelated code paths — this crate's own default
+    /// `encode_batch` never parallelized no matter how the feature was
+    /// set), and must produce identical results either way.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_encode_decode_batch_matches_parallel_variant() {
+        let tokenizer = ContinuousTokenizer::new(4, 8);
+        let signals = Array2::from_shape_fn((5, 4), |(i, j)| (i * 4 + j) as f32 * 0.1);
+
+        let via_default = tokenizer.encode_batch(&signals).unwrap();
+        let via_parallel = tokenizer.encode_batch_parallel(&signals).unwrap();
+        assert_eq!(via_default, via_parallel);
+
+        let tokens = Array2::from_shape_fn((5, 8), |(i, j)| (i * 8 + j) as f32 * 0.1);
+        let decoded_default = tokenizer.decode_batch(&tokens).unwrap();
+        let decoded_parallel = tokenizer.decode_batch_parallel(&tokens).unwrap();
+        assert_eq!(decoded_default, decoded_parallel);
     }
 
     #[test]

@@ -36,7 +36,7 @@ fn main() {
 
     // Initialize from a starting point
     let x0 = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-    admm.initialize(&x0);
+    admm.initialize(&x0).expect("matching dimension");
 
     println!("   Configuration:");
     println!("   - Number of blocks: {}", num_blocks);
@@ -108,16 +108,18 @@ fn main() {
 
     // Initialize
     let x0_bcd = Array1::from_vec(vec![1.0; 10]);
-    bcd.initialize(&x0_bcd);
+    bcd.initialize(&x0_bcd).expect("matching dimension");
 
     println!("\n   Running block updates:");
     for iter in 0..3 {
         let mut total_change = 0.0;
         for block_id in 0..bcd.num_blocks() {
             // Simple block update: project to zeros (for demonstration)
-            let change = bcd.update_block(block_id, |_full_x, indices| {
-                Array1::from_vec(vec![0.0; indices.len()])
-            });
+            let change = bcd
+                .update_block(block_id, |_full_x, indices| {
+                    Array1::from_vec(vec![0.0; indices.len()])
+                })
+                .expect("block update returns one value per index");
             total_change += change;
         }
         println!("   Iter {}: total change = {:.4}", iter + 1, total_change);
@@ -143,7 +145,7 @@ fn main() {
 
     // Overlapping blocks
     println!("\n   Overlapping blocks (dim=12, size=5, overlap=2):");
-    let overlapping = block_utils::overlapping_blocks(12, 5, 2);
+    let overlapping = block_utils::overlapping_blocks(12, 5, 2).expect("valid overlap");
     println!("   Number of blocks: {}", overlapping.len());
     for (i, block) in overlapping.iter().enumerate() {
         println!("   - Block {}: {:?}", i, block.indices);
@@ -172,7 +174,9 @@ fn main() {
         // Dummy constraint violations for demonstration
         let violations =
             Array1::from_vec(vec![0.5 - (iter as f32) * 0.1, 0.3 - (iter as f32) * 0.05]);
-        dual_decomp.update_duals(&violations);
+        dual_decomp
+            .update_duals(&violations)
+            .expect("matching violation vector");
 
         println!(
             "   Iter {}: dual vars = {:?}",

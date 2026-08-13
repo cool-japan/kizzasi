@@ -214,6 +214,16 @@ impl FlashAttention {
         let mut row_max = Array2::<f32>::from_elem((seq_len_q, num_heads), f32::NEG_INFINITY);
         let mut row_sum = Array2::<f32>::zeros((seq_len_q, num_heads));
 
+        // Scratch buffer for the per-tile attention scores, sized to the
+        // largest possible tile (`tile_q` x `num_heads` x `tile_kv`) and
+        // reused across every (kv_tile, q_tile) pair instead of a fresh
+        // `Array3::zeros` allocation on each iteration. Every entry within
+        // the used prefix (`[0..q_tile_size, .., 0..kv_tile_size]`) is
+        // unconditionally overwritten by the score computation loop below
+        // before it is ever read, so leftover contents from a previous
+        // (possibly larger) tile never leak into the result.
+        let mut scores_buf = Array3::<f32>::zeros((tile_q, num_heads, tile_kv));
+
         // Process in tiles
         let num_tiles_kv = seq_len_kv.div_ceil(tile_kv);
 
@@ -237,8 +247,11 @@ impl FlashAttention {
                 // Extract Q tile
                 let q_tile = q.slice(s![q_start..q_end, .., ..]);
 
-                // Compute attention scores for this tile: S = Q @ K^T
-                let mut scores = Array3::zeros((q_tile_size, num_heads, kv_tile_size));
+                // Compute attention scores for this tile: S = Q @ K^T,
+                // written into the shared scratch buffer's used prefix
+                // instead of a fresh per-iteration allocation (see
+                // `scores_buf` above).
+                let mut scores = scores_buf.slice_mut(s![0..q_tile_size, .., 0..kv_tile_size]);
 
                 for h in 0..num_heads {
                     for i in 0..q_tile_size {
@@ -450,6 +463,66 @@ mod tests {
         let output = result.unwrap();
         assert_eq!(output.dim(), (batch_size, seq_len, d_model));
         assert!(output.iter().all(|&x| x.is_finite()));
+    }
+
+    /// The per-tile `scores` buffer is now a reused scratch buffer (see
+    /// `scores_buf` in `flash_attention_forward`) instead of a fresh
+    /// `Array3::zeros` allocated on every `(kv_tile, q_tile)` pair. Use tile
+    /// sizes that do NOT evenly divide `seq_len`, so a later iteration
+    /// reuses a smaller "used prefix" of a buffer a previous, larger tile
+    /// already wrote into -- and check the result still agrees with a
+    /// single-tile (tile size == seq_len) run of the identical kernel.
+    #[test]
+    fn test_flash_attention_ragged_tiles_reused_buffer_matches_oracle() {
+        let num_heads = 2usize;
+        let head_dim = 3usize;
+        let d_model = num_heads * head_dim; // 6
+        let seq_len = 7usize; // Does not divide evenly by the tile size below.
+        let batch_size = 1usize;
+
+        let q = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            ((i * 5 + d * 3) % 17) as f32 * 0.07 - 0.4
+        });
+        let k = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            ((i * 3 + d * 7) % 13) as f32 * 0.09 - 0.3
+        });
+        let v = Array3::from_shape_fn((batch_size, seq_len, d_model), |(_, i, d)| {
+            ((i * 2 + d) % 11) as f32 * 0.05
+        });
+
+        // tile_q = tile_kv = 3: with seq_len = 7, tiles are sized [3, 3, 1]
+        // along both axes, so the LAST tile pair reuses `scores_buf` with a
+        // much smaller used prefix than the FIRST tile pair filled it with.
+        let config = FlashAttentionConfig::new(num_heads, head_dim).with_tile_sizes(3, 3);
+        let flash_attn = FlashAttention::new(config).unwrap();
+        let output = flash_attn.forward(&q, &k, &v).unwrap();
+        assert_eq!(output.dim(), (batch_size, seq_len, d_model));
+
+        // Oracle: identical kernel, but with tile sizes >= seq_len so every
+        // tile pair is the whole sequence (no cross-iteration buffer reuse
+        // with a shrinking prefix). Flash-Attention's tiling is exact, so
+        // both configurations must produce the same numbers.
+        let oracle_config =
+            FlashAttentionConfig::new(num_heads, head_dim).with_tile_sizes(seq_len, seq_len);
+        let oracle_attn = FlashAttention::new(oracle_config).unwrap();
+        let oracle = oracle_attn.forward(&q, &k, &v).unwrap();
+
+        for i in 0..seq_len {
+            for d in 0..d_model {
+                let got = output[[0, i, d]];
+                let expected = oracle[[0, i, d]];
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "ragged tiling (reused buffer) vs single-tile oracle: row {} col {}: \
+                     tiled={} oracle={} diff={}",
+                    i,
+                    d,
+                    got,
+                    expected,
+                    (got - expected).abs()
+                );
+            }
+        }
     }
 
     #[test]

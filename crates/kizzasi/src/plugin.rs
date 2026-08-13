@@ -10,16 +10,32 @@ use std::any::Any;
 use std::fmt;
 
 /// Plugin execution phase
+///
+/// A plugin declares which phases it participates in via
+/// [`Plugin::phases`]; [`PluginManager`] skips it entirely for the others, so
+/// a metrics plugin that only cares about errors costs nothing on the hot
+/// path. The default is [`PluginPhase::ALL`], which preserves the historical
+/// behaviour for plugins that do not override it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginPhase {
-    /// Before prediction (preprocessing)
+    /// Before prediction (preprocessing), including `transform_input`
     PreProcess,
-    /// After prediction (postprocessing)
+    /// After prediction (postprocessing), including `transform_output`
     PostProcess,
     /// On prediction error
     OnError,
     /// On state reset
     OnReset,
+}
+
+impl PluginPhase {
+    /// Every phase, in pipeline order.
+    pub const ALL: &'static [PluginPhase] = &[
+        PluginPhase::PreProcess,
+        PluginPhase::PostProcess,
+        PluginPhase::OnError,
+        PluginPhase::OnReset,
+    ];
 }
 
 /// Context provided to plugins during execution
@@ -94,6 +110,15 @@ pub trait Plugin: Send {
     /// Check if plugin is enabled
     fn is_enabled(&self) -> bool {
         true
+    }
+
+    /// Phases this plugin participates in.
+    ///
+    /// [`PluginManager`] only invokes the hooks for the phases listed here.
+    /// The default covers every phase, so overriding this is purely an
+    /// optimisation for plugins that hook a single stage.
+    fn phases(&self) -> &[PluginPhase] {
+        PluginPhase::ALL
     }
 
     /// Called before prediction (preprocessing)
@@ -197,7 +222,7 @@ impl PluginManager {
     ) -> KizzasiResult<()> {
         let ctx = PluginContext::new(self.step_counter, input_dim, output_dim);
         for plugin in &mut self.plugins {
-            if plugin.is_enabled() {
+            if plugin.is_enabled() && plugin.phases().contains(&PluginPhase::PreProcess) {
                 plugin.on_pre_process(input, &ctx)?;
             }
         }
@@ -213,7 +238,7 @@ impl PluginManager {
     ) -> KizzasiResult<Array1<f32>> {
         let ctx = PluginContext::new(self.step_counter, input_dim, output_dim);
         for plugin in &mut self.plugins {
-            if plugin.is_enabled() {
+            if plugin.is_enabled() && plugin.phases().contains(&PluginPhase::PreProcess) {
                 input = plugin.transform_input(input, &ctx)?;
             }
         }
@@ -230,7 +255,7 @@ impl PluginManager {
     ) -> KizzasiResult<()> {
         let ctx = PluginContext::new(self.step_counter, input_dim, output_dim);
         for plugin in &mut self.plugins {
-            if plugin.is_enabled() {
+            if plugin.is_enabled() && plugin.phases().contains(&PluginPhase::PostProcess) {
                 plugin.on_post_process(input, output, &ctx)?;
             }
         }
@@ -247,7 +272,7 @@ impl PluginManager {
     ) -> KizzasiResult<Array1<f32>> {
         let ctx = PluginContext::new(self.step_counter, input_dim, output_dim);
         for plugin in &mut self.plugins {
-            if plugin.is_enabled() {
+            if plugin.is_enabled() && plugin.phases().contains(&PluginPhase::PostProcess) {
                 output = plugin.transform_output(output, &ctx)?;
             }
         }
@@ -263,7 +288,7 @@ impl PluginManager {
     ) -> KizzasiResult<()> {
         let ctx = PluginContext::new(self.step_counter, input_dim, output_dim);
         for plugin in &mut self.plugins {
-            if plugin.is_enabled() {
+            if plugin.is_enabled() && plugin.phases().contains(&PluginPhase::OnError) {
                 plugin.on_error(error, &ctx)?;
             }
         }
@@ -274,7 +299,7 @@ impl PluginManager {
     pub fn execute_on_reset(&mut self, input_dim: usize, output_dim: usize) -> KizzasiResult<()> {
         let ctx = PluginContext::new(0, input_dim, output_dim);
         for plugin in &mut self.plugins {
-            if plugin.is_enabled() {
+            if plugin.is_enabled() && plugin.phases().contains(&PluginPhase::OnReset) {
                 plugin.on_reset(&ctx)?;
             }
         }
@@ -464,6 +489,88 @@ impl Plugin for StatsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plugin that records every hook it observes.
+    struct RecordingPlugin {
+        name: String,
+        phases: Vec<PluginPhase>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl Plugin for RecordingPlugin {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn phases(&self) -> &[PluginPhase] {
+            &self.phases
+        }
+
+        fn on_pre_process(
+            &mut self,
+            _input: &Array1<f32>,
+            _ctx: &PluginContext,
+        ) -> KizzasiResult<()> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("pre");
+            Ok(())
+        }
+
+        fn on_post_process(
+            &mut self,
+            _input: &Array1<f32>,
+            _output: &Array1<f32>,
+            _ctx: &PluginContext,
+        ) -> KizzasiResult<()> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("post");
+            Ok(())
+        }
+
+        fn on_error(&mut self, _error: &KizzasiError, _ctx: &PluginContext) -> KizzasiResult<()> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("error");
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_phases_gate_hook_dispatch() {
+        // Regression: PluginPhase was publicly exported but no function in the
+        // crate accepted or returned it, so it documented a dispatch mechanism
+        // that did not exist.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut manager = PluginManager::new();
+        manager.add_plugin(Box::new(RecordingPlugin {
+            name: "errors_only".to_string(),
+            phases: vec![PluginPhase::OnError],
+            seen: seen.clone(),
+        }));
+
+        let input = Array1::from_vec(vec![0.1, 0.2]);
+        manager.execute_pre_process(&input, 2, 2).unwrap();
+        manager.execute_post_process(&input, &input, 2, 2).unwrap();
+        manager
+            .execute_on_error(&KizzasiError::inference("boom"), 2, 2)
+            .unwrap();
+
+        let observed = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(observed, vec!["error"]);
+    }
 
     #[test]
     fn test_plugin_manager_creation() {

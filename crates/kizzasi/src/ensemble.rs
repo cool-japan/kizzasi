@@ -1,10 +1,13 @@
 //! Multi-model ensemble predictions with voting strategies
 //!
 //! This module provides sophisticated ensemble prediction capabilities:
-//! - Multiple models running in parallel
+//! - Multiple models combined per prediction. They are evaluated
+//!   sequentially: each member is a stateful `Kizzasi` requiring `&mut self`,
+//!   so a step cannot be shared across threads without cloning the models
 //! - Weighted voting and averaging
 //! - Confidence-based model selection
-//! - Dynamic model weighting based on performance
+//! - Dynamic model weighting based on performance (see
+//!   `EnsemblePredictor::record_outcome`)
 //! - Fallback and redundancy strategies
 //!
 //! # Example
@@ -95,6 +98,12 @@ pub struct EnsemblePredictor {
     enable_dynamic_weighting: bool,
     /// Running sum of per-prediction inter-model variance (for stats)
     variance_sum: f64,
+    /// Monotonic id counter. Using `models.len()` meant remove-then-add
+    /// produced a duplicate id, collapsing two models into one `stats()` entry.
+    next_model_id: usize,
+    /// Per-model predictions from the most recent `predict` call, kept so
+    /// `record_outcome` can score them against the observed value.
+    last_predictions: Vec<Array1<f32>>,
 }
 
 impl EnsemblePredictor {
@@ -106,6 +115,8 @@ impl EnsemblePredictor {
             total_predictions: 0,
             enable_dynamic_weighting: false,
             variance_sum: 0.0,
+            next_model_id: 0,
+            last_predictions: Vec::new(),
         }
     }
 
@@ -124,15 +135,27 @@ impl EnsemblePredictor {
         Self::new(VotingStrategy::Median)
     }
 
-    /// Enable dynamic weight adjustment based on performance
+    /// Enable dynamic weight adjustment based on observed performance
+    ///
+    /// With this set, [`Self::record_outcome`] rescales each model's weight
+    /// from an exponential moving average of its recent accuracy, so models
+    /// that track the observed signal better get more influence. Without it,
+    /// `record_outcome` still updates the reported confidences but leaves the
+    /// weights exactly as configured.
     pub fn enable_dynamic_weighting(mut self) -> Self {
         self.enable_dynamic_weighting = true;
         self
     }
 
+    /// Whether dynamic weighting is enabled
+    pub fn dynamic_weighting_enabled(&self) -> bool {
+        self.enable_dynamic_weighting
+    }
+
     /// Add a model to the ensemble
     pub fn add_model(&mut self, predictor: Kizzasi, weight: f64) -> KizzasiResult<()> {
-        self.add_model_with_id(predictor, weight, format!("model_{}", self.models.len()))
+        let model_id = format!("model_{}", self.next_model_id);
+        self.add_model_with_id(predictor, weight, model_id)
     }
 
     /// Add a model with a specific ID
@@ -174,6 +197,7 @@ impl EnsemblePredictor {
             selection_count: 0,
             avg_confidence: 1.0,
         });
+        self.next_model_id += 1;
 
         Ok(())
     }
@@ -246,11 +270,11 @@ impl EnsemblePredictor {
                 self.models[max_idx].selection_count += 1;
                 predictions[max_idx].clone()
             }
-            VotingStrategy::MajorityVote => {
-                // For continuous outputs, use weighted average as approximation
-                self.weighted_average(&predictions, &weights)
-            }
+            VotingStrategy::MajorityVote => self.majority_vote(&predictions, &weights),
         };
+
+        // Keep the per-model predictions so `record_outcome` can score them.
+        self.last_predictions = predictions.clone();
 
         // Track inter-model variance: mean squared distance from the mean
         // prediction vector across all models.  For each prediction step we
@@ -343,6 +367,71 @@ impl EnsemblePredictor {
         Ok(())
     }
 
+    /// Feed the observed value back into the ensemble.
+    ///
+    /// Scores each model's most recent prediction against `actual`, folds the
+    /// score into that model's `avg_confidence` with an exponential moving
+    /// average, and — when [`Self::enable_dynamic_weighting`] was set —
+    /// rescales its weight to match. `ConfidenceBased` voting only differs
+    /// from `Weighted` once this has been called at least once, because
+    /// confidences start out uniform.
+    ///
+    /// Returns an error if no prediction has been made yet, or if `actual`
+    /// does not match the ensemble's output dimension.
+    pub fn record_outcome(&mut self, actual: &Array1<f32>) -> KizzasiResult<()> {
+        if self.last_predictions.is_empty() {
+            return Err(KizzasiError::InvalidState {
+                reason: "record_outcome called before any prediction".to_string(),
+                recovery: Some("Call predict() first".to_string()),
+            });
+        }
+        if self.last_predictions.len() != self.models.len() {
+            return Err(KizzasiError::InvalidState {
+                reason: "the ensemble changed since the last prediction".to_string(),
+                recovery: Some("Call predict() again before record_outcome()".to_string()),
+            });
+        }
+
+        // Exponential moving average factor for the confidence update.
+        const EMA_ALPHA: f64 = 0.2;
+
+        for (model, prediction) in self.models.iter_mut().zip(self.last_predictions.iter()) {
+            if prediction.len() != actual.len() {
+                return Err(KizzasiError::DimensionMismatch {
+                    expected: prediction.len(),
+                    actual: actual.len(),
+                    context: "observed value must match the ensemble output dimension".to_string(),
+                });
+            }
+
+            let sq_error: f64 = prediction
+                .iter()
+                .zip(actual.iter())
+                .map(|(p, a)| ((*p - *a) as f64).powi(2))
+                .sum::<f64>()
+                / prediction.len().max(1) as f64;
+
+            // Map error onto (0, 1]: perfect prediction scores 1.
+            let score = 1.0 / (1.0 + sq_error);
+            model.avg_confidence = (1.0 - EMA_ALPHA) * model.avg_confidence + EMA_ALPHA * score;
+        }
+
+        if self.enable_dynamic_weighting {
+            let total: f64 = self.models.iter().map(|m| m.avg_confidence).sum();
+            if total > 0.0 {
+                let count = self.models.len() as f64;
+                for model in &mut self.models {
+                    // Keep the weight sum equal to the model count so the
+                    // absolute scale stays comparable to the initial 1.0-each
+                    // convention.
+                    model.weight = model.avg_confidence / total * count;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get the number of models in the ensemble
     pub fn num_models(&self) -> usize {
         self.models.len()
@@ -387,6 +476,58 @@ impl EnsemblePredictor {
         result
     }
 
+    /// Per-dimension weighted mode over discretised predictions.
+    ///
+    /// Real majority voting, not the weighted average this arm used to
+    /// delegate to: each model's value is binned, the bin with the largest
+    /// total weight wins, and the winning bin's weighted mean is emitted so
+    /// the output stays on the models' own scale.
+    fn majority_vote(&self, predictions: &[Array1<f32>], weights: &[f64]) -> Array1<f32> {
+        const BIN_WIDTH: f32 = 0.05;
+
+        let dim = predictions.first().map(|p| p.len()).unwrap_or(0);
+        let mut result = Array1::zeros(dim);
+
+        for i in 0..dim {
+            // bin index -> (total weight, weighted value sum)
+            let mut buckets: HashMap<i64, (f64, f64)> = HashMap::new();
+            for (prediction, &weight) in predictions.iter().zip(weights.iter()) {
+                let Some(&value) = prediction.get(i) else {
+                    continue;
+                };
+                let bin = (value / BIN_WIDTH).round() as i64;
+                let effective = if weight > 0.0 { weight } else { 1.0 };
+                let entry = buckets.entry(bin).or_insert((0.0, 0.0));
+                entry.0 += effective;
+                entry.1 += effective * value as f64;
+            }
+
+            let winner = buckets
+                .iter()
+                // Ties break on the lower bin index so the result is
+                // deterministic across runs.
+                .max_by(|(bin_a, (weight_a, _)), (bin_b, (weight_b, _))| {
+                    weight_a
+                        .partial_cmp(weight_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(bin_b.cmp(bin_a))
+                })
+                .map(|(_, (total_weight, value_sum))| {
+                    if *total_weight > 0.0 {
+                        (value_sum / total_weight) as f32
+                    } else {
+                        0.0
+                    }
+                });
+
+            if let Some(value) = winner {
+                result[i] = value;
+            }
+        }
+
+        result
+    }
+
     fn median_predictions(&self, predictions: &[Array1<f32>]) -> Array1<f32> {
         let dim = predictions[0].len();
         let mut result = Array1::zeros(dim);
@@ -411,6 +552,99 @@ impl EnsemblePredictor {
 mod tests {
     use super::*;
     use crate::predictor::KizzasiBuilder;
+
+    fn two_model_ensemble(strategy: VotingStrategy) -> EnsemblePredictor {
+        let mut ensemble = EnsemblePredictor::new(strategy);
+        for _ in 0..2 {
+            let model = KizzasiBuilder::lightweight_preset(2, 2).build().unwrap();
+            ensemble.add_model(model, 1.0).unwrap();
+        }
+        ensemble
+    }
+
+    #[test]
+    fn test_record_outcome_updates_confidence_and_weights() {
+        // Regression: `enable_dynamic_weighting` was stored and never read,
+        // and `avg_confidence` stayed at its 1.0 initial value forever, which
+        // made ConfidenceBased byte-identical to Weighted.
+        let mut ensemble =
+            two_model_ensemble(VotingStrategy::ConfidenceBased).enable_dynamic_weighting();
+        assert!(ensemble.dynamic_weighting_enabled());
+
+        let input = Array1::from_vec(vec![0.4, -0.2]);
+        let prediction = ensemble.predict(&input).unwrap();
+        ensemble.record_outcome(&prediction).unwrap();
+
+        let stats = ensemble.stats();
+        let confidences: Vec<f64> = stats
+            .model_stats
+            .values()
+            .map(|m| m.avg_confidence)
+            .collect();
+        assert_eq!(confidences.len(), 2);
+        assert!(
+            confidences.iter().any(|c| (*c - 1.0).abs() > 1e-9),
+            "confidence must move once an outcome is recorded"
+        );
+
+        // Weights track the confidences when dynamic weighting is on.
+        let weights: Vec<f64> = stats.model_stats.values().map(|m| m.weight).collect();
+        assert!(weights.iter().any(|w| (*w - 1.0).abs() > 1e-9));
+    }
+
+    #[test]
+    fn test_record_outcome_without_dynamic_weighting_keeps_weights() {
+        let mut ensemble = two_model_ensemble(VotingStrategy::WeightedAverage);
+        let input = Array1::from_vec(vec![0.4, -0.2]);
+        let prediction = ensemble.predict(&input).unwrap();
+        ensemble.record_outcome(&prediction).unwrap();
+
+        for model in ensemble.stats().model_stats.values() {
+            assert!((model.weight - 1.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_record_outcome_before_predict_is_an_error() {
+        let mut ensemble = two_model_ensemble(VotingStrategy::Average);
+        assert!(ensemble
+            .record_outcome(&Array1::from_vec(vec![0.0, 0.0]))
+            .is_err());
+    }
+
+    #[test]
+    fn test_majority_vote_is_a_mode_not_an_average() {
+        // Two models agree on ~1.0 and one is an outlier at 5.0: a weighted
+        // average lands near 2.33, a majority vote stays with the agreeing
+        // pair. The arm used to delegate straight to `weighted_average`.
+        let ensemble = EnsemblePredictor::new(VotingStrategy::MajorityVote);
+        let predictions = vec![
+            Array1::from_vec(vec![1.0]),
+            Array1::from_vec(vec![1.01]),
+            Array1::from_vec(vec![5.0]),
+        ];
+        let weights = vec![1.0, 1.0, 1.0];
+
+        let voted = ensemble.majority_vote(&predictions, &weights);
+        assert!(
+            (voted[0] - 1.005).abs() < 0.05,
+            "majority vote returned {}",
+            voted[0]
+        );
+    }
+
+    #[test]
+    fn test_model_ids_are_unique_after_remove_and_add() {
+        // Regression: ids came from `models.len()`, so remove-then-add
+        // produced a duplicate that collapsed two entries in `stats()`.
+        let mut ensemble = two_model_ensemble(VotingStrategy::Average);
+        ensemble.remove_model("model_0").unwrap();
+        let extra = KizzasiBuilder::lightweight_preset(2, 2).build().unwrap();
+        ensemble.add_model(extra, 1.0).unwrap();
+
+        assert_eq!(ensemble.num_models(), 2);
+        assert_eq!(ensemble.stats().model_stats.len(), 2);
+    }
 
     #[test]
     fn test_ensemble_creation() {

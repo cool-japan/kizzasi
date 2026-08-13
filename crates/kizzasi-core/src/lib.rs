@@ -10,13 +10,23 @@
 //! This crate follows the KIZZASI_POLICY.md and uses `scirs2-core` for all
 //! array and numerical operations.
 
-#![cfg_attr(not(feature = "std"), no_std)]
-
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+// NOTE on `no_std`: this crate previously declared
+// `#![cfg_attr(not(feature = "std"), no_std)]` here, advertised as "Core SSM
+// works without the standard library" in the README. That claim did not
+// hold: `candle-core`, `candle-nn`, `safetensors`, `serde_json` and `chrono`
+// are unconditional (non-optional) std-only dependencies in Cargo.toml, and
+// dozens of modules (simd.rs, parallel.rs, pool.rs, profiling.rs, metrics.rs,
+// weights.rs, gpu_utils.rs, dataloader.rs, training_loop.rs, ...) use `std::`
+// directly with no `#[cfg]` guard, so `cargo build --no-default-features`
+// never actually linked. Making the claim true would mean feature-gating
+// those std dependencies (removing weight loading, PyTorch checkpoint
+// conversion, and most of the training stack behind `std`) and auditing
+// every module for std usage -- out of proportion for this pass, and the
+// crate is squarely std-oriented in practice. The `std` feature is kept
+// (default-on) as an inert compatibility flag since downstream `Cargo.toml`s
+// may already reference it; genuine `no_std` embedded support lives in the
+// self-contained `embedded_alloc` and `fixed_point` modules, which do not
+// depend on the rest of the crate and can be used standalone.
 
 pub mod attention;
 mod config;
@@ -38,6 +48,7 @@ pub mod metrics;
 pub mod nn;
 pub mod numerics;
 pub mod optimizations;
+pub mod optimizer;
 pub mod parallel;
 pub mod pool;
 pub mod profiling;
@@ -63,6 +74,7 @@ mod ssm;
 pub mod ssm_backend;
 mod state;
 pub mod training;
+pub mod training_checkpoint;
 pub mod training_core;
 pub mod training_loop;
 pub mod weights;
@@ -74,8 +86,7 @@ pub use dataloader::{
     BatchIterator, DataLoaderConfig, TimeSeriesAugmentation, TimeSeriesDataLoader,
 };
 pub use device::{
-    get_best_device, is_cuda_available, is_metal_available, list_devices, DeviceConfig, DeviceInfo,
-    DeviceType,
+    get_best_device, is_metal_available, list_devices, DeviceConfig, DeviceInfo, DeviceType,
 };
 pub use efficient_attention::{
     EfficientAttentionConfig, EfficientMultiHeadAttention, FusedAttentionKernel,
@@ -102,6 +113,7 @@ pub use optimizations::{
     acquire_workspace, ilp, prefetch, release_workspace, CacheAligned, DiscretizationCache,
     SSMWorkspace, WorkspaceGuard,
 };
+pub use optimizer::KizzasiAdamW;
 pub use parallel::{BatchProcessor, ParallelConfig};
 pub use pool::{ArrayPool, MultiArrayPool, PoolStats, PooledArray};
 pub use profiling::{

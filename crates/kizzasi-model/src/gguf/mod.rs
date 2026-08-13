@@ -15,7 +15,11 @@
 //! # Quantization Types
 //!
 //! Supports F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q6_K, Q2_K, Q3_K, Q4_K,
-//! Q5_K, and Q8_K dequantization. IQ* types return an unsupported error.
+//! Q5_K, and Q8_K dequantization, byte-exact with `ggml`'s block layouts and
+//! element order. `Q8_1` and the IQ* family are parsed and named but return an
+//! unsupported error from `dequant::dequantize`; use
+//! [`GgufQuantType::is_dequantizable`], [`GgufTensorInfo::is_supported`] or
+//! [`GgufInspection::is_fully_supported`] to see that gap before a load.
 //!
 //! # Submodules
 //!
@@ -216,6 +220,36 @@ impl GgufQuantType {
             Self::BF16 => "BF16",
         }
     }
+
+    /// Whether this crate can dequantize tensors stored in this type.
+    ///
+    /// GGUF files may legitimately contain quantization types this crate does
+    /// not decode — currently `Q8_1` and the whole IQ (importance-matrix)
+    /// family, whose decoders need the large hard-coded codebook grids from
+    /// `ggml`. Those types are still parsed and named, so a file can be
+    /// inspected; only the `dequant::dequantize` entry point refuses them.
+    ///
+    /// Check this before attempting a load to see the gap up front rather than
+    /// on the first failing tensor.
+    pub fn is_dequantizable(&self) -> bool {
+        matches!(
+            self,
+            Self::F32
+                | Self::F16
+                | Self::BF16
+                | Self::Q4_0
+                | Self::Q4_1
+                | Self::Q5_0
+                | Self::Q5_1
+                | Self::Q8_0
+                | Self::Q2K
+                | Self::Q3K
+                | Self::Q4K
+                | Self::Q5K
+                | Self::Q6K
+                | Self::Q8K
+        )
+    }
 }
 
 /// Information about a single tensor stored in a GGUF file.
@@ -238,6 +272,13 @@ impl GgufTensorInfo {
     /// Total number of scalar elements in this tensor.
     pub fn n_elements(&self) -> u64 {
         self.shape.iter().product()
+    }
+
+    /// Whether this tensor's quantization type can be dequantized by this crate.
+    ///
+    /// See [`GgufQuantType::is_dequantizable`].
+    pub fn is_supported(&self) -> bool {
+        self.quant_type.is_dequantizable()
     }
 }
 
@@ -271,6 +312,27 @@ pub struct GgufInspection {
     pub total_param_count: u64,
     /// Unique quantization type names used across all tensors.
     pub quant_types_used: Vec<String>,
+    /// Per-tensor dequantization support, in the same order as `tensor_names`.
+    ///
+    /// `false` means the tensor's quantization type is recognised and reported
+    /// but cannot be decoded by this crate (see
+    /// [`GgufQuantType::is_dequantizable`]), so loading it will fail.
+    pub tensor_supported: Vec<bool>,
+    /// Names of the tensors whose quantization type cannot be dequantized.
+    ///
+    /// Empty when the whole file can be loaded. Inspect this before a load to
+    /// see the gap up front instead of on the first failing tensor.
+    pub unsupported_tensors: Vec<String>,
+    /// Unique quantization type names that appear in the file but cannot be
+    /// dequantized by this crate.
+    pub unsupported_quant_types: Vec<String>,
+}
+
+impl GgufInspection {
+    /// Whether every tensor in the file can be dequantized by this crate.
+    pub fn is_fully_supported(&self) -> bool {
+        self.unsupported_tensors.is_empty()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -589,6 +651,23 @@ impl GgufFile {
             quant_set.into_iter().map(|s| s.to_owned()).collect();
         quant_types_used.sort();
 
+        // Surface the dequantization gap before a load is attempted: GGUF files
+        // may contain types this crate recognises but cannot decode.
+        let tensor_supported: Vec<bool> = self.tensors.iter().map(|t| t.is_supported()).collect();
+        let unsupported_tensors: Vec<String> = self
+            .tensors
+            .iter()
+            .filter(|t| !t.is_supported())
+            .map(|t| t.name.clone())
+            .collect();
+        let mut unsupported_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for t in self.tensors.iter().filter(|t| !t.is_supported()) {
+            unsupported_set.insert(t.quant_type.name());
+        }
+        let mut unsupported_quant_types: Vec<String> =
+            unsupported_set.into_iter().map(|s| s.to_owned()).collect();
+        unsupported_quant_types.sort();
+
         GgufInspection {
             version: self.version,
             tensor_count: self.tensors.len(),
@@ -597,6 +676,9 @@ impl GgufFile {
             tensor_names,
             total_param_count,
             quant_types_used,
+            tensor_supported,
+            unsupported_tensors,
+            unsupported_quant_types,
         }
     }
 

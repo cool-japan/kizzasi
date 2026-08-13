@@ -3,7 +3,8 @@
 //! Contains [`VQConfig`] and [`VectorQuantizer`].
 
 use crate::error::{TokenizerError, TokenizerResult};
-use scirs2_core::ndarray::{Array1, Array2};
+use scirs2_core::ndarray::{Array1, Array2, Axis};
+use scirs2_core::parallel_ops::parallel_map;
 use scirs2_core::random::thread_rng;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,17 @@ impl Default for VQConfig {
     }
 }
 
+/// Squared Euclidean distance between two vectors.
+///
+/// Argmin/nearest-neighbour searches only need relative ordering, so the
+/// `.sqrt()` a true Euclidean distance would need is dropped — squaring it
+/// straight back afterward (as the D^2-proportional k-means++ sampling
+/// below does) would otherwise compute a square root purely to discard it.
+#[inline]
+fn euclidean_distance_sq(a: &Array1<f32>, b: &Array1<f32>) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
+}
+
 /// Vector Quantizer with learned codebook
 #[derive(Debug, Clone)]
 pub struct VectorQuantizer {
@@ -63,8 +75,15 @@ impl VectorQuantizer {
             (rng.random::<f32>() - 0.5) * 2.0 * scale
         });
 
-        let ema_cluster_size = Array1::zeros(config.codebook_size);
-        let ema_embed_sum = Array2::zeros((config.codebook_size, config.embed_dim));
+        // Seed the EMA accumulators so they represent "one pseudo-observation
+        // already equal to the random init", not "zero observations of
+        // zero". `update_ema` computes `codebook[i] = ema_embed_sum[i] /
+        // (ema_cluster_size[i] + epsilon)`; starting both at zero means the
+        // very first call divides ~0/~epsilon, driving every never-selected
+        // code's row to ~0 regardless of its random init. Mirrors
+        // `reset_unused_codes`'s seeding of the same pair of accumulators.
+        let ema_cluster_size = Array1::ones(config.codebook_size);
+        let ema_embed_sum = codebook.clone();
         let usage_counts = Array1::zeros(config.codebook_size);
 
         Self {
@@ -77,73 +96,89 @@ impl VectorQuantizer {
     }
 
     /// Initialize codebook from data using k-means++
+    ///
+    /// # Errors
+    /// Returns an error if `data` is empty, or if any point's length
+    /// differs from `config.embed_dim` — a shorter or longer point would
+    /// otherwise reach an unchecked `self.codebook[[i, j]]` write (panicking
+    /// on a longer point) or silently leave part of a codebook row at its
+    /// random-init value (for a shorter point).
     pub fn initialize_from_data(&mut self, data: &[Array1<f32>]) -> TokenizerResult<()> {
         if data.is_empty() {
             return Err(TokenizerError::InvalidConfig(
                 "Cannot initialize from empty data".into(),
             ));
         }
+        for (i, point) in data.iter().enumerate() {
+            if point.len() != self.config.embed_dim {
+                return Err(TokenizerError::dim_mismatch(
+                    self.config.embed_dim,
+                    point.len(),
+                    format!("initialize_from_data: data[{i}]"),
+                ));
+            }
+        }
 
         let mut rng = thread_rng();
-        let mut centroids = Vec::with_capacity(self.config.codebook_size);
+        let mut centroids: Vec<&Array1<f32>> = Vec::with_capacity(self.config.codebook_size);
 
-        // k-means++ initialization
-        // 1. Choose first centroid randomly
-        let first_idx = rng.random_range(0..data.len());
-        centroids.push(data[first_idx].clone());
+        // k-means++ initialization.
+        // 1. Choose first centroid randomly.
+        centroids.push(&data[rng.random_range(0..data.len())]);
 
-        // 2. Choose remaining centroids with probability proportional to D^2
+        // 2. Choose remaining centroids with probability proportional to D^2.
+        //
+        // `min_dist` is maintained across iterations and updated with only
+        // the most recently added centroid, giving O(codebook_size * data.len()
+        // * embed_dim) total instead of recomputing every point's distance
+        // to every previously-chosen centroid on each of the
+        // `codebook_size` iterations (O(codebook_size^2 * data.len() * embed_dim)).
+        let mut min_dist = vec![f32::INFINITY; data.len()];
         while centroids.len() < self.config.codebook_size {
-            let mut distances = vec![f32::INFINITY; data.len()];
-
-            // Compute minimum distance to existing centroids
+            let last = centroids[centroids.len() - 1];
             for (i, point) in data.iter().enumerate() {
-                for centroid in &centroids {
-                    let dist = self.euclidean_distance(point, centroid);
-                    distances[i] = distances[i].min(dist);
+                let dist = euclidean_distance_sq(point, last);
+                if dist < min_dist[i] {
+                    min_dist[i] = dist;
                 }
             }
 
             // Choose next centroid with probability proportional to distance^2
-            let total: f32 = distances.iter().map(|d| d * d).sum();
+            // (min_dist is already squared).
+            let total: f32 = min_dist.iter().sum();
             if total <= 0.0 {
                 break;
             }
 
             let mut threshold = rng.random::<f32>() * total;
-            for (i, &dist) in distances.iter().enumerate() {
-                threshold -= dist * dist;
+            let mut chosen = data.len() - 1;
+            for (i, &dist) in min_dist.iter().enumerate() {
+                threshold -= dist;
                 if threshold <= 0.0 {
-                    centroids.push(data[i].clone());
+                    chosen = i;
                     break;
                 }
             }
+            centroids.push(&data[chosen]);
         }
 
-        // Update codebook
-        for (i, centroid) in centroids.iter().enumerate() {
-            if i >= self.config.codebook_size {
-                break;
-            }
-            for (j, &val) in centroid.iter().enumerate() {
-                self.codebook[[i, j]] = val;
-            }
+        // Update codebook. `data[i].len() == config.embed_dim` was validated
+        // above, so every centroid row matches the codebook's column count.
+        for (i, &centroid) in centroids.iter().enumerate().take(self.config.codebook_size) {
+            self.codebook.row_mut(i).assign(centroid);
         }
 
         Ok(())
     }
 
-    /// Compute Euclidean distance between two vectors
-    #[inline]
-    fn euclidean_distance(&self, a: &Array1<f32>, b: &Array1<f32>) -> f32 {
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).powi(2))
-            .sum::<f32>()
-            .sqrt()
-    }
-
-    /// Find nearest codebook entry for a vector
+    /// Find nearest codebook entry for a vector.
+    ///
+    /// Computes `argmin_i ||codebook[i] - vector||^2` via
+    /// `||c||^2 - 2 * c.vector` (the `||vector||^2` term is constant across
+    /// `i` and does not affect the argmin, so it is dropped): the cross
+    /// term becomes a single matrix-vector product (`codebook.dot(vector)`)
+    /// instead of `codebook_size` separate dot products, and `||c||^2` is a
+    /// vectorized row-wise reduction instead of a manual nested loop.
     pub fn find_nearest(&self, vector: &Array1<f32>) -> TokenizerResult<usize> {
         if vector.len() != self.config.embed_dim {
             return Err(TokenizerError::dim_mismatch(
@@ -153,19 +188,15 @@ impl VectorQuantizer {
             ));
         }
 
-        let mut min_dist = f32::INFINITY;
+        let cross = self.codebook.dot(vector);
+        let sq_norms = self.codebook.mapv(|v| v * v).sum_axis(Axis(1));
+
+        let mut min_score = f32::INFINITY;
         let mut min_idx = 0;
-
-        for i in 0..self.config.codebook_size {
-            let codebook_entry = self.codebook.row(i);
-            let dist: f32 = vector
-                .iter()
-                .zip(codebook_entry.iter())
-                .map(|(x, y)| (x - y).powi(2))
-                .sum();
-
-            if dist < min_dist {
-                min_dist = dist;
+        for (i, (&norm, &c)) in sq_norms.iter().zip(cross.iter()).enumerate() {
+            let score = norm - 2.0 * c;
+            if score < min_score {
+                min_score = score;
                 min_idx = i;
             }
         }
@@ -180,16 +211,21 @@ impl VectorQuantizer {
         Ok((idx, quantized))
     }
 
-    /// Quantize multiple vectors
+    /// Quantize multiple vectors in parallel (via `scirs2_core::parallel_ops`,
+    /// falling back to sequential when the ecosystem's `parallel` feature is
+    /// disabled). `quantize` takes `&self`, so calling it concurrently
+    /// across vectors is safe.
     pub fn quantize_batch(
         &self,
         vectors: &[Array1<f32>],
     ) -> TokenizerResult<(Vec<usize>, Vec<Array1<f32>>)> {
+        let results: Vec<TokenizerResult<(usize, Array1<f32>)>> =
+            parallel_map(vectors, |vector| self.quantize(vector));
+
         let mut indices = Vec::with_capacity(vectors.len());
         let mut quantized = Vec::with_capacity(vectors.len());
-
-        for vector in vectors {
-            let (idx, quant) = self.quantize(vector)?;
+        for result in results {
+            let (idx, quant) = result?;
             indices.push(idx);
             quantized.push(quant);
         }
@@ -222,12 +258,31 @@ impl VectorQuantizer {
         (total_loss, codebook_loss, commitment_loss)
     }
 
-    /// Update codebook using EMA
+    /// Update codebook using EMA.
+    ///
+    /// # Errors
+    /// Returns [`TokenizerError::InvalidConfig`] if `config.use_ema` is
+    /// `false`. This quantizer has no gradient-based codebook update path
+    /// (the "vs gradient-based" alternative `VQConfig::use_ema` documents),
+    /// so honoring `use_ema: false` by silently running the EMA update
+    /// anyway would contradict the flag's documented meaning; erroring
+    /// makes the gap visible instead. Set `use_ema: true`, or update the
+    /// codebook through another path (e.g. [`VectorQuantizer::initialize_from_data`]),
+    /// if `use_ema: false` is intentional.
     pub fn update_ema(
         &mut self,
         encoder_outputs: &[Array1<f32>],
         indices: &[usize],
     ) -> TokenizerResult<()> {
+        if !self.config.use_ema {
+            return Err(TokenizerError::InvalidConfig(
+                "VectorQuantizer::update_ema called with config.use_ema == false: this quantizer \
+                 has no gradient-based codebook update, so there is nothing else update_ema could \
+                 honestly do; set use_ema: true to use EMA updates"
+                    .into(),
+            ));
+        }
+
         if encoder_outputs.len() != indices.len() {
             return Err(TokenizerError::InvalidConfig(
                 "Encoder outputs and indices length mismatch".into(),
@@ -441,6 +496,90 @@ mod tests {
         assert_eq!(total, 3);
         assert_eq!(used, 2); // Only indices 0 and 1 were used
         assert!(util > 0.0);
+    }
+
+    /// Regression: before the fix, `ema_cluster_size`/`ema_embed_sum`
+    /// started at zero, so a single `update_ema` call zeroed out every
+    /// codebook row that received no vectors in the batch (dividing
+    /// `0.0 / (0.0 + epsilon)`), destroying the random initialization.
+    /// Unused rows must instead stay close to their pre-update value.
+    #[test]
+    fn test_update_ema_preserves_unused_codebook_rows() {
+        let config = VQConfig {
+            codebook_size: 512,
+            embed_dim: 8,
+            use_ema: true,
+            ..Default::default()
+        };
+        let mut vq = VectorQuantizer::new(config);
+        let codebook_before = vq.codebook.clone();
+
+        // Only 2 of 512 codes are used in this update.
+        let outputs = vec![
+            Array1::from_vec(vec![0.1; 8]),
+            Array1::from_vec(vec![0.2; 8]),
+            Array1::from_vec(vec![0.3; 8]),
+        ];
+        let indices = vec![0usize, 1, 0];
+        vq.update_ema(&outputs, &indices).unwrap();
+
+        for i in 2..512 {
+            for j in 0..8 {
+                let before = codebook_before[[i, j]];
+                let after = vq.codebook[[i, j]];
+                assert!(
+                    (after - before).abs() < 1e-3,
+                    "unused row {i} col {j} changed from {before} to {after} after a single update_ema call"
+                );
+                assert_ne!(
+                    after, 0.0,
+                    "unused row {i} col {j} collapsed to exactly 0.0"
+                );
+            }
+        }
+    }
+
+    /// Regression: `update_ema` must not silently behave identically
+    /// whether `use_ema` is true or false — it has no alternative
+    /// (gradient-based) update path, so `use_ema: false` must be a real error.
+    #[test]
+    fn test_update_ema_errors_when_use_ema_false() {
+        let config = VQConfig {
+            codebook_size: 4,
+            embed_dim: 8,
+            use_ema: false,
+            ..Default::default()
+        };
+        let mut vq = VectorQuantizer::new(config);
+        let outputs = vec![Array1::from_vec(vec![0.1; 8])];
+        let indices = vec![0usize];
+
+        assert!(vq.update_ema(&outputs, &indices).is_err());
+    }
+
+    /// Regression: `initialize_from_data` used to index
+    /// `self.codebook[[i, j]]` with no bound on `j`, panicking on any input
+    /// vector longer than `embed_dim`.
+    #[test]
+    fn test_initialize_from_data_rejects_wrong_length_points() {
+        let config = VQConfig {
+            codebook_size: 2,
+            embed_dim: 3,
+            ..Default::default()
+        };
+        let mut vq = VectorQuantizer::new(config);
+
+        let too_long = vec![
+            Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0]), // 4 != embed_dim 3
+            Array1::from_vec(vec![1.0, 1.0, 1.0, 1.0]),
+        ];
+        assert!(vq.initialize_from_data(&too_long).is_err());
+
+        let too_short = vec![
+            Array1::from_vec(vec![0.0, 0.0]), // 2 != embed_dim 3
+            Array1::from_vec(vec![1.0, 1.0]),
+        ];
+        assert!(vq.initialize_from_data(&too_short).is_err());
     }
 
     #[test]

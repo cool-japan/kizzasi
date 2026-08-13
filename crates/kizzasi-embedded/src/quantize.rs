@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::vec::Vec;
 
+use crate::error::{EmbeddedError, EmbeddedResult};
 use crate::math::core_math;
 
 /// Maximum absolute value of a slice (no_std compatible).
@@ -42,16 +43,34 @@ pub fn quantize_scalar(value: f32, scale: f32) -> i8 {
 
 /// Dequantize a slice of INT8 values to f32, writing into `output`.
 ///
-/// Requires no heap allocation. Panics in debug mode if slice lengths differ.
-pub fn dequantize_into(quantized: &[i8], scale: f32, output: &mut [f32]) {
-    debug_assert_eq!(
-        quantized.len(),
-        output.len(),
-        "quantized and output slices must have equal length"
-    );
+/// Requires no heap allocation.
+///
+/// # Errors
+///
+/// Returns [`EmbeddedError::BufferTooSmall`] when `output` is shorter than
+/// `quantized`, and [`EmbeddedError::DimensionMismatch`] when it is longer.
+///
+/// The length agreement used to be a `debug_assert_eq!` only, so a release
+/// build silently truncated to the shorter slice: handing in a 16-element
+/// `quantized` with an 8-element `output` wrote 8 values and returned
+/// normally, leaving the caller with a half-dequantised tensor and no signal.
+pub fn dequantize_into(quantized: &[i8], scale: f32, output: &mut [f32]) -> EmbeddedResult<()> {
+    if output.len() < quantized.len() {
+        return Err(EmbeddedError::BufferTooSmall {
+            required: quantized.len(),
+            available: output.len(),
+        });
+    }
+    if output.len() != quantized.len() {
+        return Err(EmbeddedError::DimensionMismatch {
+            expected: quantized.len(),
+            got: output.len(),
+        });
+    }
     for (q, o) in quantized.iter().zip(output.iter_mut()) {
         *o = *q as f32 * scale;
     }
+    Ok(())
 }
 
 /// Quantize a slice of f32 values to INT8 using symmetric per-tensor quantization.
@@ -110,7 +129,7 @@ mod tests {
             quantize_scalar(original[3], scale),
         ];
         let mut reconstructed = [0.0_f32; 4];
-        dequantize_into(&q, scale, &mut reconstructed);
+        dequantize_into(&q, scale, &mut reconstructed).expect("equal lengths");
         for (orig, recon) in original.iter().zip(reconstructed.iter()) {
             // Tolerance: at most 1 LSB
             assert!(
@@ -118,5 +137,48 @@ mod tests {
                 "round-trip error too large: orig={orig}, recon={recon}, tol={scale}"
             );
         }
+    }
+
+    #[test]
+    fn test_dequantize_into_rejects_short_output() {
+        // Release builds used to silently write a partial result here.
+        let quantized = [1_i8; 16];
+        let mut output = [0.0_f32; 8];
+        assert_eq!(
+            dequantize_into(&quantized, 0.5, &mut output),
+            Err(EmbeddedError::BufferTooSmall {
+                required: 16,
+                available: 8
+            }),
+            "a short output buffer must be reported, not silently truncated"
+        );
+        assert!(
+            output.iter().all(|&v| v == 0.0),
+            "the output buffer must be left untouched on error"
+        );
+    }
+
+    #[test]
+    fn test_dequantize_into_rejects_long_output() {
+        let quantized = [1_i8; 4];
+        let mut output = [0.0_f32; 8];
+        assert_eq!(
+            dequantize_into(&quantized, 0.5, &mut output),
+            Err(EmbeddedError::DimensionMismatch {
+                expected: 4,
+                got: 8
+            })
+        );
+    }
+
+    #[test]
+    fn test_max_abs_and_scale_edge_cases() {
+        assert_eq!(max_abs(&[]), 0.0, "empty slice has zero max_abs");
+        assert_eq!(
+            compute_scale(&[0.0; 4]),
+            1.0,
+            "near-zero tensors must not divide by zero"
+        );
+        assert!((max_abs(&[-5.0, 2.0]) - 5.0).abs() < 1e-6);
     }
 }

@@ -20,13 +20,20 @@ use scirs2_core::ndarray::{Array2, ArrayView2, ArrayView3};
 use tracing::{debug, trace};
 
 /// Configuration for parallel multi-head computation
+///
+/// `min_heads_for_parallel` and `num_threads` are honoured by every function
+/// in this module (via a scoped `rayon::ThreadPool` built when
+/// `num_threads != 0` — see [`MultiHeadExecutor`]). `enable_simd` is
+/// reserved and currently has no effect: every op here is expressed as
+/// `ndarray` operations (`.dot()`, `Zip`, ...), which have no separate
+/// non-vectorized code path to switch to.
 #[derive(Debug, Clone, Copy)]
 pub struct ParallelConfig {
     /// Minimum number of heads to enable parallel processing
     pub min_heads_for_parallel: usize,
-    /// Number of threads to use (0 = auto)
+    /// Number of threads to use (0 = auto: rayon's global pool)
     pub num_threads: usize,
-    /// Enable SIMD vectorization within heads
+    /// Reserved: has no effect (see struct docs).
     pub enable_simd: bool,
 }
 
@@ -43,11 +50,19 @@ impl Default for ParallelConfig {
 /// Multi-head operation executor
 pub struct MultiHeadExecutor {
     config: ParallelConfig,
+    /// Scoped thread pool sized to `config.num_threads`, built once here
+    /// instead of per-call. `None` means "use rayon's global pool" (the
+    /// `num_threads == 0` / auto case).
+    pool: Option<rayon::ThreadPool>,
 }
 
 impl MultiHeadExecutor {
-    /// Create a new multi-head executor
-    pub fn new(config: ParallelConfig) -> Self {
+    /// Create a new multi-head executor.
+    ///
+    /// # Errors
+    /// Returns an error if `config.num_threads != 0` and building a thread
+    /// pool with that many threads fails.
+    pub fn new(config: ParallelConfig) -> ModelResult<Self> {
         debug!(
             "Created MultiHeadExecutor: min_heads={}, threads={}",
             config.min_heads_for_parallel,
@@ -57,7 +72,22 @@ impl MultiHeadExecutor {
                 config.num_threads.to_string()
             }
         );
-        Self { config }
+        let pool = if config.num_threads == 0 {
+            None
+        } else {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(config.num_threads)
+                    .build()
+                    .map_err(|e| {
+                        ModelError::load_error(
+                            "MultiHeadExecutor::new",
+                            format!("failed to build a {}-thread pool: {e}", config.num_threads),
+                        )
+                    })?,
+            )
+        };
+        Ok(Self { config, pool })
     }
 
     /// Execute a function in parallel across heads
@@ -77,10 +107,15 @@ impl MultiHeadExecutor {
 
         if num_heads < self.config.min_heads_for_parallel {
             // Sequential execution for small number of heads
-            (0..num_heads).map(f).collect()
-        } else {
-            // Parallel execution
-            (0..num_heads).into_par_iter().map(f).collect()
+            return (0..num_heads).map(f).collect();
+        }
+
+        // Parallel execution — on this executor's own scoped pool when
+        // `config.num_threads` requested one, otherwise rayon's global pool.
+        let run = move || (0..num_heads).into_par_iter().map(f).collect();
+        match &self.pool {
+            Some(pool) => pool.install(run),
+            None => run(),
         }
     }
 
@@ -158,6 +193,38 @@ impl MultiHeadExecutor {
     }
 }
 
+/// Run `f` over `0..num_heads`, honouring `config.min_heads_for_parallel`
+/// and `config.num_threads`.
+///
+/// This is the free-function counterpart to [`MultiHeadExecutor::par_map`]:
+/// since these functions take a fresh `&ParallelConfig` on every call with
+/// nowhere to cache a thread pool, a scoped pool is built per call when
+/// `num_threads != 0` rather than once at construction time. Prefer
+/// [`MultiHeadExecutor`] in a hot loop that calls with the same config
+/// repeatedly.
+fn run_over_heads<T, F>(config: &ParallelConfig, num_heads: usize, f: F) -> ModelResult<Vec<T>>
+where
+    F: Fn(usize) -> ModelResult<T> + Sync + Send,
+    T: Send,
+{
+    if num_heads < config.min_heads_for_parallel {
+        return (0..num_heads).map(f).collect();
+    }
+    if config.num_threads == 0 {
+        return (0..num_heads).into_par_iter().map(f).collect();
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.num_threads)
+        .build()
+        .map_err(|e| {
+            ModelError::load_error(
+                "run_over_heads",
+                format!("failed to build a {}-thread pool: {e}", config.num_threads),
+            )
+        })?;
+    pool.install(|| (0..num_heads).into_par_iter().map(f).collect())
+}
+
 /// Parallel multi-head linear projection
 ///
 /// Performs W_q, W_k, W_v projections in parallel across heads.
@@ -198,11 +265,7 @@ pub fn parallel_multi_head_projection(
         Ok(input.dot(&head_weight))
     };
 
-    if num_heads < config.min_heads_for_parallel {
-        (0..num_heads).map(process_head).collect()
-    } else {
-        (0..num_heads).into_par_iter().map(process_head).collect()
-    }
+    run_over_heads(config, num_heads, process_head)
 }
 
 /// Parallel multi-head output combination
@@ -280,11 +343,7 @@ pub fn parallel_attention_scores(
         Ok(scores)
     };
 
-    if num_heads < config.min_heads_for_parallel {
-        (0..num_heads).map(compute_scores).collect()
-    } else {
-        (0..num_heads).into_par_iter().map(compute_scores).collect()
-    }
+    run_over_heads(config, num_heads, compute_scores)
 }
 
 /// Apply softmax in parallel across heads
@@ -318,11 +377,7 @@ pub fn parallel_softmax(
         Ok(output)
     };
 
-    if num_heads < config.min_heads_for_parallel {
-        (0..num_heads).map(apply_softmax).collect()
-    } else {
-        (0..num_heads).into_par_iter().map(apply_softmax).collect()
-    }
+    run_over_heads(config, num_heads, apply_softmax)
 }
 
 // Import ndarray slicing macro
@@ -336,8 +391,52 @@ mod tests {
     #[test]
     fn test_executor_creation() {
         let config = ParallelConfig::default();
-        let executor = MultiHeadExecutor::new(config);
+        let executor = MultiHeadExecutor::new(config).expect("executor creation should succeed");
         assert_eq!(executor.config.min_heads_for_parallel, 4);
+    }
+
+    #[test]
+    fn test_executor_custom_thread_count_par_map() {
+        let config = ParallelConfig {
+            min_heads_for_parallel: 0, // force the parallel branch
+            num_threads: 2,
+            ..Default::default()
+        };
+        let executor =
+            MultiHeadExecutor::new(config).expect("executor with a 2-thread pool should build");
+
+        let results = executor.par_map(6, |i| Ok(i * 2)).expect("par_map failed");
+        assert_eq!(results, vec![0, 2, 4, 6, 8, 10]);
+    }
+
+    #[test]
+    fn test_run_over_heads_custom_thread_count() {
+        // Exercises `run_over_heads`'s scoped-pool branch via a public free
+        // function so a custom `num_threads` is proven to actually run
+        // (rather than just being logged and ignored).
+        let d_model = 4;
+        let head_dim = 2;
+        let num_heads = 2;
+        let input = Array2::from_shape_fn((3, d_model), |(i, j)| (i * d_model + j) as f32);
+        let weights = Array3::from_shape_fn((num_heads, d_model, head_dim), |(h, i, j)| {
+            if i == j + h {
+                1.0
+            } else {
+                0.0
+            }
+        });
+        let config = ParallelConfig {
+            min_heads_for_parallel: 0,
+            num_threads: 2,
+            ..Default::default()
+        };
+
+        let result = parallel_multi_head_projection(&input.view(), &weights.view(), &config)
+            .expect("parallel_multi_head_projection with custom thread count failed");
+        assert_eq!(result.len(), num_heads);
+        for r in &result {
+            assert_eq!(r.dim(), (3, head_dim));
+        }
     }
 
     #[test]
@@ -346,7 +445,7 @@ mod tests {
             min_heads_for_parallel: 10,
             ..Default::default()
         };
-        let executor = MultiHeadExecutor::new(config);
+        let executor = MultiHeadExecutor::new(config).expect("executor creation should succeed");
 
         let results = executor.par_map(3, |i| Ok(i * 2)).expect("par_map failed");
 
@@ -359,7 +458,7 @@ mod tests {
             min_heads_for_parallel: 2,
             ..Default::default()
         };
-        let executor = MultiHeadExecutor::new(config);
+        let executor = MultiHeadExecutor::new(config).expect("executor creation should succeed");
 
         let results = executor.par_map(4, |i| Ok(i * 3)).expect("par_map failed");
 
@@ -369,7 +468,7 @@ mod tests {
     #[test]
     fn test_split_heads_and_process() {
         let config = ParallelConfig::default();
-        let executor = MultiHeadExecutor::new(config);
+        let executor = MultiHeadExecutor::new(config).expect("executor creation should succeed");
 
         let input = array![[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]];
 
@@ -452,9 +551,9 @@ mod tests {
         let config = ParallelConfig::default();
         let input = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
 
-        let result =
-            MultiHeadExecutor::new(config)
-                .split_heads_and_process(&input.view(), 2, 2, |head| Ok(head.to_owned()));
+        let result = MultiHeadExecutor::new(config)
+            .expect("executor creation should succeed")
+            .split_heads_and_process(&input.view(), 2, 2, |head| Ok(head.to_owned()));
 
         assert!(result.is_err());
     }

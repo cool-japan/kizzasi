@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::body::Body as TonicBody;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
@@ -27,6 +27,18 @@ use tracing::{debug, info};
 // Re-export http types used in the Service impl — the http crate is a direct
 // dependency gated on the `grpc` feature.
 use ::http::{Request as HttpRequest, Response as HttpResponse};
+
+/// Map an inference failure onto a gRPC status code
+///
+/// Rejected per-request overrides and malformed inputs are the client's mistake
+/// and must not be reported as an internal server fault.
+fn inference_status(error: InferenceError) -> Status {
+    match error {
+        InferenceError::InvalidConfiguration(message) => Status::invalid_argument(message),
+        InferenceError::DimensionMismatch { .. } => Status::invalid_argument(error.to_string()),
+        other => Status::internal(format!("Inference error: {other}")),
+    }
+}
 
 // ============================================================================
 // Protocol buffer message definitions
@@ -272,17 +284,17 @@ impl InferenceServiceInner {
 
         let start = std::time::Instant::now();
 
-        let output = {
+        let outputs = {
             let engine = self.engine.write().await;
             engine
-                .step_async(input)
+                .step_async_with(input, &(&msg.config).into())
                 .await
-                .map_err(|e| Status::internal(format!("Inference error: {e}")))?
+                .map_err(inference_status)?
         };
 
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let response =
-            InferenceResponse::new(request_id, output.to_vec(), latency_ms, output.len());
+        let (output, num_tokens) = super::flatten_outputs(&outputs);
+        let response = InferenceResponse::new(request_id, output, latency_ms, num_tokens);
 
         Ok(Response::new(response.into()))
     }
@@ -307,17 +319,15 @@ impl InferenceServiceInner {
                         let start = std::time::Instant::now();
                         let result = {
                             let eng = engine.write().await;
-                            eng.step_async(input).await
+                            eng.step_async_with(input, &(&msg.config).into()).await
                         };
 
                         let send_result = match result {
-                            Ok(output) => {
+                            Ok(outputs) => {
                                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                let (output, num_tokens) = super::flatten_outputs(&outputs);
                                 let resp = InferenceResponse::new(
-                                    request_id,
-                                    output.to_vec(),
-                                    latency_ms,
-                                    output.len(),
+                                    request_id, output, latency_ms, num_tokens,
                                 );
                                 tx.send(Ok(resp.into())).await
                             }
@@ -496,14 +506,18 @@ where
                 }
 
                 PATH_INFER_STREAM => {
-                    // Client-streaming, server-streaming (bidi) rpc
+                    // Bidirectional streaming: one reply per request frame,
+                    // via `infer_stream_impl` — the same per-item streaming
+                    // logic `InferenceService::infer_stream` exposes at the
+                    // Rust API level, now actually reachable from the wire.
                     struct StreamHandler(Arc<InferenceServiceInner>);
 
-                    impl tonic::server::ClientStreamingService<proto::InferenceRequest> for StreamHandler {
+                    impl tonic::server::StreamingService<proto::InferenceRequest> for StreamHandler {
                         type Response = proto::InferenceReply;
+                        type ResponseStream = ReceiverStream<Result<proto::InferenceReply, Status>>;
                         type Future = Pin<
                             Box<
-                                dyn Future<Output = Result<Response<proto::InferenceReply>, Status>>
+                                dyn Future<Output = Result<Response<Self::ResponseStream>, Status>>
                                     + Send,
                             >,
                         >;
@@ -513,45 +527,13 @@ where
                             request: Request<Streaming<proto::InferenceRequest>>,
                         ) -> Self::Future {
                             let inner = self.0.clone();
-                            Box::pin(async move {
-                                // Collect all incoming requests, run inference on each, return
-                                // the last reply (simplest contract for client-streaming).
-                                let mut stream = request.into_inner();
-                                let mut last_reply: Option<proto::InferenceReply> = None;
-
-                                while let Some(item) = stream.next().await {
-                                    let req = item?;
-                                    let msg: InferenceMessage = req.into();
-                                    let input = msg.to_array();
-                                    let request_id = msg.request_id.clone();
-                                    let start = std::time::Instant::now();
-
-                                    let output = {
-                                        let eng = inner.engine.write().await;
-                                        eng.step_async(input).await.map_err(|e| {
-                                            Status::internal(format!("Inference error: {e}"))
-                                        })?
-                                    };
-
-                                    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-                                    let resp = InferenceResponse::new(
-                                        request_id,
-                                        output.to_vec(),
-                                        latency_ms,
-                                        output.len(),
-                                    );
-                                    last_reply = Some(resp.into());
-                                }
-
-                                let reply = last_reply.unwrap_or_default();
-                                Ok(Response::new(reply))
-                            })
+                            Box::pin(async move { inner.infer_stream_impl(request).await })
                         }
                     }
 
                     let mut grpc: Grpc<ProstCodec<proto::InferenceReply, proto::InferenceRequest>> =
                         Grpc::new(ProstCodec::default());
-                    let resp = grpc.client_streaming(StreamHandler(inner), req).await;
+                    let resp = grpc.streaming(StreamHandler(inner), req).await;
                     Ok(resp)
                 }
 
@@ -613,8 +595,12 @@ pub struct GrpcAdapter {
     /// Bound socket address
     addr: SocketAddr,
 
-    /// Runtime running state flag
-    running: Arc<RwLock<bool>>,
+    /// Runtime running state, and the signal `stop()` uses to interrupt an
+    /// in-flight `serve()`/`start()` call. A `watch` channel serves both
+    /// purposes: `is_running()` is a plain synchronous `borrow()` (no
+    /// runtime interaction, so it can never panic), and the serve loop
+    /// awaits a transition to `false` via `serve_with_shutdown`.
+    running: watch::Sender<bool>,
 
     /// Server configuration
     config: GrpcServerConfig,
@@ -628,10 +614,11 @@ impl GrpcAdapter {
     /// * `addr`   — Socket address to bind to
     /// * `engine` — Streaming inference engine to serve
     pub fn new(addr: impl Into<SocketAddr>, engine: StreamingEngine) -> Self {
+        let (running, _) = watch::channel(false);
         Self {
             service: InferenceService::new(engine),
             addr: addr.into(),
-            running: Arc::new(RwLock::new(false)),
+            running,
             config: GrpcServerConfig::default(),
         }
     }
@@ -642,10 +629,11 @@ impl GrpcAdapter {
         engine: StreamingEngine,
         config: GrpcServerConfig,
     ) -> Self {
+        let (running, _) = watch::channel(false);
         Self {
             service: InferenceService::new(engine),
             addr: addr.into(),
-            running: Arc::new(RwLock::new(false)),
+            running,
             config,
         }
     }
@@ -661,7 +649,7 @@ impl GrpcAdapter {
     /// `InferenceServiceServer` and applies `GrpcServerConfig` settings.
     pub async fn serve(&self) -> InferenceResult<()> {
         info!("gRPC server listening on {}", self.addr);
-        *self.running.write().await = true;
+        let _ = self.running.send_replace(true);
 
         let inner = self.service.inner.clone();
         let svc = InferenceServiceServer { inner };
@@ -677,13 +665,17 @@ impl GrpcAdapter {
             builder = builder.timeout(std::time::Duration::from_millis(self.config.timeout_ms));
         }
 
+        if self.config.max_frame_size > 0 {
+            builder = builder.max_frame_size(Some(self.config.max_frame_size));
+        }
+
         builder
             .add_service(svc)
             .serve(addr)
             .await
             .map_err(|e| InferenceError::NetworkError(format!("gRPC transport error: {e}")))?;
 
-        *self.running.write().await = false;
+        let _ = self.running.send_replace(false);
         Ok(())
     }
 
@@ -693,7 +685,7 @@ impl GrpcAdapter {
         F: Future<Output = ()>,
     {
         info!("gRPC server (with shutdown) listening on {}", self.addr);
-        *self.running.write().await = true;
+        let _ = self.running.send_replace(true);
 
         let inner = self.service.inner.clone();
         let svc = InferenceServiceServer { inner };
@@ -709,32 +701,48 @@ impl GrpcAdapter {
             builder = builder.timeout(std::time::Duration::from_millis(self.config.timeout_ms));
         }
 
+        if self.config.max_frame_size > 0 {
+            builder = builder.max_frame_size(Some(self.config.max_frame_size));
+        }
+
         builder
             .add_service(svc)
             .serve_with_shutdown(addr, signal)
             .await
             .map_err(|e| InferenceError::NetworkError(format!("gRPC transport error: {e}")))?;
 
-        *self.running.write().await = false;
+        let _ = self.running.send_replace(false);
         Ok(())
     }
 }
 
 impl NetworkAdapter for GrpcAdapter {
-    async fn start(&mut self) -> InferenceResult<()> {
-        self.serve().await
+    /// Serve until [`NetworkAdapter::stop`] is called, using tonic's own
+    /// `serve_with_shutdown` driven by a `watch` receiver — unlike the
+    /// previous `stop()`, which flipped a flag nothing read, this genuinely
+    /// interrupts the accept loop.
+    async fn start(&self) -> InferenceResult<()> {
+        let mut rx = self.running.subscribe();
+        // `wait_for` always checks the *current* value first (not a stale
+        // snapshot from `subscribe()`), so it is safe to build this future
+        // before `serve_with_shutdown` sets the flag to `true` below: by the
+        // time this future is actually polled the flag is already `true`,
+        // and it correctly waits for a later transition to `false` from
+        // `stop()`.
+        self.serve_with_shutdown(async move {
+            let _ = rx.wait_for(|running| !*running).await;
+        })
+        .await
     }
 
-    async fn stop(&mut self) -> InferenceResult<()> {
-        *self.running.write().await = false;
-        info!("gRPC server stopped");
+    async fn stop(&self) -> InferenceResult<()> {
+        let _ = self.running.send_replace(false);
+        info!("gRPC server stop requested");
         Ok(())
     }
 
     fn is_running(&self) -> bool {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async { *self.running.read().await })
-        })
+        *self.running.borrow()
     }
 }
 
@@ -962,6 +970,87 @@ mod tests {
         );
     }
 
+    /// Regression: `PATH_INFER_STREAM` used to be routed through
+    /// `ClientStreamingService`, which collects every frame and returns only
+    /// the *last* reply — N requests in, 1 reply out, discarding N-1
+    /// predictions, and a 0-request stream produced a fabricated
+    /// `Default::default()` reply. Routed through `StreamingService` (this
+    /// test exercises the real wire codec via `tonic::client::Grpc`, not
+    /// just the `InferenceServiceInner` level `test_infer_stream_processes_requests`
+    /// already covers), N requests must now produce N replies, in order,
+    /// each with its own `request_id` — and 0 requests must produce 0
+    /// replies rather than a fabricated one.
+    #[tokio::test]
+    async fn test_infer_stream_wire_returns_one_reply_per_frame() {
+        use crate::testutil::CountingModel;
+
+        let stream_config = StreamConfig {
+            engine: crate::engine::EngineConfig::new(1, 1),
+            ..Default::default()
+        };
+        let mut engine = StreamingEngine::new(stream_config).expect("engine must construct");
+        engine.set_model(Box::new(CountingModel::new())).await;
+
+        let inner = Arc::new(InferenceServiceInner::new(engine));
+        let server = InferenceServiceServer { inner };
+
+        let mut client = tonic::client::Grpc::new(server);
+        client.ready().await.expect("service must be ready");
+
+        let requests: Vec<proto::InferenceRequest> = (0u32..3)
+            .map(|i| proto::InferenceRequest {
+                request_id: format!("wire-{i}"),
+                input: vec![i as f32 * 0.1],
+                ..Default::default()
+            })
+            .collect();
+
+        let path = ::http::uri::PathAndQuery::from_static(PATH_INFER_STREAM);
+        let codec: ProstCodec<proto::InferenceRequest, proto::InferenceReply> =
+            ProstCodec::default();
+
+        let response = client
+            .streaming(Request::new(futures::stream::iter(requests)), path, codec)
+            .await
+            .expect("streaming call must succeed");
+
+        let mut reply_stream = response.into_inner();
+        let mut request_ids = Vec::new();
+        while let Some(reply) = reply_stream.next().await {
+            request_ids.push(reply.expect("each reply must decode").request_id);
+        }
+
+        assert_eq!(
+            request_ids,
+            vec![
+                "wire-0".to_string(),
+                "wire-1".to_string(),
+                "wire-2".to_string()
+            ],
+            "each request frame must produce its own reply, in order, over the real wire codec"
+        );
+
+        // Zero requests must yield zero replies, not a fabricated
+        // `Default::default()` reply (empty request_id, latency_ms: 0.0).
+        let empty_path = ::http::uri::PathAndQuery::from_static(PATH_INFER_STREAM);
+        let empty_codec: ProstCodec<proto::InferenceRequest, proto::InferenceReply> =
+            ProstCodec::default();
+        let empty_response = client
+            .streaming(
+                Request::new(futures::stream::iter(Vec::<proto::InferenceRequest>::new())),
+                empty_path,
+                empty_codec,
+            )
+            .await
+            .expect("zero-frame streaming call must still succeed");
+        let empty_replies: Vec<_> = empty_response.into_inner().collect().await;
+        assert!(
+            empty_replies.is_empty(),
+            "zero requests must yield zero replies, got {}",
+            empty_replies.len()
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Transport-level test: bind to an ephemeral port, start, signal shutdown
     // -----------------------------------------------------------------------
@@ -1033,5 +1122,63 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:50051".parse().expect("valid socket addr");
         let adapter = GrpcAdapter::new(addr, engine);
         assert!(!adapter.is_running());
+    }
+
+    /// `is_running()` must be a plain, panic-free read even on a
+    /// current-thread runtime (the old `block_in_place` implementation
+    /// panicked outside a multi-threaded Tokio context).
+    #[tokio::test]
+    async fn test_is_running_does_not_panic_on_current_thread_runtime() {
+        let engine = make_engine();
+        let addr: SocketAddr = "127.0.0.1:50052".parse().expect("valid socket addr");
+        let adapter = GrpcAdapter::new(addr, engine);
+        assert!(!adapter.is_running());
+    }
+
+    /// Regression: `NetworkAdapter::stop()` used to flip a flag that the
+    /// `serve()` accept loop never read, so a running server kept accepting
+    /// connections after `stop()` returned `Ok(())`. `start()` must now
+    /// actually resolve promptly after `stop()` is called from a different
+    /// `Arc`-shared handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_network_adapter_stop_unblocks_start() {
+        use std::net::TcpListener as StdTcpListener;
+
+        let ephemeral_addr = {
+            let listener =
+                StdTcpListener::bind("127.0.0.1:0").expect("OS should assign a free port");
+            listener.local_addr().expect("local_addr must be set")
+        };
+
+        let adapter = Arc::new(GrpcAdapter::new(ephemeral_addr, make_engine()));
+        let adapter_for_task = adapter.clone();
+        let handle = tokio::spawn(async move { adapter_for_task.start().await });
+
+        // Poll rather than a single fixed sleep: robust against scheduling
+        // jitter when many tests run concurrently.
+        let mut became_running = false;
+        for _ in 0..100 {
+            if adapter.is_running() {
+                became_running = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            became_running,
+            "adapter should report running after start()"
+        );
+
+        adapter.stop().await.expect("stop must succeed");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "start() must resolve promptly after stop(), not keep serving forever"
+        );
+        assert!(
+            !adapter.is_running(),
+            "adapter must report not-running once start() has returned"
+        );
     }
 }

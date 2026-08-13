@@ -77,3 +77,85 @@ pub enum WindowType {
     /// Kaiser window with specified beta parameter
     Kaiser { beta: f32 },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_spectrogram() -> Spectrogram {
+        // 2 frames x 3 bins, row-major.
+        Spectrogram {
+            magnitudes: vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0],
+            phases: vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
+            num_frames: 2,
+            num_bins: 3,
+            hop_length: 256,
+            sample_rate: 16_000.0,
+        }
+    }
+
+    #[test]
+    fn test_magnitude_and_phase_are_row_major() {
+        let spectrogram = sample_spectrogram();
+        assert_eq!(spectrogram.magnitude(0, 0), 1.0);
+        assert_eq!(spectrogram.magnitude(0, 2), 4.0);
+        assert_eq!(spectrogram.magnitude(1, 0), 8.0);
+        assert_eq!(spectrogram.magnitude(1, 2), 32.0);
+        assert_eq!(spectrogram.phase(1, 1), 0.4);
+    }
+
+    #[test]
+    fn test_power_is_squared_magnitude() {
+        let spectrogram = sample_spectrogram();
+        assert_eq!(spectrogram.power(1, 2), 32.0 * 32.0);
+    }
+
+    #[test]
+    fn test_bin_to_hz_and_frame_to_time() {
+        let spectrogram = sample_spectrogram();
+        // Bin k of an n_fft-point transform sits at k * fs / n_fft.
+        assert!((spectrogram.bin_to_hz(0, 512) - 0.0).abs() < 1e-6);
+        assert!((spectrogram.bin_to_hz(256, 512) - 8000.0).abs() < 1e-3);
+        // Frame m starts at m * hop / fs seconds.
+        assert!((spectrogram.frame_to_time(0)).abs() < 1e-9);
+        assert!((spectrogram.frame_to_time(1) - 0.016).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_to_db_scales_and_floors() {
+        let spectrogram = sample_spectrogram();
+        let db = spectrogram.to_db(1.0, -20.0);
+        assert_eq!(db.len(), spectrogram.magnitudes.len());
+        // 20*log10(2) ~= 6.02 dB, and doubling adds ~6 dB each step.
+        let first = db.first().copied().unwrap_or(f32::NAN);
+        let second = db.get(1).copied().unwrap_or(f32::NAN);
+        assert!(
+            (second - first - 6.0206).abs() < 1e-2,
+            "{first} -> {second}"
+        );
+        assert!(db.iter().all(|&v| v >= -20.0), "floor not applied");
+
+        // Everything below the floor is clamped to it.
+        let quiet = Spectrogram {
+            magnitudes: vec![0.0; 4],
+            ..sample_spectrogram()
+        };
+        assert!(quiet.to_db(1.0, -80.0).iter().all(|&v| v == -80.0));
+    }
+
+    #[test]
+    fn test_window_type_variants_are_copyable() {
+        let windows = [
+            WindowType::Rectangular,
+            WindowType::Hann,
+            WindowType::Hamming,
+            WindowType::Blackman,
+            WindowType::Bartlett,
+            WindowType::Kaiser { beta: 8.6 },
+        ];
+        for window in windows {
+            let copied = window;
+            assert!(!format!("{copied:?}").is_empty());
+        }
+    }
+}

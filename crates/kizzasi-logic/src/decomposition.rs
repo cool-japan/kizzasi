@@ -11,10 +11,45 @@
 //! - **Block Decomposition**: Divides variables into blocks for coordinate descent
 //! - **Hierarchical Decomposition**: Multi-level decomposition for very large problems
 
+use crate::lp_simplex::{solve_ge_lp, LpOutcome};
 use scirs2_core::ndarray::{Array1, Array2};
 
 /// Result type for decomposition operations
 pub type DecompositionResult<T> = Result<T, DecompositionError>;
+
+/// Iteration budget for a simplex solve of the given size.
+///
+/// Generous enough that only genuinely pathological instances hit it, while
+/// still guaranteeing termination.
+fn simplex_budget(num_vars: usize, num_rows: usize) -> usize {
+    50 * (num_vars + num_rows + 1) + 200
+}
+
+/// Convert an `f64` solver vector into the crate's `f32` representation.
+fn to_f32_array(values: &[f64]) -> Array1<f32> {
+    Array1::from_vec(values.iter().map(|&v| v as f32).collect())
+}
+
+/// Dot product of two `f32` arrays, tolerant of length differences.
+fn dot_f32(a: &Array1<f32>, b: &Array1<f32>) -> f32 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+}
+
+/// Compute `Mᵀv` for an `Array2` with `columns` columns.
+fn transpose_dot(matrix: &Array2<f32>, vector: &Array1<f32>, columns: usize) -> Array1<f32> {
+    let rows = matrix.nrows();
+    let values: Vec<f32> = (0..columns)
+        .map(|j| {
+            (0..rows)
+                .map(|i| {
+                    matrix.get((i, j)).copied().unwrap_or(0.0)
+                        * vector.get(i).copied().unwrap_or(0.0)
+                })
+                .sum()
+        })
+        .collect();
+    Array1::from_vec(values)
+}
 
 /// Errors that can occur during constraint decomposition
 #[derive(Debug, Clone)]
@@ -145,12 +180,24 @@ impl ConsensusADMM {
     }
 
     /// Initialize from a starting point
-    pub fn initialize(&mut self, x0: &Array1<f32>) {
-        assert_eq!(x0.len(), self.dimension, "Initial point dimension mismatch");
-        self.global_var = x0.clone();
-        for i in 0..self.num_blocks {
-            self.local_vars[i] = x0.clone();
+    ///
+    /// # Errors
+    ///
+    /// [`DecompositionError::IncompatibleStructure`] when `x0` does not have
+    /// the solver's dimension.
+    pub fn initialize(&mut self, x0: &Array1<f32>) -> DecompositionResult<()> {
+        if x0.len() != self.dimension {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "initial point must have {} entries, got {}",
+                self.dimension,
+                x0.len()
+            )));
         }
+        self.global_var = x0.clone();
+        for local in self.local_vars.iter_mut() {
+            *local = x0.clone();
+        }
+        Ok(())
     }
 
     /// Perform one ADMM iteration with custom local updates
@@ -285,38 +332,77 @@ impl BlockCoordinateDescent {
     }
 
     /// Initialize from a starting point
-    pub fn initialize(&mut self, x0: &Array1<f32>) {
-        assert_eq!(x0.len(), self.dimension);
+    ///
+    /// # Errors
+    ///
+    /// [`DecompositionError::IncompatibleStructure`] when `x0` does not have
+    /// the solver's dimension.
+    pub fn initialize(&mut self, x0: &Array1<f32>) -> DecompositionResult<()> {
+        if x0.len() != self.dimension {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "initial point must have {} entries, got {}",
+                self.dimension,
+                x0.len()
+            )));
+        }
         self.current_solution = x0.clone();
+        Ok(())
     }
 
     /// Perform one block update
     ///
     /// The `block_update_fn` should optimize the objective over the specified block
     /// while keeping other variables fixed.
-    pub fn update_block<F>(&mut self, block_id: usize, block_update_fn: F) -> f32
+    ///
+    /// # Errors
+    ///
+    /// [`DecompositionError::InvalidBlocks`] for an unknown `block_id`, and
+    /// [`DecompositionError::IncompatibleStructure`] when the callback returns
+    /// a vector of the wrong length.
+    pub fn update_block<F>(
+        &mut self,
+        block_id: usize,
+        block_update_fn: F,
+    ) -> DecompositionResult<f32>
     where
         F: Fn(&Array1<f32>, &[usize]) -> Array1<f32>,
     {
-        let block = &self.blocks[block_id];
-        let block_solution = block_update_fn(&self.current_solution, &block.indices);
+        let Some(block) = self.blocks.get(block_id) else {
+            return Err(DecompositionError::InvalidBlocks(format!(
+                "block {block_id} does not exist (there are {} blocks)",
+                self.blocks.len()
+            )));
+        };
+        let indices = block.indices.clone();
+        let block_solution = block_update_fn(&self.current_solution, &indices);
 
-        assert_eq!(
-            block_solution.len(),
-            block.indices.len(),
-            "Block solution size mismatch"
-        );
+        if block_solution.len() != indices.len() {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "block update must return {} values, got {}",
+                indices.len(),
+                block_solution.len()
+            )));
+        }
 
         // Update the solution for this block
         let mut change = 0.0f32;
-        for (i, &idx) in block.indices.iter().enumerate() {
-            let old_val = self.current_solution[idx];
-            let new_val = block_solution[i];
-            self.current_solution[idx] = new_val;
+        for (i, &idx) in indices.iter().enumerate() {
+            let (Some(old_val), Some(&new_val)) = (
+                self.current_solution.get(idx).copied(),
+                block_solution.get(i),
+            ) else {
+                return Err(DecompositionError::InvalidBlocks(format!(
+                    "block index {idx} exceeds the solution dimension {}",
+                    self.current_solution.len()
+                )));
+            };
+            if let Some(slot) = self.current_solution.get_mut(idx) {
+                *slot = new_val;
+            }
             change += (new_val - old_val).powi(2);
         }
 
-        change.sqrt()
+        Ok(change.sqrt())
     }
 
     /// Get current solution
@@ -377,14 +463,26 @@ impl DualDecomposition {
     }
 
     /// Update dual variables using subgradient method
-    pub fn update_duals(&mut self, constraint_violations: &Array1<f32>) {
-        assert_eq!(constraint_violations.len(), self.dual_vars.len());
+    ///
+    /// # Errors
+    ///
+    /// [`DecompositionError::IncompatibleStructure`] when the violation vector
+    /// does not have one entry per coupling constraint.
+    pub fn update_duals(&mut self, constraint_violations: &Array1<f32>) -> DecompositionResult<()> {
+        if constraint_violations.len() != self.dual_vars.len() {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "violation vector must have {} entries, got {}",
+                self.dual_vars.len(),
+                constraint_violations.len()
+            )));
+        }
 
         // Dual ascent: λ := λ + α·g(x) where g(x) is the constraint violation
-        for i in 0..self.dual_vars.len() {
-            self.dual_vars[i] =
-                (self.dual_vars[i] + self.step_size * constraint_violations[i]).max(0.0);
+        let step_size = self.step_size;
+        for (dual, &violation) in self.dual_vars.iter_mut().zip(constraint_violations.iter()) {
+            *dual = (*dual + step_size * violation).max(0.0);
         }
+        Ok(())
     }
 
     /// Get current dual variables
@@ -393,24 +491,40 @@ impl DualDecomposition {
     }
 
     /// Compute augmented cost for subproblem i
+    ///
+    /// # Errors
+    ///
+    /// [`DecompositionError::InvalidBlocks`] when `subproblem_id` is out of
+    /// range for the configured coupling matrix.
     pub fn augmented_cost(
         &self,
         subproblem_id: usize,
         base_cost: f32,
         local_vars: &Array1<f32>,
-    ) -> f32 {
-        assert!(subproblem_id < self.num_subproblems);
+    ) -> DecompositionResult<f32> {
+        if subproblem_id >= self.num_subproblems || subproblem_id >= self.coupling_matrix.ncols() {
+            return Err(DecompositionError::InvalidBlocks(format!(
+                "subproblem {subproblem_id} does not exist (there are {} subproblems, \
+                 coupling matrix has {} columns)",
+                self.num_subproblems,
+                self.coupling_matrix.ncols()
+            )));
+        }
 
         // Add dual contribution: f(x) + λᵀAx
         let mut augmented = base_cost;
         for (i, &dual) in self.dual_vars.iter().enumerate() {
-            let coupling_coeff = self.coupling_matrix[[i, subproblem_id]];
-            if let Some(&var_val) = local_vars.get(0) {
+            let coupling_coeff = self
+                .coupling_matrix
+                .get((i, subproblem_id))
+                .copied()
+                .unwrap_or(0.0);
+            if let Some(&var_val) = local_vars.first() {
                 augmented += dual * coupling_coeff * var_val;
             }
         }
 
-        augmented
+        Ok(augmented)
     }
 }
 
@@ -544,8 +658,27 @@ pub mod block_utils {
     }
 
     /// Create overlapping blocks with specified overlap
-    pub fn overlapping_blocks(dimension: usize, block_size: usize, overlap: usize) -> Vec<Block> {
-        assert!(overlap < block_size, "Overlap must be less than block size");
+    ///
+    /// # Errors
+    ///
+    /// [`DecompositionError::InvalidBlocks`] when `block_size` is zero or the
+    /// overlap is not strictly smaller than the block size (either would make
+    /// the stride zero and never terminate).
+    pub fn overlapping_blocks(
+        dimension: usize,
+        block_size: usize,
+        overlap: usize,
+    ) -> DecompositionResult<Vec<Block>> {
+        if block_size == 0 {
+            return Err(DecompositionError::InvalidBlocks(
+                "block size must be at least 1".to_string(),
+            ));
+        }
+        if overlap >= block_size {
+            return Err(DecompositionError::InvalidBlocks(format!(
+                "overlap ({overlap}) must be smaller than the block size ({block_size})"
+            )));
+        }
 
         let stride = block_size - overlap;
         let mut blocks = Vec::new();
@@ -558,7 +691,7 @@ pub mod block_utils {
             start += stride;
         }
 
-        blocks
+        Ok(blocks)
     }
 }
 
@@ -566,27 +699,42 @@ pub mod block_utils {
 // Benders Decomposition
 // ============================================================================
 
-/// Benders Decomposition for mixed-integer programming
+/// Benders Decomposition for two-stage linear programs
 ///
 /// Decomposes problems of the form:
 /// ```text
 /// min c'x + d'y
 /// s.t. Ax + By >= b
-///      x binary/integer, y continuous
+///      lo <= x <= hi,  y >= 0
 /// ```
 ///
 /// Into:
-/// - Master problem: involves only x (integer variables)
-/// - Subproblem: involves only y given fixed x
+/// - Master problem: involves only `x`, plus the Benders cuts accumulated so far
+/// - Subproblem: involves only `y`, for a fixed `x`
 ///
 /// # Algorithm
 ///
-/// 1. Solve relaxed master problem → get x*
-/// 2. Solve subproblem with fixed x* → get dual variables
-/// 3. Add Benders cut to master based on dual values
-/// 4. Repeat until convergence
+/// 1. Solve the relaxed master problem → get x*
+/// 2. Solve the subproblem with fixed x* → get its dual variables (or, when it
+///    is infeasible, a Farkas extreme ray)
+/// 3. Add the corresponding optimality/feasibility cut to the master
+/// 4. Repeat until the bound gap closes
+///
+/// Both stages are solved by the crate's own dense two-phase simplex, so the
+/// duals used to build cuts are real multipliers and are checked for dual
+/// feasibility before a cut is generated.
+///
+/// # Integrality is not enforced
+///
+/// The master problem is solved as a **continuous** LP over the box
+/// `[lo, hi]` — by default `[0, 1]`, the binary relaxation — together with the
+/// accumulated cuts. Integer restrictions are *not* imposed; enforcing them
+/// requires branch-and-bound around this loop, which this crate does not
+/// provide. The reported `lower_bound` is therefore the LP-relaxation bound of
+/// the two-stage problem, and it is exact for problems whose master variables
+/// are genuinely continuous.
 pub struct BendersDecomposition {
-    /// Number of master variables (integer/binary)
+    /// Number of master variables (first stage)
     num_master_vars: usize,
     /// Number of subproblem variables (continuous)
     num_sub_vars: usize,
@@ -598,6 +746,24 @@ pub struct BendersDecomposition {
     lower_bound: f32,
     /// Current upper bound
     upper_bound: f32,
+    /// Lower box bound of the master variables
+    master_lower: Array1<f32>,
+    /// Upper box bound of the master variables
+    master_upper: Array1<f32>,
+}
+
+/// Solution of a Benders subproblem
+#[derive(Debug, Clone)]
+pub struct BendersSubproblemSolution {
+    /// Optimal subproblem objective `d'y` (`+∞` when infeasible)
+    pub objective: f32,
+    /// Optimal subproblem variables `y` (all zeros when infeasible)
+    pub primal: Array1<f32>,
+    /// Dual multipliers of `By >= b - Ax`, or the Farkas extreme ray when the
+    /// subproblem is infeasible
+    pub dual: Array1<f32>,
+    /// Whether the subproblem admitted a feasible `y`
+    pub is_feasible: bool,
 }
 
 /// Configuration for Benders decomposition
@@ -651,6 +817,9 @@ pub enum BendersCut {
 
 impl BendersDecomposition {
     /// Create a new Benders decomposition
+    ///
+    /// Master variables default to the box `[0, 1]` (the binary relaxation);
+    /// use [`Self::with_master_bounds`] for a different first-stage domain.
     pub fn new(num_master_vars: usize, num_sub_vars: usize) -> Self {
         Self {
             num_master_vars,
@@ -659,6 +828,8 @@ impl BendersDecomposition {
             config: BendersConfig::default(),
             lower_bound: f32::NEG_INFINITY,
             upper_bound: f32::INFINITY,
+            master_lower: Array1::zeros(num_master_vars),
+            master_upper: Array1::from_elem(num_master_vars, 1.0),
         }
     }
 
@@ -666,6 +837,42 @@ impl BendersDecomposition {
     pub fn with_config(mut self, config: BendersConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Set the box bounds of the master variables
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecompositionError::IncompatibleStructure`] when the vectors
+    /// do not have `num_master_vars` entries or when some `lower[i] > upper[i]`.
+    pub fn with_master_bounds(
+        mut self,
+        lower: Array1<f32>,
+        upper: Array1<f32>,
+    ) -> DecompositionResult<Self> {
+        if lower.len() != self.num_master_vars || upper.len() != self.num_master_vars {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "master bounds must have {} entries, got {} and {}",
+                self.num_master_vars,
+                lower.len(),
+                upper.len()
+            )));
+        }
+        for (index, (lo, hi)) in lower.iter().zip(upper.iter()).enumerate() {
+            if lo > hi {
+                return Err(DecompositionError::IncompatibleStructure(format!(
+                    "master bound {index} is empty: lower {lo} exceeds upper {hi}"
+                )));
+            }
+        }
+        self.master_lower = lower;
+        self.master_upper = upper;
+        Ok(self)
+    }
+
+    /// Current master variable bounds `(lower, upper)`
+    pub fn master_bounds(&self) -> (&Array1<f32>, &Array1<f32>) {
+        (&self.master_lower, &self.master_upper)
     }
 
     /// Add an optimality cut
@@ -705,27 +912,89 @@ impl BendersDecomposition {
         });
     }
 
-    /// Solve master problem (to be implemented with external solver)
+    /// Solve the master problem
     ///
-    /// Returns the master solution and lower bound
+    /// Minimises `c'x + θ` over the master box bounds subject to every
+    /// accumulated cut:
+    ///
+    /// ```text
+    /// θ >= constant_k + coefficients_k · x     (optimality cuts)
+    /// 0 <= constant_j + coefficients_j · x     (feasibility cuts)
+    /// lo <= x <= hi
+    /// ```
+    ///
+    /// The LP is solved by the crate's dense two-phase simplex. When no
+    /// optimality cut has been generated yet, `θ` is unconstrained from below,
+    /// so the returned lower bound is `-∞` (the master carries no information
+    /// about the recourse cost yet) and only `c'x` is minimised.
+    ///
+    /// Returns the master solution and the corresponding lower bound.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecompositionError::IncompatibleStructure`] when there are no master
+    ///   variables, `objective` has the wrong length, or the accumulated
+    ///   feasibility cuts leave no feasible `x`.
+    /// * [`DecompositionError::NumericalIssue`] when the LP is unbounded or the
+    ///   simplex cannot produce consistent multipliers.
     pub fn solve_master(&self, objective: &Array1<f32>) -> DecompositionResult<(Array1<f32>, f32)> {
-        // Simplified master problem: minimize c'x + θ
-        // subject to Benders cuts
-        //
-        // In practice, this would call an MILP solver
-        // For now, we return a simple relaxation
-
         if self.num_master_vars == 0 {
             return Err(DecompositionError::IncompatibleStructure(
                 "No master variables".to_string(),
             ));
         }
+        if objective.len() != self.num_master_vars {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "master objective must have {} entries, got {}",
+                self.num_master_vars,
+                objective.len()
+            )));
+        }
 
-        // Simple heuristic: round to nearest feasible integer
-        let mut x = Array1::zeros(self.num_master_vars);
+        let n = self.num_master_vars;
+        let lower: Vec<f64> = self.master_lower.iter().map(|&v| v as f64).collect();
+        let width: Vec<f64> = self
+            .master_lower
+            .iter()
+            .zip(self.master_upper.iter())
+            .map(|(&lo, &hi)| (hi - lo) as f64)
+            .collect();
 
-        // Estimate lower bound from cuts
-        let mut theta = f32::NEG_INFINITY;
+        let has_theta = self
+            .cuts
+            .iter()
+            .any(|cut| matches!(cut, BendersCut::Optimality { .. }));
+
+        // Shifted variables x' = x - lo >= 0, plus θ = θ⁺ - θ⁻ when needed.
+        let num_vars = if has_theta { n + 2 } else { n };
+        let mut costs = vec![0.0_f64; num_vars];
+        for (j, &value) in objective.iter().enumerate() {
+            if let Some(slot) = costs.get_mut(j) {
+                *slot = value as f64;
+            }
+        }
+        if has_theta {
+            if let Some(slot) = costs.get_mut(n) {
+                *slot = 1.0;
+            }
+            if let Some(slot) = costs.get_mut(n + 1) {
+                *slot = -1.0;
+            }
+        }
+
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        let mut rhs: Vec<f64> = Vec::new();
+
+        // Upper bounds: -x'_j >= -(hi_j - lo_j)
+        for (j, &span) in width.iter().enumerate() {
+            let mut row = vec![0.0_f64; num_vars];
+            if let Some(slot) = row.get_mut(j) {
+                *slot = -1.0;
+            }
+            rows.push(row);
+            rhs.push(-span);
+        }
+
         for cut in &self.cuts {
             match cut {
                 BendersCut::Optimality {
@@ -733,132 +1002,297 @@ impl BendersDecomposition {
                     coefficients,
                     ..
                 } => {
-                    let cut_value = constant + coefficients.dot(&x);
-                    theta = theta.max(cut_value);
+                    // θ - coefficients·x' >= constant + coefficients·lo
+                    let mut row = vec![0.0_f64; num_vars];
+                    let mut shift = 0.0_f64;
+                    for j in 0..n {
+                        let coefficient = coefficients.get(j).copied().unwrap_or(0.0) as f64;
+                        if let Some(slot) = row.get_mut(j) {
+                            *slot = -coefficient;
+                        }
+                        shift += coefficient * lower.get(j).copied().unwrap_or(0.0);
+                    }
+                    if let Some(slot) = row.get_mut(n) {
+                        *slot = 1.0;
+                    }
+                    if let Some(slot) = row.get_mut(n + 1) {
+                        *slot = -1.0;
+                    }
+                    rows.push(row);
+                    rhs.push(*constant as f64 + shift);
                 }
                 BendersCut::Feasibility {
                     constant,
                     coefficients,
                     ..
                 } => {
-                    // Ensure feasibility cut: constant + c·x ≥ 0
-                    let cut_value = *constant + coefficients.dot(&x);
-                    if cut_value < 0.0 {
-                        // Minimum-norm projected gradient step to satisfy the cut.
-                        // x' = x + α·c / ||c||²  where α = -cut_value + margin
-                        let c_sq_norm: f32 = coefficients.dot(coefficients);
-                        if c_sq_norm > 1e-12 {
-                            let alpha = (-cut_value + 1e-6) / c_sq_norm;
-                            x = &x + &(coefficients * alpha);
+                    // coefficients·x' >= -constant - coefficients·lo
+                    let mut row = vec![0.0_f64; num_vars];
+                    let mut shift = 0.0_f64;
+                    for j in 0..n {
+                        let coefficient = coefficients.get(j).copied().unwrap_or(0.0) as f64;
+                        if let Some(slot) = row.get_mut(j) {
+                            *slot = coefficient;
                         }
-                        // If c_sq_norm ≈ 0, the cut has zero gradient — cannot adjust; leave x unchanged.
+                        shift += coefficient * lower.get(j).copied().unwrap_or(0.0);
                     }
+                    rows.push(row);
+                    rhs.push(-(*constant as f64) - shift);
                 }
             }
         }
 
-        let lower_bound = objective.dot(&x) + theta;
-        Ok((x, lower_bound))
+        let simplex_budget = simplex_budget(num_vars, rows.len());
+        match solve_ge_lp(&costs, &rows, &rhs, simplex_budget) {
+            LpOutcome::Optimal {
+                primal,
+                objective: lp_objective,
+                ..
+            } => {
+                let x: Array1<f32> = (0..n)
+                    .map(|j| {
+                        (lower.get(j).copied().unwrap_or(0.0)
+                            + primal.get(j).copied().unwrap_or(0.0)) as f32
+                    })
+                    .collect::<Vec<f32>>()
+                    .into();
+
+                let lower_bound = if has_theta {
+                    let shift: f64 = (0..n)
+                        .map(|j| {
+                            objective.get(j).copied().unwrap_or(0.0) as f64
+                                * lower.get(j).copied().unwrap_or(0.0)
+                        })
+                        .sum();
+                    (lp_objective + shift) as f32
+                } else {
+                    // No optimality cut yet: θ is unbounded below, so the master
+                    // provides no finite lower bound.
+                    f32::NEG_INFINITY
+                };
+
+                Ok((x, lower_bound))
+            }
+            LpOutcome::Infeasible { .. } => Err(DecompositionError::IncompatibleStructure(
+                "master problem is infeasible: the accumulated feasibility cuts and the master \
+                 bounds have no common point"
+                    .to_string(),
+            )),
+            LpOutcome::Unbounded => Err(DecompositionError::NumericalIssue(
+                "master problem is unbounded below; tighten the master bounds".to_string(),
+            )),
+            LpOutcome::IterationLimit => Err(DecompositionError::NumericalIssue(
+                "master LP exhausted the simplex iteration budget".to_string(),
+            )),
+            LpOutcome::NumericalFailure(reason) => Err(DecompositionError::NumericalIssue(
+                format!("master LP failed: {reason}"),
+            )),
+        }
     }
 
-    /// Solve subproblem given master solution
+    /// Solve the subproblem for a fixed master solution
     ///
-    /// Returns (objective value, dual variables, feasible flag)
+    /// Solves `min d'y  s.t.  By >= b - Ax*,  y >= 0` with the crate's dense
+    /// two-phase simplex, where `A` is `master_coupling` and `B` is
+    /// `sub_coupling`.
+    ///
+    /// When the subproblem is feasible the returned `dual` holds genuine
+    /// multipliers of `By >= b - Ax*` (checked against `B'π <= d`, `π >= 0`).
+    /// When it is infeasible, `is_feasible` is `false` and `dual` holds a
+    /// Farkas extreme ray (`π >= 0`, `B'π <= 0`, `π'(b - Ax*) > 0`) suitable
+    /// for a feasibility cut.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecompositionError::IncompatibleStructure`] on any shape mismatch.
+    /// * [`DecompositionError::NumericalIssue`] when the subproblem objective
+    ///   is unbounded below, or the simplex cannot produce consistent
+    ///   multipliers.
     pub fn solve_subproblem(
         &self,
         master_solution: &Array1<f32>,
         sub_objective: &Array1<f32>,
-        coupling_matrix: &Array2<f32>,
+        master_coupling: &Array2<f32>,
+        sub_coupling: &Array2<f32>,
         rhs: &Array1<f32>,
-    ) -> DecompositionResult<(f32, Array1<f32>, bool)> {
-        // Solve: min d'y
-        //        s.t. By >= b - Ax*
-        //
-        // where x* is the fixed master solution
-        // Returns (objective, dual variables, is_feasible)
+    ) -> DecompositionResult<BendersSubproblemSolution> {
+        let (n_constraints, n_sub_vars) = sub_coupling.dim();
+        let (n_master_rows, n_master_cols) = master_coupling.dim();
 
-        let (n_constraints, n_vars) = coupling_matrix.dim();
-
-        if n_vars != self.num_sub_vars {
-            return Err(DecompositionError::IncompatibleStructure(
-                "Subproblem dimension mismatch".to_string(),
-            ));
+        if n_sub_vars != self.num_sub_vars {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "sub coupling matrix must have {} columns, got {}",
+                self.num_sub_vars, n_sub_vars
+            )));
+        }
+        if n_master_cols != self.num_master_vars {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "master coupling matrix must have {} columns, got {}",
+                self.num_master_vars, n_master_cols
+            )));
+        }
+        if n_master_rows != n_constraints {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "coupling matrices disagree on the constraint count: {n_master_rows} vs {n_constraints}"
+            )));
+        }
+        if rhs.len() != n_constraints {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "right-hand side must have {n_constraints} entries, got {}",
+                rhs.len()
+            )));
+        }
+        if master_solution.len() != self.num_master_vars {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "master solution must have {} entries, got {}",
+                self.num_master_vars,
+                master_solution.len()
+            )));
+        }
+        if sub_objective.len() != self.num_sub_vars {
+            return Err(DecompositionError::IncompatibleStructure(format!(
+                "sub objective must have {} entries, got {}",
+                self.num_sub_vars,
+                sub_objective.len()
+            )));
         }
 
-        // Compute adjusted RHS: b - Ax*
-        let _adjusted_rhs = if !master_solution.is_empty() {
-            // For simplification, assume we have the master coupling part
-            rhs.clone()
-        } else {
-            rhs.clone()
-        };
+        // Adjusted right-hand side: b - Ax*
+        let adjusted: Vec<f64> = (0..n_constraints)
+            .map(|i| {
+                let coupled: f64 = (0..self.num_master_vars)
+                    .map(|j| {
+                        master_coupling.get((i, j)).copied().unwrap_or(0.0) as f64
+                            * master_solution.get(j).copied().unwrap_or(0.0) as f64
+                    })
+                    .sum();
+                rhs.get(i).copied().unwrap_or(0.0) as f64 - coupled
+            })
+            .collect();
 
-        // Simplified LP solve (in practice, use OSQP or other LP solver)
-        // For now, return a feasible solution with dual values
+        let matrix: Vec<Vec<f64>> = (0..n_constraints)
+            .map(|i| {
+                (0..n_sub_vars)
+                    .map(|j| sub_coupling.get((i, j)).copied().unwrap_or(0.0) as f64)
+                    .collect()
+            })
+            .collect();
+        let costs: Vec<f64> = sub_objective.iter().map(|&v| v as f64).collect();
 
-        let y = Array1::from_elem(n_vars, 0.5);
-        let dual = Array1::from_elem(n_constraints, 1.0);
-        let obj_value = sub_objective.dot(&y);
-
-        Ok((obj_value, dual, true))
+        let budget = simplex_budget(n_sub_vars, n_constraints);
+        match solve_ge_lp(&costs, &matrix, &adjusted, budget) {
+            LpOutcome::Optimal {
+                primal,
+                dual,
+                objective,
+            } => Ok(BendersSubproblemSolution {
+                objective: objective as f32,
+                primal: to_f32_array(&primal),
+                dual: to_f32_array(&dual),
+                is_feasible: true,
+            }),
+            LpOutcome::Infeasible { farkas } => Ok(BendersSubproblemSolution {
+                objective: f32::INFINITY,
+                primal: Array1::zeros(self.num_sub_vars),
+                dual: to_f32_array(&farkas),
+                is_feasible: false,
+            }),
+            LpOutcome::Unbounded => Err(DecompositionError::NumericalIssue(
+                "subproblem objective is unbounded below for this master solution".to_string(),
+            )),
+            LpOutcome::IterationLimit => Err(DecompositionError::NumericalIssue(
+                "subproblem LP exhausted the simplex iteration budget".to_string(),
+            )),
+            LpOutcome::NumericalFailure(reason) => Err(DecompositionError::NumericalIssue(
+                format!("subproblem LP failed: {reason}"),
+            )),
+        }
     }
 
-    /// Main Benders iteration
+    /// Run the Benders loop until the bound gap closes
+    ///
+    /// `master_coupling` is `A` and `sub_coupling` is `B` in
+    /// `Ax + By >= rhs`. Cuts are derived from the subproblem's real
+    /// multipliers:
+    ///
+    /// ```text
+    /// optimality:  θ >= π'b - (A'π)·x
+    /// feasibility: (A'r)·x - r'b >= 0
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`DecompositionError::ConvergenceFailed`] when `config.max_iterations`
+    ///   is exhausted before the gap closes.
+    /// * Any error surfaced by [`Self::solve_master`] or
+    ///   [`Self::solve_subproblem`].
     pub fn iterate(
         &mut self,
         master_obj: &Array1<f32>,
         sub_obj: &Array1<f32>,
-        coupling: &Array2<f32>,
+        master_coupling: &Array2<f32>,
+        sub_coupling: &Array2<f32>,
         rhs: &Array1<f32>,
     ) -> DecompositionResult<BendersIterationResult> {
         let mut iteration = 0;
+        let mut incumbent: Option<(Array1<f32>, Array1<f32>)> = None;
+        let mut incumbent_value = f32::INFINITY;
 
         loop {
             iteration += 1;
 
             if iteration > self.config.max_iterations {
                 return Err(DecompositionError::ConvergenceFailed {
-                    iterations: iteration,
+                    iterations: iteration - 1,
                     residual: self.upper_bound - self.lower_bound,
                 });
             }
 
-            // Step 1: Solve master problem
+            // Step 1: Solve the master problem
             let (master_sol, lower_bound) = self.solve_master(master_obj)?;
             self.lower_bound = lower_bound;
 
-            // Step 2: Solve subproblem
-            let (sub_obj_value, dual, is_feasible) =
-                self.solve_subproblem(&master_sol, sub_obj, coupling, rhs)?;
+            // Step 2: Solve the subproblem for this master solution
+            let sub =
+                self.solve_subproblem(&master_sol, sub_obj, master_coupling, sub_coupling, rhs)?;
 
-            // Step 3: Update upper bound
-            let master_obj_value = master_obj.dot(&master_sol);
-            let total_obj = master_obj_value + sub_obj_value;
-            self.upper_bound = self.upper_bound.min(total_obj);
+            if sub.is_feasible {
+                // Step 3: Update the incumbent and the upper bound
+                let total = master_obj.dot(&master_sol) + sub.objective;
+                if total < incumbent_value {
+                    incumbent_value = total;
+                    incumbent = Some((master_sol.clone(), sub.primal.clone()));
+                }
+                if total < self.upper_bound {
+                    self.upper_bound = total;
+                }
 
-            // Step 4: Check convergence
-            let gap = self.upper_bound - self.lower_bound;
-            if gap < self.config.tolerance {
-                return Ok(BendersIterationResult {
-                    master_solution: master_sol,
-                    sub_solution: Array1::zeros(self.num_sub_vars), // Would be from subproblem
-                    lower_bound: self.lower_bound,
-                    upper_bound: self.upper_bound,
-                    iterations: iteration,
-                    converged: true,
-                });
-            }
+                // Step 4: Check convergence
+                let gap = self.upper_bound - self.lower_bound;
+                if self.lower_bound.is_finite()
+                    && self.upper_bound.is_finite()
+                    && gap < self.config.tolerance
+                {
+                    let (best_master, best_sub) = incumbent.unwrap_or((master_sol, sub.primal));
+                    return Ok(BendersIterationResult {
+                        master_solution: best_master,
+                        sub_solution: best_sub,
+                        lower_bound: self.lower_bound,
+                        upper_bound: self.upper_bound,
+                        iterations: iteration,
+                        converged: true,
+                    });
+                }
 
-            // Step 5: Generate and add cut
-            if !is_feasible {
-                // Add feasibility cut (using extreme ray)
-                let coefficients = Array1::zeros(self.num_master_vars);
-                self.add_feasibility_cut(dual.clone(), 0.0, coefficients);
+                // Step 5: Optimality cut  θ >= π'b - (A'π)·x
+                let constant = dot_f32(&sub.dual, rhs);
+                let coefficients = transpose_dot(master_coupling, &sub.dual, self.num_master_vars);
+                self.add_optimality_cut(sub.dual, constant, -coefficients);
             } else {
-                // Add optimality cut
-                let coefficients = Array1::zeros(self.num_master_vars);
-                let constant = sub_obj_value;
-                self.add_optimality_cut(dual, constant, coefficients);
+                // Step 5': Feasibility cut  (A'r)·x - r'b >= 0
+                let constant = -dot_f32(&sub.dual, rhs);
+                let coefficients = transpose_dot(master_coupling, &sub.dual, self.num_master_vars);
+                self.add_feasibility_cut(sub.dual, constant, coefficients);
             }
         }
     }
@@ -963,7 +1397,7 @@ mod tests {
         let mut admm = ConsensusADMM::new(3, 5, config);
 
         let x0 = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-        admm.initialize(&x0);
+        admm.initialize(&x0).expect("matching dimension");
 
         assert_eq!(admm.solution(), &x0);
     }
@@ -999,7 +1433,7 @@ mod tests {
 
     #[test]
     fn test_overlapping_blocks() {
-        let blocks = block_utils::overlapping_blocks(10, 4, 1);
+        let blocks = block_utils::overlapping_blocks(10, 4, 1).expect("valid overlap");
         assert!(blocks.len() > 3);
 
         // Check first two blocks overlap
@@ -1112,6 +1546,271 @@ mod tests {
             "Cut B must be satisfied; cut_value_b = {}",
             cut_value_b
         );
+    }
+
+    /// Regression (finding 125/298): `iterate` must reach the *known* optimum
+    /// of a small two-stage LP instead of reporting fabricated convergence.
+    ///
+    /// Problem: min x + 2y  s.t.  x + y >= 1,  x ∈ [0, 1],  y >= 0.
+    /// Optimum: x = 1, y = 0, objective 1.
+    #[test]
+    fn test_benders_reaches_known_optimum() {
+        let mut benders = BendersDecomposition::new(1, 1);
+
+        let master_obj = Array1::from_vec(vec![1.0_f32]);
+        let sub_obj = Array1::from_vec(vec![2.0_f32]);
+        let master_coupling = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("A");
+        let sub_coupling = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("B");
+        let rhs = Array1::from_vec(vec![1.0_f32]);
+
+        let result = benders
+            .iterate(&master_obj, &sub_obj, &master_coupling, &sub_coupling, &rhs)
+            .expect("benders must converge");
+
+        assert!(result.converged);
+        assert!(
+            (result.master_solution[0] - 1.0).abs() < 1e-3,
+            "x* should be 1.0, got {}",
+            result.master_solution[0]
+        );
+        assert!(
+            result.sub_solution[0].abs() < 1e-3,
+            "y* should be 0.0, got {}",
+            result.sub_solution[0]
+        );
+        assert!(
+            (result.upper_bound - 1.0).abs() < 1e-3,
+            "optimal value should be 1.0, got {}",
+            result.upper_bound
+        );
+        assert!(
+            result.gap().abs() < 1e-3,
+            "converged gap must be ~0, got {}",
+            result.gap()
+        );
+    }
+
+    /// Regression (finding 125/298): the optimum must depend on the data.
+    ///
+    /// Same structure, but recourse is now cheaper than the first stage:
+    /// min 3x + y  s.t. x + y >= 1 → x = 0, y = 1, objective 1.
+    #[test]
+    fn test_benders_optimum_follows_the_cost_data() {
+        let mut benders = BendersDecomposition::new(1, 1);
+
+        let master_obj = Array1::from_vec(vec![3.0_f32]);
+        let sub_obj = Array1::from_vec(vec![1.0_f32]);
+        let master_coupling = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("A");
+        let sub_coupling = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("B");
+        let rhs = Array1::from_vec(vec![1.0_f32]);
+
+        let result = benders
+            .iterate(&master_obj, &sub_obj, &master_coupling, &sub_coupling, &rhs)
+            .expect("benders must converge");
+
+        assert!(result.converged);
+        assert!(
+            result.master_solution[0].abs() < 1e-3,
+            "x* should stay at 0.0, got {}",
+            result.master_solution[0]
+        );
+        assert!(
+            (result.sub_solution[0] - 1.0).abs() < 1e-3,
+            "y* should be 1.0, got {}",
+            result.sub_solution[0]
+        );
+        assert!((result.upper_bound - 1.0).abs() < 1e-3);
+    }
+
+    /// Regression (finding 125/298): an infeasible subproblem must be detected
+    /// (the old code hardcoded `is_feasible = true`, so feasibility cuts were
+    /// dead code).
+    #[test]
+    fn test_benders_detects_infeasible_subproblem() {
+        let benders = BendersDecomposition::new(1, 1);
+
+        // Subproblem: -y >= 1 - x with y >= 0. At x = 0 this needs y <= -1.
+        let sub_obj = Array1::from_vec(vec![1.0_f32]);
+        let master_coupling = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("A");
+        let sub_coupling = Array2::from_shape_vec((1, 1), vec![-1.0_f32]).expect("B");
+        let rhs = Array1::from_vec(vec![1.0_f32]);
+
+        let infeasible = benders
+            .solve_subproblem(
+                &Array1::from_vec(vec![0.0_f32]),
+                &sub_obj,
+                &master_coupling,
+                &sub_coupling,
+                &rhs,
+            )
+            .expect("solve must not error");
+        assert!(
+            !infeasible.is_feasible,
+            "subproblem at x=0 must be reported infeasible"
+        );
+        assert!(
+            infeasible.dual[0] > 0.0,
+            "an extreme ray must be returned, got {:?}",
+            infeasible.dual
+        );
+
+        // At x = 1 the adjusted right-hand side is 0 and y = 0 is feasible.
+        let feasible = benders
+            .solve_subproblem(
+                &Array1::from_vec(vec![1.0_f32]),
+                &sub_obj,
+                &master_coupling,
+                &sub_coupling,
+                &rhs,
+            )
+            .expect("solve must not error");
+        assert!(feasible.is_feasible, "subproblem at x=1 must be feasible");
+    }
+
+    /// Regression (finding 125/298): the full loop must generate a feasibility
+    /// cut and still converge for a problem whose first iterate is infeasible.
+    #[test]
+    fn test_benders_generates_feasibility_cut() {
+        let mut benders = BendersDecomposition::new(1, 1);
+
+        let master_obj = Array1::from_vec(vec![1.0_f32]);
+        let sub_obj = Array1::from_vec(vec![1.0_f32]);
+        let master_coupling = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("A");
+        let sub_coupling = Array2::from_shape_vec((1, 1), vec![-1.0_f32]).expect("B");
+        let rhs = Array1::from_vec(vec![1.0_f32]);
+
+        let result = benders
+            .iterate(&master_obj, &sub_obj, &master_coupling, &sub_coupling, &rhs)
+            .expect("benders must converge");
+
+        assert!(result.converged);
+        assert!(
+            (result.master_solution[0] - 1.0).abs() < 1e-3,
+            "the feasibility cut forces x >= 1, got {}",
+            result.master_solution[0]
+        );
+        assert!(
+            benders
+                .cuts()
+                .iter()
+                .any(|cut| matches!(cut, BendersCut::Feasibility { .. })),
+            "an infeasible subproblem must produce a feasibility cut"
+        );
+    }
+
+    /// Regression (finding 125/298): the subproblem must actually read its
+    /// inputs — the old version returned `y = 0.5`, `dual = 1.0` for every
+    /// input.
+    #[test]
+    fn test_benders_subproblem_depends_on_master_solution() {
+        let benders = BendersDecomposition::new(1, 1);
+
+        let sub_obj = Array1::from_vec(vec![2.0_f32]);
+        let master_coupling = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("A");
+        let sub_coupling = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("B");
+        let rhs = Array1::from_vec(vec![4.0_f32]);
+
+        let at_zero = benders
+            .solve_subproblem(
+                &Array1::from_vec(vec![0.0_f32]),
+                &sub_obj,
+                &master_coupling,
+                &sub_coupling,
+                &rhs,
+            )
+            .expect("solve at x=0");
+        let at_one = benders
+            .solve_subproblem(
+                &Array1::from_vec(vec![1.0_f32]),
+                &sub_obj,
+                &master_coupling,
+                &sub_coupling,
+                &rhs,
+            )
+            .expect("solve at x=1");
+
+        // y >= 4 - x, so y* = 4 and 3, objectives 8 and 6.
+        assert!((at_zero.primal[0] - 4.0).abs() < 1e-4, "{:?}", at_zero);
+        assert!((at_zero.objective - 8.0).abs() < 1e-4, "{:?}", at_zero);
+        assert!((at_one.primal[0] - 3.0).abs() < 1e-4, "{:?}", at_one);
+        assert!((at_one.objective - 6.0).abs() < 1e-4, "{:?}", at_one);
+        // Dual of a binding y >= r row with cost 2 is exactly 2.
+        assert!((at_zero.dual[0] - 2.0).abs() < 1e-4, "{:?}", at_zero);
+    }
+
+    /// Regression (finding 125): a mismatched master objective must return an
+    /// error instead of panicking inside ndarray.
+    #[test]
+    fn test_benders_master_objective_dimension_checked() {
+        let benders = BendersDecomposition::new(3, 2);
+        let result = benders.solve_master(&Array1::from_vec(vec![1.0_f32, 2.0]));
+        assert!(
+            matches!(result, Err(DecompositionError::IncompatibleStructure(_))),
+            "wrong-length objective must be rejected"
+        );
+    }
+
+    /// A multi-variable instance with a non-trivial first stage.
+    ///
+    /// min 1·x0 + 4·x1 + 3·y  s.t. x0 + x1 + y >= 1, x ∈ [0, 1]², y >= 0.
+    /// Optimum: x0 = 1 (cheapest), objective 1.
+    #[test]
+    fn test_benders_multi_variable_optimum() {
+        let mut benders = BendersDecomposition::new(2, 1);
+
+        let master_obj = Array1::from_vec(vec![1.0_f32, 4.0]);
+        let sub_obj = Array1::from_vec(vec![3.0_f32]);
+        let master_coupling = Array2::from_shape_vec((1, 2), vec![1.0_f32, 1.0]).expect("A");
+        let sub_coupling = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("B");
+        let rhs = Array1::from_vec(vec![1.0_f32]);
+
+        let result = benders
+            .iterate(&master_obj, &sub_obj, &master_coupling, &sub_coupling, &rhs)
+            .expect("benders must converge");
+
+        assert!(result.converged);
+        assert!(
+            (result.upper_bound - 1.0).abs() < 1e-3,
+            "optimum should be 1.0, got {}",
+            result.upper_bound
+        );
+        assert!(
+            (result.master_solution[0] - 1.0).abs() < 1e-3,
+            "the cheap first-stage variable should be used: {:?}",
+            result.master_solution
+        );
+    }
+
+    /// Regression (finding 140): invalid input to these public entry points
+    /// must return a typed error instead of aborting through `assert!`.
+    #[test]
+    fn test_decomposition_entry_points_return_errors() {
+        let mut admm = ConsensusADMM::new(2, 3, ADMMConfig::default());
+        assert!(admm
+            .initialize(&Array1::from_vec(vec![1.0_f32, 2.0]))
+            .is_err());
+
+        let mut bcd = BlockCoordinateDescent::new(vec![Block::new("b", vec![0, 1])], 2)
+            .expect("valid blocks");
+        assert!(bcd.initialize(&Array1::from_vec(vec![1.0_f32])).is_err());
+        assert!(bcd
+            .update_block(7, |_x, indices| Array1::zeros(indices.len()))
+            .is_err());
+        assert!(bcd
+            .update_block(0, |_x, _indices| Array1::zeros(5))
+            .is_err());
+
+        let coupling =
+            Array2::from_shape_vec((2, 2), vec![1.0_f32, 0.0, 0.0, 1.0]).expect("coupling matrix");
+        let mut dual = DualDecomposition::new(2, coupling);
+        assert!(dual.update_duals(&Array1::from_vec(vec![1.0_f32])).is_err());
+        assert!(dual
+            .augmented_cost(9, 0.0, &Array1::from_vec(vec![1.0_f32]))
+            .is_err());
+
+        assert!(block_utils::overlapping_blocks(10, 4, 4).is_err());
+        assert!(block_utils::overlapping_blocks(10, 0, 0).is_err());
+        assert!(block_utils::overlapping_blocks(10, 4, 1).is_ok());
     }
 
     #[test]

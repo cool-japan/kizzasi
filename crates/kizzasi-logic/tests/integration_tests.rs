@@ -101,9 +101,12 @@ fn test_hysteresis_workflow() {
 
 #[test]
 fn test_advanced_constraints_integration() {
-    let chance_constraint = ChanceConstraint::gaussian("temp_chance", 0.95, 25.0, 2.0);
+    let chance_constraint = ChanceConstraint::gaussian("temp_chance", 0.95, 25.0, 2.0)
+        .expect("valid chance constraint");
 
-    let tightened_bound = chance_constraint.get_tightened_bound();
+    let tightened_bound = chance_constraint
+        .get_tightened_bound()
+        .expect("gaussian tightening succeeds");
     assert!(tightened_bound > 25.0);
     assert!(tightened_bound < 30.0);
 
@@ -112,7 +115,8 @@ fn test_advanced_constraints_integration() {
         tightened_bound
     );
 
-    let cvar_constraint = CVaRConstraint::new("risk_limit", 0.05, 100.0, 1000);
+    let cvar_constraint =
+        CVaRConstraint::new("risk_limit", 0.05, 100.0, 1000).expect("valid CVaR constraint");
 
     let losses: Vec<f32> = (0..100)
         .map(|i| if i < 95 { i as f32 } else { (i as f32) * 1.5 })
@@ -134,10 +138,13 @@ fn test_advanced_constraints_integration() {
 #[test]
 fn test_robust_optimization_workflow() {
     let robust_constraint =
-        RobustConstraint::box_uncertain("power_limit", vec![-2.0, -1.0], vec![2.0, 1.0]);
+        RobustConstraint::box_uncertain("power_limit", vec![-2.0, -1.0], vec![2.0, 1.0])
+            .expect("valid robust constraint");
 
     let nominal = vec![5.0, 3.0];
-    let worst_case = robust_constraint.worst_case_scenario(&nominal);
+    let worst_case = robust_constraint
+        .worst_case_scenario(&nominal)
+        .expect("box worst case succeeds");
 
     println!("Nominal: {:?}", nominal);
     println!("Worst-case: {:?}", worst_case);
@@ -147,7 +154,7 @@ fn test_robust_optimization_workflow() {
 
 #[test]
 fn test_differentiable_projection_workflow() {
-    let diff_proj = DifferentiableProjection::new(1.0);
+    let diff_proj = DifferentiableProjection::new(1.0).expect("positive temperature");
 
     let test_values = vec![
         (-5.0f32, 0.0, 10.0),

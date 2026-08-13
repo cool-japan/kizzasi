@@ -164,8 +164,9 @@ proptest! {
         let out1_before = predictor1.step(&input).unwrap();
         let out2_before = predictor2.step(&input).unwrap();
 
-        // They should NOT be the same initially because fork creates new weights
-        // But both should be valid outputs
+        // fork() copies the weights and resets only the recurrent state, so
+        // the fork's first output equals what the parent produced from a
+        // fresh state — not an unrelated randomly-initialised model.
         prop_assert_eq!(out1_before.len(), 3);
         prop_assert_eq!(out2_before.len(), 3);
 

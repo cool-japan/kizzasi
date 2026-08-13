@@ -184,7 +184,8 @@ fn example_geometric_constraints() {
     println!("--- Geometric Set Constraints ---");
 
     // Box constraint: [0, 10] x [0, 5]
-    let safe_region = GeometricSet::box_constraint(vec![0.0, 0.0], vec![10.0, 5.0]);
+    let safe_region =
+        GeometricSet::box_constraint(vec![0.0, 0.0], vec![10.0, 5.0]).expect("valid box set");
 
     println!("  Box: [0,10] x [0,5]");
     println!("  Contains [5, 2]: {}", safe_region.contains(&[5.0, 2.0]));
@@ -195,7 +196,7 @@ fn example_geometric_constraints() {
     println!("  Projected {:?} -> {:?}\n", outside_point, projected);
 
     // Ball constraint: ||x - center|| <= radius
-    let ball = GeometricSet::ball(vec![0.0, 0.0], 5.0);
+    let ball = GeometricSet::ball(vec![0.0, 0.0], 5.0).expect("valid ball set");
 
     println!("  Ball: center=[0,0], radius=5");
     println!("  Contains [3, 0]: {}", ball.contains(&[3.0, 0.0]));
@@ -206,7 +207,7 @@ fn example_geometric_constraints() {
     println!("  Projected {:?} -> {:?}\n", far_point, projected_ball);
 
     // L-infinity ball: max|xi - ci| <= r
-    let linf_ball = GeometricSet::l_inf_ball(vec![0.0, 0.0], 3.0);
+    let linf_ball = GeometricSet::l_inf_ball(vec![0.0, 0.0], 3.0).expect("valid L-inf ball");
 
     println!("  L-inf Ball: center=[0,0], radius=3");
     println!("  Contains [2, 2]: {}", linf_ball.contains(&[2.0, 2.0]));

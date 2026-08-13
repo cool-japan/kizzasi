@@ -15,9 +15,7 @@ default = []
 webgpu = ["dep:wgpu"]
 
 [dependencies]
-# wgpu cannot use `workspace = true` here because workspace deps cannot be optional.
-# The version is kept in sync with the workspace dep `wgpu = { version = "30" }`.
-wgpu = { version = "30", optional = true }
+wgpu = { workspace = true, optional = true }
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

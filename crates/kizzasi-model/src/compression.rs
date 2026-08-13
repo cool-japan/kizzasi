@@ -12,15 +12,26 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use kizzasi_model::compression::{PruningConfig, prune_model};
+//! ```rust
+//! use kizzasi_model::compression::{prune_model, PruningConfig};
+//! use scirs2_core::ndarray::Array2;
+//! use std::collections::HashMap;
 //!
-//! let config = PruningConfig::magnitude_based(0.3); // Prune 30% of weights
-//! let compressed_model = prune_model(&model, &config)?;
+//! let mut weights: HashMap<String, Array2<f32>> = HashMap::new();
+//! weights.insert(
+//!     "layer0.weight".to_string(),
+//!     Array2::from_shape_vec((2, 2), vec![0.01, 5.0, -0.02, 3.0]).unwrap(),
+//! );
+//!
+//! let config = PruningConfig::magnitude_based(0.5); // prune ~50% of weights
+//! let stats = prune_model(&mut weights, &config)?;
+//! assert!(stats.sparsity > 0.0);
+//! # Ok::<(), kizzasi_model::ModelError>(())
 //! ```
 
 use crate::error::{ModelError, ModelResult};
 use scirs2_core::ndarray::{Array1, Array2};
+use scirs2_core::random::{rng, RngExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -231,6 +242,143 @@ pub fn prune_threshold(
     Ok((pruned, mask))
 }
 
+/// Prune every tensor in a model's weight map according to `config`.
+///
+/// This is the entry point the module doc example (and `PruningConfig`'s
+/// builders) advertise: it actually reads `config.strategy`,
+/// `config.global_threshold`, and clamps the effective sparsity to
+/// `[config.min_sparsity, config.max_sparsity]` before pruning, then applies
+/// the result in place and returns aggregate statistics.
+///
+/// # Strategies
+/// - [`PruningStrategy::Magnitude`]: per-tensor threshold via
+///   [`prune_magnitude`], or (when `config.global_threshold` is set) one
+///   threshold computed across every tensor's weights combined, applied
+///   per-tensor via [`prune_threshold`].
+/// - [`PruningStrategy::Random`]: zero a `sparsity` fraction of each
+///   tensor's elements, chosen uniformly at random.
+/// - [`PruningStrategy::Structured`]: zero entire rows (e.g. output
+///   neurons/channels) with the smallest L2 norm, so that a `sparsity`
+///   fraction of *rows* — not scattered individual elements — are removed.
+/// - [`PruningStrategy::Movement`]: not supported here. Movement pruning
+///   scores parameters by how much they moved during fine-tuning, which
+///   requires weight-update history this function's snapshot-only signature
+///   does not have; it returns [`ModelError::UnsupportedOperation`] instead
+///   of silently falling back to a different strategy.
+///
+/// # Errors
+/// Returns an error if `config.sparsity` is outside `[0, 1]`, or if the
+/// strategy is `Movement`.
+pub fn prune_model(
+    weights: &mut HashMap<String, Array2<f32>>,
+    config: &PruningConfig,
+) -> ModelResult<PruningStats> {
+    if !(0.0..=1.0).contains(&config.sparsity) {
+        return Err(ModelError::invalid_config(format!(
+            "Pruning: Sparsity must be between 0 and 1, got {}",
+            config.sparsity
+        )));
+    }
+    let sparsity = config.sparsity.clamp(
+        config.min_sparsity.min(config.max_sparsity),
+        config.max_sparsity,
+    );
+
+    let mut stats = PruningStats::new();
+
+    match config.strategy {
+        PruningStrategy::Magnitude if config.global_threshold => {
+            let mut all_abs: Vec<f32> = weights
+                .values()
+                .flat_map(|w| w.iter().map(|v| v.abs()))
+                .collect();
+            if all_abs.is_empty() {
+                stats.finalize();
+                return Ok(stats);
+            }
+            all_abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let cut = ((all_abs.len() as f32) * sparsity) as usize;
+            let threshold = all_abs[cut.min(all_abs.len() - 1)];
+
+            for (name, w) in weights.iter_mut() {
+                let (pruned, mask) = prune_threshold(w, threshold)?;
+                let pruned_count = mask.iter().filter(|keep| !**keep).count();
+                stats.add_layer(name.clone(), mask.len(), pruned_count);
+                *w = pruned;
+            }
+        }
+        PruningStrategy::Magnitude => {
+            for (name, w) in weights.iter_mut() {
+                let (pruned, mask) = prune_magnitude(w, sparsity)?;
+                let pruned_count = mask.iter().filter(|keep| !**keep).count();
+                stats.add_layer(name.clone(), mask.len(), pruned_count);
+                *w = pruned;
+            }
+        }
+        PruningStrategy::Random => {
+            let mut rng_state = rng();
+            for (name, w) in weights.iter_mut() {
+                let total = w.len();
+                let num_to_prune = (total as f32 * sparsity) as usize;
+                let mut indices: Vec<usize> = (0..total).collect();
+                // Partial Fisher-Yates: only shuffle the prefix we need.
+                for i in 0..num_to_prune.min(total) {
+                    let j = i + (rng_state.random::<u32>() as usize % (total - i));
+                    indices.swap(i, j);
+                }
+                let to_zero: std::collections::HashSet<usize> =
+                    indices[..num_to_prune.min(total)].iter().copied().collect();
+                let mut pruned_count = 0usize;
+                for (idx, v) in w.iter_mut().enumerate() {
+                    if to_zero.contains(&idx) {
+                        *v = 0.0;
+                        pruned_count += 1;
+                    }
+                }
+                stats.add_layer(name.clone(), total, pruned_count);
+            }
+        }
+        PruningStrategy::Structured => {
+            for (name, w) in weights.iter_mut() {
+                let (rows, cols) = w.dim();
+                if rows == 0 || cols == 0 {
+                    stats.add_layer(name.clone(), 0, 0);
+                    continue;
+                }
+                let num_rows_to_prune = ((rows as f32) * sparsity) as usize;
+                let mut row_norms: Vec<(f32, usize)> = (0..rows)
+                    .map(|r| {
+                        let norm_sq: f32 = w.row(r).iter().map(|v| v * v).sum();
+                        (norm_sq.sqrt(), r)
+                    })
+                    .collect();
+                row_norms
+                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+                let mut pruned_count = 0usize;
+                for &(_, r) in row_norms.iter().take(num_rows_to_prune.min(rows)) {
+                    for v in w.row_mut(r).iter_mut() {
+                        *v = 0.0;
+                    }
+                    pruned_count += cols;
+                }
+                stats.add_layer(name.clone(), rows * cols, pruned_count);
+            }
+        }
+        PruningStrategy::Movement => {
+            return Err(ModelError::unsupported_operation(
+                "prune_model",
+                "Movement pruning (requires weight-update history not available \
+                 from a weight-map snapshot; track per-parameter movement scores \
+                 externally and call prune_threshold/prune_magnitude directly)",
+            ));
+        }
+    }
+
+    stats.finalize();
+    Ok(stats)
+}
+
 /// Knowledge distillation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistillationConfig {
@@ -317,6 +465,49 @@ pub fn distillation_loss(
 
     // Scale by temperature squared (as per Hinton et al.)
     Ok(kl_div * temperature * temperature)
+}
+
+/// Compute the combined knowledge-distillation training loss:
+/// `alpha * distillation_loss + task_weight * task_loss`.
+///
+/// [`distillation_loss`] alone only computes the teacher/student KL term; it
+/// takes no ground-truth `targets`, so `config.alpha`/`config.task_weight`
+/// have nothing to weight on their own — this is the function that actually
+/// combines them. The task loss is mean-squared error between the student's
+/// predictions and `targets`, matching this crate's continuous
+/// signal-prediction outputs (rather than assuming a classification
+/// cross-entropy task).
+///
+/// # Errors
+/// Returns an error if `student_logits`/`teacher_logits`/`targets` have
+/// mismatched lengths.
+pub fn combined_distillation_loss(
+    student_logits: &Array1<f32>,
+    teacher_logits: &Array1<f32>,
+    targets: &Array1<f32>,
+    config: &DistillationConfig,
+) -> ModelResult<f32> {
+    let distill = distillation_loss(student_logits, teacher_logits, config.temperature)?;
+
+    if student_logits.len() != targets.len() {
+        return Err(ModelError::dimension_mismatch(
+            "combined distillation loss (task targets)",
+            student_logits.len(),
+            targets.len(),
+        ));
+    }
+    let task_loss: f32 = if student_logits.is_empty() {
+        0.0
+    } else {
+        student_logits
+            .iter()
+            .zip(targets.iter())
+            .map(|(p, t)| (p - t).powi(2))
+            .sum::<f32>()
+            / student_logits.len() as f32
+    };
+
+    Ok(config.alpha * distill + config.task_weight * task_loss)
 }
 
 /// Low-rank factorization configuration
@@ -946,6 +1137,105 @@ mod tests {
         assert_eq!(config.temperature, 5.0);
         assert_eq!(config.alpha, 0.8);
         assert!((config.task_weight - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_combined_distillation_loss_uses_task_weight() {
+        let student = Array1::from_vec(vec![2.0, 1.0, 0.1]);
+        let teacher = Array1::from_vec(vec![2.5, 1.5, 0.5]);
+        let targets = Array1::from_vec(vec![0.0, 0.0, 0.0]);
+
+        let config = DistillationConfig::new(3.0, 0.8); // task_weight = 0.2
+        let combined = combined_distillation_loss(&student, &teacher, &targets, &config)
+            .expect("combined loss should succeed");
+
+        // task_loss = mean((student - 0)^2) = (4 + 1 + 0.01) / 3
+        let task_loss = (2.0f32.powi(2) + 1.0f32.powi(2) + 0.1f32.powi(2)) / 3.0;
+        let distill = distillation_loss(&student, &teacher, 3.0).expect("distill loss");
+        let expected = config.alpha * distill + config.task_weight * task_loss;
+
+        assert!((combined - expected).abs() < 1e-5);
+
+        // task_weight actually changes the result -- regression guard for
+        // the field being read at all.
+        let zero_task_weight = DistillationConfig {
+            task_weight: 0.0,
+            ..config.clone()
+        };
+        let combined_no_task =
+            combined_distillation_loss(&student, &teacher, &targets, &zero_task_weight)
+                .expect("combined loss (no task weight) should succeed");
+        assert!((combined_no_task - config.alpha * distill).abs() < 1e-5);
+        assert!((combined - combined_no_task).abs() > 1e-6);
+    }
+
+    #[test]
+    fn test_prune_model_magnitude_reads_config() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "w".to_string(),
+            Array2::from_shape_vec((2, 2), vec![0.01, -0.02, 5.0, -6.0]).expect("valid shape"),
+        );
+        let config = PruningConfig::magnitude_based(0.5);
+        let stats = prune_model(&mut weights, &config).expect("prune_model should succeed");
+
+        // The two smallest-magnitude elements (0.01, -0.02) must be zeroed;
+        // the two largest (5.0, -6.0) must survive.
+        let w = &weights["w"];
+        assert_eq!(w[[0, 0]], 0.0);
+        assert_eq!(w[[0, 1]], 0.0);
+        assert!((w[[1, 0]] - 5.0).abs() < 1e-6);
+        assert!((w[[1, 1]] - (-6.0)).abs() < 1e-6);
+        assert_eq!(stats.pruned_params, 2);
+        assert_eq!(stats.total_params, 4);
+    }
+
+    #[test]
+    fn test_prune_model_structured_zeros_whole_rows() {
+        let mut weights = HashMap::new();
+        // Row 0 has a much larger norm than row 1, so structured pruning at
+        // 50% must zero row 1 entirely and leave row 0 untouched.
+        weights.insert(
+            "w".to_string(),
+            Array2::from_shape_vec((2, 3), vec![10.0, 10.0, 10.0, 0.1, 0.1, 0.1])
+                .expect("valid shape"),
+        );
+        let config = PruningConfig::structured(0.5);
+        prune_model(&mut weights, &config).expect("prune_model should succeed");
+
+        let w = &weights["w"];
+        assert!(w.row(0).iter().all(|&v| v == 10.0));
+        assert!(w.row(1).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_prune_model_movement_is_unsupported() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "w".to_string(),
+            Array2::from_shape_vec((1, 2), vec![1.0, 2.0]).expect("valid shape"),
+        );
+        let mut config = PruningConfig::magnitude_based(0.3);
+        config.strategy = PruningStrategy::Movement;
+
+        let result = prune_model(&mut weights, &config);
+        assert!(
+            result.is_err(),
+            "Movement pruning has no weight-update history available and must \
+             error loudly instead of silently falling back to another strategy"
+        );
+    }
+
+    #[test]
+    fn test_prune_model_rejects_invalid_sparsity() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "w".to_string(),
+            Array2::from_shape_vec((1, 2), vec![1.0, 2.0]).expect("valid shape"),
+        );
+        let mut config = PruningConfig::magnitude_based(0.3);
+        config.sparsity = 1.5;
+        assert!(prune_model(&mut weights, &config).is_err());
     }
 
     #[test]

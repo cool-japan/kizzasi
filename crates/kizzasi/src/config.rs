@@ -65,15 +65,27 @@ pub struct ConfigFile {
     #[serde(default)]
     pub weights_path: Option<String>,
 
-    /// Expansion factor (for Mamba models)
+    /// Inner-dimension expansion factor.
+    ///
+    /// Consumed by `model_type = "mamba"` (the only architecture here with a
+    /// gated expansion branch). Setting it for another model type is a
+    /// configuration error at build time, not a silently dropped value.
     #[serde(default)]
     pub expansion_factor: Option<usize>,
 
-    /// Head dimension (for multi-head models)
+    /// Head dimension for multi-head models.
+    ///
+    /// Consumed by `model_type = "rwkv"`; must equal `hidden_dim / num_heads`.
+    /// Setting it for another model type is a configuration error at build
+    /// time, not a silently dropped value.
     #[serde(default)]
     pub head_dim: Option<usize>,
 
-    /// Number of attention heads
+    /// Number of heads for multi-head models.
+    ///
+    /// Consumed by `model_type = "rwkv"`; must divide `hidden_dim`. Setting it
+    /// for another model type is a configuration error at build time, not a
+    /// silently dropped value.
     #[serde(default)]
     pub num_heads: Option<usize>,
 }
@@ -194,6 +206,20 @@ impl ConfigFile {
             config = config.context_window(size);
         }
 
+        // Architecture options consumed by the model backends. They are
+        // forwarded to KizzasiConfig rather than dropped; building a model
+        // whose architecture cannot honour one of them is rejected with an
+        // explicit error at `Kizzasi::new`.
+        if let Some(factor) = self.expansion_factor {
+            config = config.expansion_factor(factor);
+        }
+        if let Some(heads) = self.num_heads {
+            config = config.num_heads(heads);
+        }
+        if let Some(dim) = self.head_dim {
+            config = config.head_dim(dim);
+        }
+
         // Optional parameters
         if let Some(ref path) = self.weights_path {
             config = config.load_weights(path);
@@ -212,10 +238,10 @@ impl ConfigFile {
             state_dim: Some(config.get_state_dim()),
             num_layers: Some(config.get_num_layers()),
             context_window: Some(config.get_context_window()),
-            weights_path: None, // Not exposed in KizzasiConfig getters
-            expansion_factor: None,
-            head_dim: None,
-            num_heads: None,
+            weights_path: config.get_weights_path().map(str::to_string),
+            expansion_factor: config.get_expansion_factor(),
+            head_dim: config.get_head_dim(),
+            num_heads: config.get_num_heads(),
         }
     }
 }
@@ -342,6 +368,80 @@ context_window: 8192
         assert_eq!(reconstructed.get_input_dim(), original.get_input_dim());
         assert_eq!(reconstructed.get_hidden_dim(), original.get_hidden_dim());
         assert_eq!(reconstructed.get_model_type(), original.get_model_type());
+    }
+
+    #[test]
+    fn test_roundtrip_preserves_weights_path() {
+        // Regression: `from_kizzasi_config` hard-coded `weights_path: None`
+        // with the (false) comment "Not exposed in KizzasiConfig getters", so
+        // load -> save -> load silently dropped the reference to the weights.
+        let original = KizzasiConfig::new()
+            .input_dim(3)
+            .output_dim(3)
+            .load_weights("model.safetensors");
+
+        let toml_str = ConfigFile::from_kizzasi_config(&original)
+            .to_string(ConfigFormat::Toml)
+            .unwrap();
+        let reconstructed = ConfigFile::parse(&toml_str, ConfigFormat::Toml)
+            .unwrap()
+            .to_kizzasi_config()
+            .unwrap();
+
+        assert_eq!(
+            reconstructed.get_weights_path(),
+            Some("model.safetensors"),
+            "weights_path must survive a config round-trip"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_preserves_architecture_options() {
+        // Regression: expansion_factor / head_dim / num_heads were parsed and
+        // then silently discarded by `to_kizzasi_config`.
+        let original = KizzasiConfig::new()
+            .model_type(ModelType::Rwkv)
+            .input_dim(2)
+            .output_dim(2)
+            .hidden_dim(32)
+            .num_heads(4)
+            .head_dim(8);
+
+        let toml_str = ConfigFile::from_kizzasi_config(&original)
+            .to_string(ConfigFormat::Toml)
+            .unwrap();
+        let reconstructed = ConfigFile::parse(&toml_str, ConfigFormat::Toml)
+            .unwrap()
+            .to_kizzasi_config()
+            .unwrap();
+
+        assert_eq!(reconstructed.get_num_heads(), Some(4));
+        assert_eq!(reconstructed.get_head_dim(), Some(8));
+
+        // And the values actually reach the model.
+        assert!(crate::Kizzasi::new(reconstructed).is_ok());
+    }
+
+    #[test]
+    fn test_architecture_option_for_wrong_model_type_is_rejected() {
+        let config_file = ConfigFile {
+            model_type: Some("mamba2".to_string()),
+            input_dim: Some(2),
+            output_dim: Some(2),
+            hidden_dim: Some(32),
+            state_dim: Some(8),
+            num_layers: Some(1),
+            context_window: Some(64),
+            weights_path: None,
+            expansion_factor: Some(4),
+            head_dim: None,
+            num_heads: None,
+        };
+
+        let config = config_file.to_kizzasi_config().unwrap();
+        // Accepted by the file parser, refused when the model is built —
+        // never accepted-and-dropped.
+        assert!(crate::Kizzasi::new(config).is_err());
     }
 
     #[test]

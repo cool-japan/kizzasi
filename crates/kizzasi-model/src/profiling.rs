@@ -705,80 +705,113 @@ impl ComprehensiveProfiler {
     }
 
     /// Profile all available models and generate comprehensive comparison
+    ///
+    /// "Available" means *compiled in*: each architecture below is behind the
+    /// same Cargo feature that gates its module (`mamba`, `rwkv`, `s4`,
+    /// `transformer`), so a reduced build profiles only the architectures it
+    /// actually contains instead of failing to compile. With the default
+    /// features every architecture is present.
     pub fn profile_all_models(&self) -> ModelResult<ComprehensiveComparison> {
-        use crate::{mamba::*, mamba2::*, rwkv::*, s4::*, s5::*, transformer::*};
+        #[cfg(feature = "rwkv")]
+        use crate::rwkv::*;
+        #[cfg(feature = "transformer")]
+        use crate::transformer::*;
+        #[cfg(feature = "mamba")]
+        use crate::{mamba::*, mamba2::*};
+        #[cfg(feature = "s4")]
+        use crate::{s4::*, s5::*};
 
-        let mut analyses = Vec::new();
+        #[allow(unused_mut)]
+        let mut analyses: Vec<ModelBottleneckAnalysis> = Vec::new();
 
-        // Define common configuration
+        // Define common configuration. Each binding is consumed only by the
+        // feature-gated blocks below, so a build with a subset of the
+        // architectures legitimately leaves some of them unread.
+        #[allow(unused_variables)]
         let hidden_dim = 256;
+        #[allow(unused_variables)]
         let num_layers = 4;
+        #[allow(unused_variables)]
         let state_dim = 64;
 
-        // Profile Mamba
-        let mamba_config = MambaConfig::default()
-            .hidden_dim(hidden_dim)
-            .state_dim(state_dim)
-            .num_layers(num_layers);
+        #[cfg(feature = "mamba")]
+        {
+            // Profile Mamba
+            let mamba_config = MambaConfig::default()
+                .hidden_dim(hidden_dim)
+                .state_dim(state_dim)
+                .num_layers(num_layers);
 
-        let mamba = Mamba::new(mamba_config)?;
-        let mamba_analysis =
-            ModelBottleneckAnalysis::analyze(mamba, "Mamba".to_string(), self.num_steps)?;
-        analyses.push(mamba_analysis);
+            let mamba = Mamba::new(mamba_config)?;
+            let mamba_analysis =
+                ModelBottleneckAnalysis::analyze(mamba, "Mamba".to_string(), self.num_steps)?;
+            analyses.push(mamba_analysis);
 
-        // Profile Mamba2
-        let mamba2_config = Mamba2Config::default()
-            .hidden_dim(hidden_dim)
-            .state_dim(state_dim)
-            .num_layers(num_layers)
-            .num_heads(4);
+            // Profile Mamba2
+            let mamba2_config = Mamba2Config::default()
+                .hidden_dim(hidden_dim)
+                .state_dim(state_dim)
+                .num_layers(num_layers)
+                .num_heads(4);
 
-        let mamba2 = Mamba2::new(mamba2_config)?;
-        let mamba2_analysis =
-            ModelBottleneckAnalysis::analyze(mamba2, "Mamba2".to_string(), self.num_steps)?;
-        analyses.push(mamba2_analysis);
+            let mamba2 = Mamba2::new(mamba2_config)?;
+            let mamba2_analysis =
+                ModelBottleneckAnalysis::analyze(mamba2, "Mamba2".to_string(), self.num_steps)?;
+            analyses.push(mamba2_analysis);
+        }
 
-        // Profile RWKV
-        let rwkv_config = RwkvConfig::default()
-            .hidden_dim(hidden_dim)
-            .num_layers(num_layers)
-            .num_heads(4);
+        #[cfg(feature = "rwkv")]
+        {
+            // Profile RWKV
+            let rwkv_config = RwkvConfig::default()
+                .hidden_dim(hidden_dim)
+                .num_layers(num_layers)
+                .num_heads(4);
 
-        let rwkv = Rwkv::new(rwkv_config)?;
-        let rwkv_analysis =
-            ModelBottleneckAnalysis::analyze(rwkv, "RWKV".to_string(), self.num_steps)?;
-        analyses.push(rwkv_analysis);
+            let rwkv = Rwkv::new(rwkv_config)?;
+            let rwkv_analysis =
+                ModelBottleneckAnalysis::analyze(rwkv, "RWKV".to_string(), self.num_steps)?;
+            analyses.push(rwkv_analysis);
+        }
 
-        // Profile S4D
-        let s4_config = S4Config::default()
-            .hidden_dim(hidden_dim)
-            .state_dim(state_dim)
-            .num_layers(num_layers);
+        #[cfg(feature = "s4")]
+        {
+            // Profile S4D
+            let s4_config = S4Config::default()
+                .hidden_dim(hidden_dim)
+                .state_dim(state_dim)
+                .num_layers(num_layers);
 
-        let s4 = S4D::new(s4_config)?;
-        let s4_analysis = ModelBottleneckAnalysis::analyze(s4, "S4D".to_string(), self.num_steps)?;
-        analyses.push(s4_analysis);
+            let s4 = S4D::new(s4_config)?;
+            let s4_analysis =
+                ModelBottleneckAnalysis::analyze(s4, "S4D".to_string(), self.num_steps)?;
+            analyses.push(s4_analysis);
 
-        // Profile S5 (S5Config doesn't have fluent setters, so we use new with defaults)
-        let s5_config = S5Config::new(1, hidden_dim, num_layers);
+            // Profile S5 (S5Config doesn't have fluent setters, so we use new with defaults)
+            let s5_config = S5Config::new(1, hidden_dim, num_layers);
 
-        let s5 = S5::new(s5_config)?;
-        let s5_analysis = ModelBottleneckAnalysis::analyze(s5, "S5".to_string(), self.num_steps)?;
-        analyses.push(s5_analysis);
+            let s5 = S5::new(s5_config)?;
+            let s5_analysis =
+                ModelBottleneckAnalysis::analyze(s5, "S5".to_string(), self.num_steps)?;
+            analyses.push(s5_analysis);
+        }
 
-        // Profile Transformer
-        let transformer_config = TransformerConfig::default()
-            .hidden_dim(hidden_dim)
-            .num_heads(4)
-            .num_layers(num_layers);
+        #[cfg(feature = "transformer")]
+        {
+            // Profile Transformer
+            let transformer_config = TransformerConfig::default()
+                .hidden_dim(hidden_dim)
+                .num_heads(4)
+                .num_layers(num_layers);
 
-        let transformer = Transformer::new(transformer_config)?;
-        let transformer_analysis = ModelBottleneckAnalysis::analyze(
-            transformer,
-            "Transformer".to_string(),
-            self.num_steps,
-        )?;
-        analyses.push(transformer_analysis);
+            let transformer = Transformer::new(transformer_config)?;
+            let transformer_analysis = ModelBottleneckAnalysis::analyze(
+                transformer,
+                "Transformer".to_string(),
+                self.num_steps,
+            )?;
+            analyses.push(transformer_analysis);
+        }
 
         // Determine winners
         let fastest_model = analyses

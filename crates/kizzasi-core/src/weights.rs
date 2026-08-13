@@ -10,7 +10,7 @@ use crate::device::DeviceConfig;
 use crate::error::{CoreError, CoreResult};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Weight format options
@@ -27,7 +27,7 @@ pub enum WeightFormat {
 /// Weight loading configuration
 #[derive(Debug, Clone)]
 pub struct WeightLoadConfig {
-    /// Device configuration (CPU/CUDA/Metal)
+    /// Device configuration (CPU, or Metal with the `metal` feature)
     pub device_config: DeviceConfig,
     /// Whether to quantize weights on load
     pub quantize: bool,
@@ -63,7 +63,6 @@ impl WeightLoadConfig {
 
 /// Weight loader for SSM models
 pub struct WeightLoader {
-    #[allow(dead_code)]
     config: WeightLoadConfig,
 }
 
@@ -73,16 +72,145 @@ impl WeightLoader {
         Self { config }
     }
 
-    /// Load weights from a safetensors file
+    /// Load weights from a safetensors file.
     ///
-    /// Note: This function uses varmap.load() which handles loading from safetensors format
+    /// Unlike a bare `varmap.load(path)`, this honours every field of
+    /// [`WeightLoadConfig`]:
+    ///
+    /// - `device_config`: `varmap`'s existing [`candle_core::Var`]s are pinned
+    ///   to whatever device they were created on -- `WeightLoadConfig`
+    ///   cannot move them post-hoc. What this loader *can* honestly do is
+    ///   verify the configured device actually matches, and refuse to
+    ///   proceed with a clear error on a mismatch instead of silently
+    ///   loading onto the pre-existing device as if `device_config` had no
+    ///   meaning.
+    /// - `strict` (default `true`): if any key the model's `varmap` needs is
+    ///   missing from the file, fail with the full list of missing keys
+    ///   instead of loading a partially-initialised model. When `false`,
+    ///   missing keys are left at their previously-initialised values rather
+    ///   than erroring (a genuinely different, more lenient behaviour than
+    ///   the always-strict `VarMap::load`, which is used only when nothing
+    ///   is missing).
+    /// - `quantize`: when set, every loaded tensor is round-tripped through
+    ///   [`Self::quantize_tensor`]/[`Self::dequantize_tensor`] (INT8), so
+    ///   the in-memory weights carry the same precision loss a genuine INT8
+    ///   deployment would see. Storage stays at the `VarMap`'s own dtype
+    ///   (F32/F16) -- this does not shrink memory usage, only applies the
+    ///   quantization error, since `Var` cannot change dtype in place.
     pub fn load_safetensors<P: AsRef<Path>>(&self, path: P, varmap: &mut VarMap) -> CoreResult<()> {
         let path = path.as_ref();
 
-        // Use VarMap's built-in safetensors loading
-        varmap.load(path).map_err(|e| {
-            CoreError::WeightLoadError(format!("Failed to load safetensors: {}", e))
-        })?;
+        // Open the file directly (rather than delegating straight to
+        // `VarMap::load`) so we can inspect which keys it actually contains
+        // and apply `strict`/`device_config` before touching any tensor.
+        let safetensors_data = unsafe { candle_core::safetensors::MmapedSafetensors::new(path) }
+            .map_err(|e| {
+                CoreError::WeightLoadError(format!(
+                    "Failed to open safetensors file '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+
+        let file_keys: HashSet<String> = safetensors_data
+            .tensors()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+
+        let expected_device = self.config.create_device()?;
+
+        let var_names: Vec<String> = {
+            let data = varmap.data().lock().map_err(|_| {
+                CoreError::WeightLoadError("WeightLoader: VarMap mutex poisoned".to_string())
+            })?;
+
+            // Fail fast, before loading any tensor data, if the configured
+            // device doesn't match where the model's variables actually
+            // live. `device_config` cannot move an already-constructed
+            // `VarMap`'s variables (they were pinned to a device at
+            // model-construction time), so the most honest thing this
+            // loader can do with a mismatch is refuse rather than silently
+            // load onto whatever device happened to be used before.
+            for var in data.values() {
+                if !var.device().same_device(&expected_device) {
+                    return Err(CoreError::WeightLoadError(format!(
+                        "WeightLoadConfig.device_config requests {:?}, but this VarMap's \
+                         variables already live on {:?}. device_config cannot move an existing \
+                         VarMap's variables -- construct the VarMap/VarBuilder on the configured \
+                         device instead.",
+                        expected_device,
+                        var.device(),
+                    )));
+                }
+            }
+
+            data.keys().cloned().collect()
+        };
+
+        let missing: Vec<String> = var_names
+            .iter()
+            .filter(|name| !file_keys.contains(name.as_str()))
+            .cloned()
+            .collect();
+
+        if self.config.strict && !missing.is_empty() {
+            let mut sorted_missing = missing.clone();
+            sorted_missing.sort();
+            return Err(CoreError::WeightLoadError(format!(
+                "strict weight load failed: {} key(s) required by the model are missing from '{}': {:?}",
+                sorted_missing.len(),
+                path.display(),
+                sorted_missing
+            )));
+        }
+
+        if missing.is_empty() {
+            // Every variable the model needs is present in the file: the
+            // upstream `VarMap::load` behaviour (mmap + load + assign each)
+            // is exactly right and already well-tested.
+            varmap.load(path).map_err(|e| {
+                CoreError::WeightLoadError(format!("Failed to load safetensors: {}", e))
+            })?;
+        } else {
+            // Non-strict partial load: only assign variables that ARE
+            // present in the file, leaving the rest at their
+            // previously-initialised values instead of hard-failing (which
+            // is what `VarMap::load` would do the moment it hit the first
+            // missing key).
+            let data = varmap.data().lock().map_err(|_| {
+                CoreError::WeightLoadError("WeightLoader: VarMap mutex poisoned".to_string())
+            })?;
+            for (name, var) in data.iter() {
+                if file_keys.contains(name.as_str()) {
+                    let tensor = safetensors_data.load(name, var.device()).map_err(|e| {
+                        CoreError::WeightLoadError(format!(
+                            "Failed to load tensor '{}': {}",
+                            name, e
+                        ))
+                    })?;
+                    var.set(&tensor).map_err(|e| {
+                        CoreError::WeightLoadError(format!("Failed to set '{}': {}", name, e))
+                    })?;
+                }
+            }
+        }
+
+        if self.config.quantize {
+            let data = varmap.data().lock().map_err(|_| {
+                CoreError::WeightLoadError("WeightLoader: VarMap mutex poisoned".to_string())
+            })?;
+            for var in data.values() {
+                let q = self.quantize_tensor(var.as_tensor())?;
+                let dequantized = self.dequantize_tensor(&q)?;
+                var.set(&dequantized).map_err(|e| {
+                    CoreError::WeightLoadError(format!(
+                        "Failed to apply on-load quantization: {}",
+                        e
+                    ))
+                })?;
+            }
+        }
 
         Ok(())
     }
@@ -719,6 +847,233 @@ mod tests {
         if save_path.exists() {
             std::fs::remove_file(save_path).ok();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests: `WeightLoadConfig.strict`/`quantize` used to be
+    // stored on `WeightLoader` and never read (`#[allow(dead_code)]`);
+    // `load_safetensors` delegated straight to `varmap.load()` regardless
+    // of configuration.
+    // ------------------------------------------------------------------
+
+    /// Save a two-variable VarMap (`w1`: (3,4) filled with 1.0, `w2`: (2,2)
+    /// filled with 2.0) to a fresh temp file and return the path.
+    fn save_two_var_checkpoint(filename: &str) -> std::path::PathBuf {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        vb.get_with_hints((3, 4), "w1", candle_nn::init::Init::Const(1.0))
+            .unwrap();
+        vb.get_with_hints((2, 2), "w2", candle_nn::init::Init::Const(2.0))
+            .unwrap();
+
+        let path = std::env::temp_dir().join(filename);
+        WeightLoader::new(WeightLoadConfig::default())
+            .save_safetensors(&path, &varmap)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn test_load_safetensors_strict_missing_key_errors() {
+        let path = save_two_var_checkpoint("kizzasi_core_test_strict_missing.safetensors");
+
+        // Fresh VarMap the "model" needs 3 keys, but the file only has 2:
+        // `w3` is genuinely missing.
+        let device = Device::Cpu;
+        let mut varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        vb.get_with_hints((3, 4), "w1", candle_nn::init::Init::Const(0.0))
+            .unwrap();
+        vb.get_with_hints((2, 2), "w2", candle_nn::init::Init::Const(0.0))
+            .unwrap();
+        vb.get_with_hints((1, 1), "w3", candle_nn::init::Init::Const(0.0))
+            .unwrap();
+
+        let loader = WeightLoader::new(WeightLoadConfig::default()); // strict: true
+        let result = loader.load_safetensors(&path, &mut varmap);
+        assert!(result.is_err(), "strict load must fail on a missing key");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("w3"),
+            "error message should name the missing key 'w3': {msg}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_load_safetensors_non_strict_partial_load() {
+        let path = save_two_var_checkpoint("kizzasi_core_test_nonstrict_partial.safetensors");
+
+        let device = Device::Cpu;
+        let mut varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        vb.get_with_hints((3, 4), "w1", candle_nn::init::Init::Const(0.0))
+            .unwrap();
+        vb.get_with_hints((2, 2), "w2", candle_nn::init::Init::Const(0.0))
+            .unwrap();
+        vb.get_with_hints((1, 1), "w3", candle_nn::init::Init::Const(9.5))
+            .unwrap();
+
+        let config = WeightLoadConfig {
+            strict: false,
+            ..WeightLoadConfig::default()
+        };
+        let loader = WeightLoader::new(config);
+        loader
+            .load_safetensors(&path, &mut varmap)
+            .expect("non-strict load must succeed despite the missing 'w3' key");
+
+        // w1/w2 were present in the file and must now hold the saved values.
+        let data = varmap.data().lock().unwrap();
+        let w1_val = data
+            .get("w1")
+            .unwrap()
+            .as_tensor()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert!(w1_val
+            .iter()
+            .all(|row| row.iter().all(|&v| (v - 1.0).abs() < 1e-6)));
+        let w2_val = data
+            .get("w2")
+            .unwrap()
+            .as_tensor()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert!(w2_val
+            .iter()
+            .all(|row| row.iter().all(|&v| (v - 2.0).abs() < 1e-6)));
+
+        // w3 was absent from the file and must be left at its initial value.
+        let w3_val = data
+            .get("w3")
+            .unwrap()
+            .as_tensor()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert!(
+            (w3_val[0][0] - 9.5).abs() < 1e-6,
+            "w3 must be untouched by a non-strict load, got {}",
+            w3_val[0][0]
+        );
+
+        drop(data);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_load_safetensors_roundtrip_exact_values() {
+        let path = save_two_var_checkpoint("kizzasi_core_test_load_roundtrip.safetensors");
+
+        let device = Device::Cpu;
+        let mut varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        vb.get_with_hints((3, 4), "w1", candle_nn::init::Init::Const(0.0))
+            .unwrap();
+        vb.get_with_hints((2, 2), "w2", candle_nn::init::Init::Const(0.0))
+            .unwrap();
+
+        let loader = WeightLoader::new(WeightLoadConfig::default());
+        loader.load_safetensors(&path, &mut varmap).unwrap();
+
+        let data = varmap.data().lock().unwrap();
+        let w1_val = data
+            .get("w1")
+            .unwrap()
+            .as_tensor()
+            .to_vec2::<f32>()
+            .unwrap();
+        for row in &w1_val {
+            for &v in row {
+                assert_eq!(v, 1.0);
+            }
+        }
+        let w2_val = data
+            .get("w2")
+            .unwrap()
+            .as_tensor()
+            .to_vec2::<f32>()
+            .unwrap();
+        for row in &w2_val {
+            for &v in row {
+                assert_eq!(v, 2.0);
+            }
+        }
+
+        drop(data);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_load_safetensors_quantize_applies_int8_precision_loss() {
+        // A non-constant tensor, so INT8 quantization has a real (nonzero)
+        // rounding error to introduce -- a constant tensor round-trips
+        // exactly regardless of quantization and wouldn't distinguish
+        // "quantize was applied" from "quantize was silently ignored".
+        let device = Device::Cpu;
+        let varmap_save = VarMap::new();
+        let vb_save = VarBuilder::from_varmap(&varmap_save, DType::F32, &device);
+        let original = vb_save
+            .get_with_hints(
+                (16, 16),
+                "w",
+                candle_nn::init::Init::Randn {
+                    mean: 0.0,
+                    stdev: 1.0,
+                },
+            )
+            .unwrap();
+        let original_values = original.to_vec2::<f32>().unwrap();
+
+        let path = std::env::temp_dir().join("kizzasi_core_test_quantize_load.safetensors");
+        WeightLoader::new(WeightLoadConfig::default())
+            .save_safetensors(&path, &varmap_save)
+            .unwrap();
+
+        let mut varmap_load = VarMap::new();
+        let vb_load = VarBuilder::from_varmap(&varmap_load, DType::F32, &device);
+        vb_load
+            .get_with_hints((16, 16), "w", candle_nn::init::Init::Const(0.0))
+            .unwrap();
+
+        let config = WeightLoadConfig {
+            quantize: true,
+            ..WeightLoadConfig::default()
+        };
+        let loader = WeightLoader::new(config);
+        loader.load_safetensors(&path, &mut varmap_load).unwrap();
+
+        let data = varmap_load.data().lock().unwrap();
+        let loaded_values = data.get("w").unwrap().as_tensor().to_vec2::<f32>().unwrap();
+
+        // Must be CLOSE (INT8 over a randn tensor is a fine-grained
+        // approximation) but not exact -- proving `quantize` actually ran
+        // rather than being silently ignored (in which case the values
+        // would match `original_values` bit-for-bit).
+        let mut max_err = 0.0f32;
+        let mut any_exact_mismatch = false;
+        for i in 0..16 {
+            for j in 0..16 {
+                let err = (loaded_values[i][j] - original_values[i][j]).abs();
+                max_err = max_err.max(err);
+                if loaded_values[i][j] != original_values[i][j] {
+                    any_exact_mismatch = true;
+                }
+            }
+        }
+        assert!(
+            any_exact_mismatch,
+            "quantize=true must perturb at least one value versus the unquantized original"
+        );
+        assert!(
+            max_err < 0.2,
+            "INT8 quantization error should be small for a randn tensor, got max_err={max_err}"
+        );
+
+        drop(data);
+        std::fs::remove_file(&path).ok();
     }
 
     // ------------------------------------------------------------------

@@ -376,6 +376,102 @@ impl HybridLayer {
             HybridLayer::Attention(attn) => attn.reset(),
         }
     }
+
+    /// Snapshot this layer's real recurrent state into a [`HiddenState`].
+    ///
+    /// * `Mamba` layers: the SSM state vector (length `state_dim`), stored as
+    ///   a `(1, state_dim)` matrix in row 0.
+    /// * `Attention` layers: the KV cache, stored as a `(2 * cache_len,
+    ///   hidden_dim)` matrix — rows `0..cache_len` are the key cache, rows
+    ///   `cache_len..2*cache_len` are the value cache, oldest entry first.
+    ///
+    /// The encoding is internal to this module; [`Self::set_state`] is the
+    /// only supported way to read it back.
+    fn get_state(&self, hidden_dim: usize, state_dim: usize) -> HiddenState {
+        let mut hs = HiddenState::new(hidden_dim, state_dim);
+        match self {
+            HybridLayer::Mamba(mamba) => {
+                let mut mat = Array2::zeros((1, mamba.state.len()));
+                for (n, &v) in mamba.state.iter().enumerate() {
+                    mat[[0, n]] = v;
+                }
+                *hs.state_mut() = mat;
+            }
+            HybridLayer::Attention(attn) => {
+                let cache_len = attn.k_cache.len();
+                let mut mat = Array2::zeros((2 * cache_len, hidden_dim));
+                for (row, k) in attn.k_cache.iter().enumerate() {
+                    for (col, &v) in k.iter().enumerate().take(hidden_dim) {
+                        mat[[row, col]] = v;
+                    }
+                }
+                for (row, v_vec) in attn.v_cache.iter().enumerate() {
+                    for (col, &v) in v_vec.iter().enumerate().take(hidden_dim) {
+                        mat[[cache_len + row, col]] = v;
+                    }
+                }
+                *hs.state_mut() = mat;
+            }
+        }
+        hs
+    }
+
+    /// Restore this layer's state from a [`HiddenState`] produced by
+    /// [`Self::get_state`] on a layer of the same kind and dimensions.
+    ///
+    /// # Errors
+    /// Returns [`ModelError::DimensionMismatch`] if the stored matrix shape
+    /// doesn't match what this layer kind expects, instead of silently
+    /// ignoring the mismatch or panicking on an out-of-range index.
+    fn set_state(&mut self, hidden_dim: usize, hs: &HiddenState) -> ModelResult<()> {
+        let mat = hs.state();
+        match self {
+            HybridLayer::Mamba(mamba) => {
+                let expected = mamba.state.len();
+                if mat.shape() != [1, expected] {
+                    return Err(ModelError::dimension_mismatch(
+                        "HybridLayer::set_state (Mamba)",
+                        expected,
+                        mat.shape().get(1).copied().unwrap_or(0),
+                    ));
+                }
+                for n in 0..expected {
+                    mamba.state[n] = mat[[0, n]];
+                }
+            }
+            HybridLayer::Attention(attn) => {
+                let rows = mat.shape()[0];
+                let cols = mat.shape()[1];
+                if cols != hidden_dim || !rows.is_multiple_of(2) {
+                    return Err(ModelError::dimension_mismatch(
+                        "HybridLayer::set_state (Attention)",
+                        hidden_dim,
+                        cols,
+                    ));
+                }
+                let cache_len = rows / 2;
+                if cache_len > attn.max_cache_len {
+                    return Err(ModelError::dimension_mismatch(
+                        "HybridLayer::set_state (Attention cache_len)",
+                        attn.max_cache_len,
+                        cache_len,
+                    ));
+                }
+                attn.k_cache.clear();
+                attn.v_cache.clear();
+                for row in 0..cache_len {
+                    attn.k_cache
+                        .push_back(Array1::from_iter((0..cols).map(|c| mat[[row, c]])));
+                }
+                for row in 0..cache_len {
+                    attn.v_cache.push_back(Array1::from_iter(
+                        (0..cols).map(|c| mat[[cache_len + row, c]]),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Hybrid Mamba+Attention model
@@ -458,6 +554,8 @@ impl HybridModel {
 impl SignalPredictor for HybridModel {
     #[instrument(skip(self, input))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.input_proj.shape()[0])?;
+
         // Project input
         let mut hidden = input.dot(&self.input_proj);
 
@@ -503,9 +601,9 @@ impl AutoregressiveModel for HybridModel {
     }
 
     fn get_states(&self) -> Vec<HiddenState> {
-        // Simplified state extraction
-        (0..self.config.num_layers)
-            .map(|_| HiddenState::new(self.config.hidden_dim, self.config.state_dim))
+        self.layers
+            .iter()
+            .map(|layer| layer.get_state(self.config.hidden_dim, self.config.state_dim))
             .collect()
     }
 
@@ -517,7 +615,9 @@ impl AutoregressiveModel for HybridModel {
                 states.len(),
             ));
         }
-        // State setting would require more complex handling of different layer types
+        for (layer, hs) in self.layers.iter_mut().zip(states.iter()) {
+            layer.set_state(self.config.hidden_dim, hs)?;
+        }
         Ok(())
     }
 }
@@ -581,6 +681,61 @@ mod tests {
 
         let output = model.step(&input).expect("Failed to get output");
         assert_eq!(output.len(), 32);
+    }
+
+    #[test]
+    fn test_hybrid_get_set_states_round_trip() {
+        // Step a few times to build up real Mamba SSM state and Attention
+        // KV-cache history, snapshot, step once more to get the "expected"
+        // continuation, then rewind to the snapshot and replay the same
+        // input. If get/set_states actually captured and restored the real
+        // per-layer state (instead of the old zeroed stub / no-op), replaying
+        // the same input from the restored state must reproduce the exact
+        // same output.
+        let config = HybridConfig::alternating(8, 16, 4, 4);
+        let mut model = HybridModel::new(config).expect("Failed to create HybridModel");
+
+        for i in 0..5 {
+            let input = Array1::from_vec(vec![0.1 * (i as f32 + 1.0); 8]);
+            model.step(&input).expect("warm-up step failed");
+        }
+
+        let snapshot = model.get_states();
+        assert_eq!(snapshot.len(), 4, "one HiddenState per layer");
+
+        let probe = Array1::from_vec(vec![0.37; 8]);
+        let expected = model.step(&probe).expect("probe step failed");
+
+        model
+            .set_states(snapshot)
+            .expect("set_states should accept its own get_states output");
+
+        let replayed = model.step(&probe).expect("replayed probe step failed");
+
+        assert_eq!(expected.len(), replayed.len());
+        for (e, r) in expected.iter().zip(replayed.iter()) {
+            assert!(
+                (e - r).abs() < 1e-6,
+                "restored state must reproduce the exact continuation: expected {e}, got {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hybrid_set_states_rejects_wrong_shape() {
+        let config = HybridConfig::alternating(8, 16, 2, 4);
+        let mut model = HybridModel::new(config).expect("Failed to create HybridModel");
+
+        // Right count, but a layer-0 (Mamba) state with the wrong column
+        // count must be rejected rather than silently ignored.
+        let mut bad_state = HiddenState::new(16, 999);
+        *bad_state.state_mut() = Array2::zeros((1, 999));
+        let bad_states = vec![bad_state, HiddenState::new(16, 64)];
+
+        assert!(
+            model.set_states(bad_states).is_err(),
+            "a mismatched state shape must return Err, not be silently accepted"
+        );
     }
 
     #[test]

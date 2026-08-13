@@ -4,7 +4,7 @@ use crate::error::{KizzasiError, KizzasiResult};
 use crate::predictor::Kizzasi;
 use kizzasi_core::KizzasiConfig;
 use scirs2_core::ndarray::{Array1, Array2};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "logic")]
 use kizzasi_logic::GuardrailSet;
@@ -44,7 +44,14 @@ pub struct LazyKizzasi {
     #[cfg(feature = "logic")]
     guardrails: Option<GuardrailSet>,
     predictor: Arc<Mutex<Option<Kizzasi>>>,
-    init_once: Once,
+    /// The last initialization error, replayed verbatim on retry.
+    ///
+    /// Initialization used to run inside a `std::sync::Once`, which marks
+    /// itself completed even when the closure fails. The first attempt then
+    /// surfaced the real error and every later attempt silently returned `Ok`
+    /// with no predictor, so callers got a generic "initialization failed"
+    /// with advice ("try again") that could never work.
+    init_error: Arc<Mutex<Option<String>>>,
 }
 
 impl LazyKizzasi {
@@ -57,7 +64,7 @@ impl LazyKizzasi {
             #[cfg(feature = "logic")]
             guardrails: None,
             predictor: Arc::new(Mutex::new(None)),
-            init_once: Once::new(),
+            init_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -80,31 +87,44 @@ impl LazyKizzasi {
     ///
     /// This can be useful for pre-warming the model or handling initialization
     /// errors separately from prediction logic.
+    ///
+    /// Initialization is performed at most once *successfully*. A failure is
+    /// reported with its real cause and leaves the predictor retryable, so a
+    /// second call after fixing the environment can still succeed — and a
+    /// second call that fails again reports the same real cause rather than a
+    /// generic placeholder.
     pub fn initialize(&self) -> KizzasiResult<()> {
-        let mut init_error: Option<KizzasiError> = None;
-
-        self.init_once.call_once(|| {
-            let mut predictor = match Kizzasi::new(self.config.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    init_error = Some(e);
-                    return;
-                }
-            };
-
-            #[cfg(feature = "logic")]
-            if let Some(ref guardrails) = self.guardrails {
-                predictor.set_guardrails(guardrails.clone());
-            }
-
-            *self.predictor.lock().unwrap_or_else(|e| e.into_inner()) = Some(predictor);
-        });
-
-        if let Some(err) = init_error {
-            return Err(err);
+        // Hold the predictor lock across the whole attempt so two threads
+        // cannot both construct a model.
+        let mut guard = self.predictor.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return Ok(());
         }
 
+        let mut predictor = match Kizzasi::new(self.config.clone()) {
+            Ok(predictor) => predictor,
+            Err(e) => {
+                *self.init_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
+                return Err(e);
+            }
+        };
+
+        #[cfg(feature = "logic")]
+        if let Some(ref guardrails) = self.guardrails {
+            predictor.set_guardrails(guardrails.clone());
+        }
+
+        *guard = Some(predictor);
+        *self.init_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
+    }
+
+    /// The most recent initialization failure, if any.
+    pub fn last_init_error(&self) -> Option<String> {
+        self.init_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Get a mutable reference to the initialized predictor
@@ -117,9 +137,14 @@ impl LazyKizzasi {
         self.initialize()?;
 
         let mut guard = self.predictor.lock().unwrap_or_else(|e| e.into_inner());
-        let predictor = guard.as_mut().ok_or_else(|| KizzasiError::InvalidState {
-            reason: "Predictor initialization failed".into(),
-            recovery: Some("Check configuration and try again".into()),
+        let predictor = guard.as_mut().ok_or_else(|| {
+            let reason = self
+                .last_init_error()
+                .unwrap_or_else(|| "predictor was not initialized".to_string());
+            KizzasiError::InvalidState {
+                reason,
+                recovery: Some("Fix the configuration and call initialize() again".into()),
+            }
         })?;
 
         f(predictor)
@@ -184,7 +209,9 @@ impl LazyKizzasi {
                 recovery: Some("Ensure no other threads are using this predictor".into()),
             })?
             .into_inner()
-            .expect("mutex cannot be poisoned: single-owner via Arc::try_unwrap")
+            // A poisoned mutex still holds a valid predictor: a panic
+            // elsewhere must not turn this into an unrecoverable error.
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .ok_or_else(|| KizzasiError::InvalidState {
                 reason: "Predictor not initialized".into(),
                 recovery: Some("Call initialize() first".into()),
@@ -194,9 +221,11 @@ impl LazyKizzasi {
     }
 }
 
-// LazyKizzasi is Send + Sync for thread-safe lazy initialization
-unsafe impl Send for LazyKizzasi {}
-unsafe impl Sync for LazyKizzasi {}
+// Send + Sync are derived by the compiler from the field types. The manual
+// `unsafe impl`s that used to live here were unnecessary (every field is
+// already Send + Sync) and actively harmful: being unconditional, they would
+// have kept compiling if a future field stopped being thread-safe, silently
+// making the type unsound.
 
 impl Clone for LazyKizzasi {
     fn clone(&self) -> Self {
@@ -205,7 +234,7 @@ impl Clone for LazyKizzasi {
             #[cfg(feature = "logic")]
             guardrails: self.guardrails.clone(),
             predictor: Arc::new(Mutex::new(None)),
-            init_once: Once::new(),
+            init_error: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -213,6 +242,33 @@ impl Clone for LazyKizzasi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_failed_initialization_is_retryable_and_keeps_the_real_error() {
+        // Regression: `Once::call_once` marks itself completed even when the
+        // closure fails, so the second attempt used to return Ok(()) with no
+        // predictor and then a generic "initialization failed" message.
+        let missing = std::env::temp_dir().join("kizzasi_lazy_missing_weights.json");
+        let _ = std::fs::remove_file(&missing);
+        let invalid = KizzasiConfig::new()
+            .input_dim(3)
+            .output_dim(3)
+            .hidden_dim(16)
+            .load_weights(&missing.to_string_lossy());
+        let lazy = LazyKizzasi::new(invalid);
+
+        let first = lazy.initialize().unwrap_err().to_string();
+        let second = lazy.initialize().unwrap_err().to_string();
+        assert_eq!(first, second, "the real cause must be reported every time");
+        assert!(!lazy.is_initialized());
+
+        // Prediction surfaces the same real cause, not a placeholder.
+        let err = lazy
+            .step(&Array1::from_vec(vec![0.1, 0.2, 0.3]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, first);
+    }
     use kizzasi_core::ModelType;
 
     #[test]

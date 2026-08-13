@@ -11,6 +11,10 @@
 //! sub-module; the shared internal helper `shift_low` is private to this
 //! module and is used only by [`RangeEncoder`].
 
+use super::model::{
+    build_scaled_table, BitWriter, FreqModel, ARITHMETIC_HEADER_LEN, DEFAULT_MIN_COUNT,
+    FLAG_ADAPTIVE, HALF, MAX_TOTAL_COUNT, QUARTER, RANGE_SCALE, THREE_QUARTER, WHOLE,
+};
 use super::HuffmanNode;
 use crate::error::{TokenizerError, TokenizerResult};
 use std::collections::{BinaryHeap, HashMap};
@@ -59,18 +63,18 @@ impl HuffmanEncoder {
 
         // Special case: single symbol
         if frequencies.len() == 1 {
-            let symbol = *frequencies
-                .keys()
-                .next()
-                .expect("Frequencies map is non-empty");
+            let (&symbol, &frequency) = frequencies.iter().next().ok_or_else(|| {
+                TokenizerError::encoding(
+                    "encoding",
+                    "Frequencies map reported one entry but yielded none",
+                )
+            })?;
             let mut codebook = HashMap::new();
             codebook.insert(symbol, vec![false]); // Single bit code
 
             let node = HuffmanNode {
                 symbol: Some(symbol),
-                frequency: *frequencies
-                    .get(&symbol)
-                    .expect("Symbol exists in frequencies map"),
+                frequency,
                 left: None,
                 right: None,
             };
@@ -124,9 +128,14 @@ impl HuffmanEncoder {
         }
 
         // Build tree bottom-up by combining lowest-frequency nodes
+        let heap_underflow = || {
+            TokenizerError::InternalError(
+                "Huffman heap drained below its own length invariant".into(),
+            )
+        };
         while heap.len() > 1 {
-            let entry1 = heap.pop().expect("Heap has at least 2 elements");
-            let entry2 = heap.pop().expect("Heap has at least 2 elements");
+            let entry1 = heap.pop().ok_or_else(heap_underflow)?;
+            let entry2 = heap.pop().ok_or_else(heap_underflow)?;
 
             let combined_freq = entry1.frequency + entry2.frequency;
             let parent_idx = nodes.len();
@@ -144,17 +153,19 @@ impl HuffmanEncoder {
             });
         }
 
-        let root_idx = heap
-            .pop()
-            .expect("Heap has exactly 1 root element after loop")
-            .idx;
+        let root_idx = heap.pop().ok_or_else(heap_underflow)?.idx;
 
         // Build codebook by traversing tree
         let mut codebook = HashMap::new();
         let mut stack = vec![(root_idx, Vec::new())];
 
         while let Some((idx, code)) = stack.pop() {
-            let node = &nodes[idx];
+            let node = nodes.get(idx).ok_or_else(|| {
+                TokenizerError::InternalError(format!(
+                    "Huffman tree references missing node index {}",
+                    idx
+                ))
+            })?;
 
             if let Some(symbol) = node.symbol {
                 // Leaf node - save code
@@ -269,8 +280,33 @@ impl HuffmanEncoder {
 
 /// Arithmetic encoder for near-optimal compression
 ///
-/// Uses adaptive probability models to achieve compression rates
-/// close to the theoretical entropy limit.
+/// Implements the textbook integer arithmetic coder (Witten–Neal–Cleary) with
+/// 32-bit `low`/`high` registers and full E1/E2/E3 renormalisation: bits are
+/// emitted as soon as the leading bit of the interval is decided, E3
+/// (underflow) states are counted and resolved when the interval finally
+/// escapes the middle half, and the interval is rescaled after every symbol.
+/// The compressed size therefore tracks the entropy of the input instead of
+/// being a fixed-width header, and precision is never exhausted no matter how
+/// many symbols are coded.
+///
+/// # Frequency model
+///
+/// The alphabet is exactly the set of symbols with a non-zero frequency.
+/// Encoding a symbol outside that set is an error rather than a silent
+/// approximation — approximating it would desynchronise the decoder.
+///
+/// The total of all counts must not exceed 2^30 so that every symbol is
+/// guaranteed a sub-interval of width at least one; larger totals are
+/// rejected by [`ArithmeticEncoder::encode`].
+///
+/// # Adaptive mode
+///
+/// With `adaptive = true` each coded symbol's count is incremented after it is
+/// coded, and all counts are halved once the total passes 1,000,000. The
+/// updated counts are written back so consecutive `encode` calls continue to
+/// adapt. [`super::ArithmeticDecoder`] applies the identical rule, so an
+/// adaptive stream decodes exactly when the decoder is constructed from the
+/// same *initial* frequency table the encoder started from.
 pub struct ArithmeticEncoder {
     /// Symbol frequency counts (adaptive)
     frequencies: HashMap<u32, u64>,
@@ -295,7 +331,7 @@ impl ArithmeticEncoder {
         Self {
             frequencies,
             total_count: alphabet_size as u64,
-            min_count: 1,
+            min_count: DEFAULT_MIN_COUNT,
         }
     }
 
@@ -305,40 +341,8 @@ impl ArithmeticEncoder {
         Self {
             frequencies,
             total_count,
-            min_count: 1,
+            min_count: DEFAULT_MIN_COUNT,
         }
-    }
-
-    /// Update frequency counts (adaptive coding)
-    fn update_frequency(&mut self, symbol: u32) {
-        *self.frequencies.entry(symbol).or_insert(self.min_count) += 1;
-        self.total_count += 1;
-
-        // Prevent overflow by rescaling
-        if self.total_count > 1_000_000 {
-            self.rescale_frequencies();
-        }
-    }
-
-    /// Rescale all frequencies by half (prevent overflow)
-    fn rescale_frequencies(&mut self) {
-        self.total_count = 0;
-        for freq in self.frequencies.values_mut() {
-            *freq = (*freq / 2).max(self.min_count);
-            self.total_count += *freq;
-        }
-    }
-
-    /// Get cumulative frequency for a symbol
-    fn cumulative_frequency(&self, symbol: u32) -> (u64, u64) {
-        let mut cumulative = 0u64;
-
-        for s in 0..symbol {
-            cumulative += self.frequencies.get(&s).unwrap_or(&0);
-        }
-
-        let freq = self.frequencies.get(&symbol).unwrap_or(&self.min_count);
-        (cumulative, cumulative + freq)
     }
 
     /// Encode symbols using arithmetic coding
@@ -350,36 +354,107 @@ impl ArithmeticEncoder {
     ///
     /// # Returns
     ///
-    /// Compressed representation as bytes
+    /// The compressed bitstream: a 4-byte little-endian symbol count, a flag
+    /// byte recording whether the stream is adaptive, then the packed bits.
+    ///
+    /// # Errors
+    ///
+    /// * [`TokenizerError::InvalidConfig`] if the frequency table is empty or
+    ///   its total exceeds the coder's 2^30 limit.
+    /// * [`TokenizerError::EncodingError`] if a symbol is not in the alphabet,
+    ///   or if more than `u32::MAX` symbols are supplied.
     pub fn encode(&mut self, symbols: &[u32], adaptive: bool) -> TokenizerResult<Vec<u8>> {
-        const PRECISION: u64 = 1u64 << 32; // 32-bit precision
+        let symbol_count = u32::try_from(symbols.len()).map_err(|_| {
+            TokenizerError::encoding(
+                "encoding",
+                format!(
+                    "Arithmetic coder supports at most {} symbols per stream, got {}",
+                    u32::MAX,
+                    symbols.len()
+                ),
+            )
+        })?;
 
-        let mut low = 0u64;
-        let mut high = PRECISION - 1;
-
-        for &symbol in symbols {
-            let range = high - low + 1;
-            let (cum_low, cum_high) = self.cumulative_frequency(symbol);
-
-            high = low + (range * cum_high / self.total_count) - 1;
-            low += range * cum_low / self.total_count;
-
-            // Adaptive update
-            if adaptive {
-                self.update_frequency(symbol);
-            }
-
-            // Renormalization (emit bits when possible)
-            // For simplicity, we'll handle this at the end
+        let mut model = FreqModel::from_frequencies(&self.frequencies, self.min_count)?;
+        self.total_count = model.total();
+        if self.total_count > MAX_TOTAL_COUNT {
+            return Err(TokenizerError::InvalidConfig(format!(
+                "Arithmetic coder total frequency {} exceeds the maximum {}; \
+                 rescale the frequency table before encoding",
+                self.total_count, MAX_TOTAL_COUNT
+            )));
         }
 
-        // Final value in [low, high]
-        let value = (low + high) / 2;
+        // Interval registers: `low` and `high` are inclusive bounds inside
+        // [0, 2^32). `pending` counts unresolved E3 (underflow) rescalings.
+        let mut low: u64 = 0;
+        let mut high: u64 = WHOLE - 1;
+        let mut pending: u64 = 0;
+        let mut writer = BitWriter::new();
 
-        // Convert to bytes
-        let mut result = Vec::new();
-        result.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
-        result.extend_from_slice(&value.to_le_bytes());
+        for &symbol in symbols {
+            let idx = model.index_of(symbol).ok_or_else(|| {
+                TokenizerError::encoding(
+                    "serialization",
+                    format!("Unknown symbol: {} (not in the coder's alphabet)", symbol),
+                )
+            })?;
+            let (cum_low, cum_high) = model.cumulative(idx).ok_or_else(|| {
+                TokenizerError::InternalError(
+                    "Arithmetic model index outside its own cumulative table".into(),
+                )
+            })?;
+            let total = model.total();
+
+            // Narrow the interval. `range <= 2^32` and `cum_high <= 2^30`, so
+            // the product stays well inside u64.
+            let range = high - low + 1;
+            high = low + range * cum_high / total - 1;
+            low += range * cum_low / total;
+
+            // Renormalisation: E1 (interval in the lower half), E2 (upper
+            // half), E3 (straddling the midpoint but inside the middle half).
+            loop {
+                if high < HALF {
+                    writer.write_bit_with_pending(false, &mut pending);
+                } else if low >= HALF {
+                    writer.write_bit_with_pending(true, &mut pending);
+                    low -= HALF;
+                    high -= HALF;
+                } else if low >= QUARTER && high < THREE_QUARTER {
+                    pending += 1;
+                    low -= QUARTER;
+                    high -= QUARTER;
+                } else {
+                    break;
+                }
+                low <<= 1;
+                high = (high << 1) | 1;
+            }
+
+            if adaptive {
+                model.update(idx)?;
+            }
+        }
+
+        // Terminate: emit one more bit (plus the deferred run) so the decoder's
+        // zero-padded reads land inside the final interval.
+        pending += 1;
+        if low < QUARTER {
+            writer.write_bit_with_pending(false, &mut pending);
+        } else {
+            writer.write_bit_with_pending(true, &mut pending);
+        }
+
+        if adaptive {
+            self.total_count = model.write_back(&mut self.frequencies);
+        }
+
+        let payload = writer.finish();
+        let mut result = Vec::with_capacity(ARITHMETIC_HEADER_LEN + payload.len());
+        result.extend_from_slice(&symbol_count.to_le_bytes());
+        result.push(if adaptive { FLAG_ADAPTIVE } else { 0 });
+        result.extend_from_slice(&payload);
 
         Ok(result)
     }
@@ -387,6 +462,14 @@ impl ArithmeticEncoder {
     /// Get the codebook for inspection
     pub fn frequencies(&self) -> &HashMap<u32, u64> {
         &self.frequencies
+    }
+
+    /// Total of all frequency counts currently held by the model
+    ///
+    /// After an adaptive [`ArithmeticEncoder::encode`] call this reflects the
+    /// updated counts.
+    pub fn total_count(&self) -> u64 {
+        self.total_count
     }
 }
 
@@ -425,14 +508,25 @@ fn shift_low(low: &mut u64, cache: &mut u8, cache_size: &mut u64, out: &mut Vec<
 pub struct RangeEncoder {
     /// Symbol frequency counts
     frequencies: HashMap<u32, u64>,
-    /// Total count
-    total_count: u64,
-    /// Cumulative frequency table
-    cumulative: Vec<(u32, u64, u64)>, // (symbol, low, high)
+    /// Cumulative frequency table quantised onto the shared `[0, 2^16]` grid
+    scaled_cum: Vec<(u32, u32, u32)>, // (symbol, scaled_low, scaled_high)
 }
 
 impl RangeEncoder {
     /// Create a new range encoder from frequencies
+    ///
+    /// The frequency table is quantised once, here, onto the coder's fixed
+    /// `[0, 2^16]` grid. [`super::RangeDecoder::from_frequencies`] performs
+    /// the identical quantisation, so both sides share byte-identical symbol
+    /// intervals.
+    ///
+    /// # Errors
+    ///
+    /// * [`TokenizerError::EncodingError`] if `frequencies` is empty.
+    /// * [`TokenizerError::InvalidConfig`] if every count is zero, or if the
+    ///   alphabet has more than 65,536 distinct symbols — the grid cannot give
+    ///   each of them a distinct interval, so the table is rejected instead of
+    ///   producing a stream that decodes to the wrong symbols.
     pub fn from_frequencies(frequencies: HashMap<u32, u64>) -> TokenizerResult<Self> {
         if frequencies.is_empty() {
             return Err(TokenizerError::encoding(
@@ -441,27 +535,11 @@ impl RangeEncoder {
             ));
         }
 
-        let total_count: u64 = frequencies.values().sum();
-
-        // Build cumulative frequency table
-        let mut symbols: Vec<u32> = frequencies.keys().copied().collect();
-        symbols.sort_unstable();
-
-        let mut cumulative = Vec::new();
-        let mut cum_freq = 0u64;
-
-        for symbol in symbols {
-            let freq = frequencies.get(&symbol).unwrap_or(&0);
-            if *freq > 0 {
-                cumulative.push((symbol, cum_freq, cum_freq + freq));
-                cum_freq += freq;
-            }
-        }
+        let scaled_cum = build_scaled_table(&frequencies)?;
 
         Ok(Self {
             frequencies,
-            total_count,
-            cumulative,
+            scaled_cum,
         })
     }
 
@@ -479,22 +557,22 @@ impl RangeEncoder {
     /// # Returns
     ///
     /// Compressed bitstream as bytes
+    ///
+    /// # Errors
+    ///
+    /// [`TokenizerError::EncodingError`] if a symbol is not in the alphabet,
+    /// or if more than `u32::MAX` symbols are supplied.
     pub fn encode(&self, symbols: &[u32]) -> TokenizerResult<Vec<u8>> {
-        // Scale frequencies to fit in reasonable precision.
-        // Scaled cumulative frequencies fit in [0, scale] and scale fits in u32.
-        let scale: u64 = 1u64 << 14;
-        let total = self.total_count;
-
-        // Pre-compute scaled cumulative frequencies.
-        // Each (cum_low, cum_high) is in [0, scale] and fits in u32.
-        let mut scaled_cum: Vec<(u32, u32, u32)> = Vec::with_capacity(self.cumulative.len());
-        for (sym, cum_low, cum_high) in &self.cumulative {
-            let scaled_low = ((*cum_low as u128 * scale as u128) / total as u128) as u64;
-            let scaled_high = ((*cum_high as u128 * scale as u128) / total as u128) as u64;
-            // Ensure at least 1 unit of width for each symbol.
-            let scaled_high = scaled_high.max(scaled_low + 1);
-            scaled_cum.push((*sym, scaled_low as u32, scaled_high as u32));
-        }
+        let symbol_count = u32::try_from(symbols.len()).map_err(|_| {
+            TokenizerError::encoding(
+                "encoding",
+                format!(
+                    "Range coder supports at most {} symbols per stream, got {}",
+                    u32::MAX,
+                    symbols.len()
+                ),
+            )
+        })?;
 
         // Range coder state.
         let mut low: u64 = 0; // 33 bits: bit 32 may be a carry
@@ -503,21 +581,27 @@ impl RangeEncoder {
         let mut cache_size: u64 = 1;
         let mut output: Vec<u8> = Vec::new();
 
-        let scale_u32 = scale as u32;
+        let scale_u32 = RANGE_SCALE as u32;
 
         for &symbol in symbols {
-            // Find symbol in cumulative table.
-            let (_, cum_low, cum_high) = scaled_cum
-                .iter()
-                .find(|(s, _, _)| *s == symbol)
-                .ok_or_else(|| {
+            // Find symbol in the pre-quantised cumulative table. The table is
+            // sorted by symbol, so this is a binary search rather than a scan.
+            let idx = self
+                .scaled_cum
+                .binary_search_by_key(&symbol, |&(s, _, _)| s)
+                .map_err(|_| {
                     TokenizerError::encoding("serialization", format!("Unknown symbol: {}", symbol))
                 })?;
+            let (_, cum_low, cum_high) = self.scaled_cum.get(idx).copied().ok_or_else(|| {
+                TokenizerError::InternalError(
+                    "Range coder table index outside its own bounds".into(),
+                )
+            })?;
 
             // Update range (LZMA-style step computation).
             let step = range / scale_u32;
-            low = low.wrapping_add((step as u64).wrapping_mul(*cum_low as u64));
-            range = step.wrapping_mul(cum_high.wrapping_sub(*cum_low));
+            low = low.wrapping_add((step as u64).wrapping_mul(cum_low as u64));
+            range = step.wrapping_mul(cum_high.wrapping_sub(cum_low));
 
             // Renormalization: emit bytes while range falls below 2^24.
             while range < (1u32 << 24) {
@@ -535,7 +619,7 @@ impl RangeEncoder {
 
         // Prepend metadata: number of symbols.
         let mut result = Vec::with_capacity(4 + output.len());
-        result.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
+        result.extend_from_slice(&symbol_count.to_le_bytes());
         result.extend_from_slice(&output);
 
         Ok(result)

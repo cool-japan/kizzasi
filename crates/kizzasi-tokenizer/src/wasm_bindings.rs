@@ -96,14 +96,17 @@ impl WasmMuLawCodec {
     /// The μ parameter is automatically set to `(2^bits) - 1` (e.g. 255 for 8-bit).
     ///
     /// # Errors
-    /// Returns a `JsValue` error if `bits` cannot be represented as a `u8`.
+    /// Returns a `JsValue` error if `bits` cannot be represented as a `u8`,
+    /// or is outside the valid range `1..=16` (a JS caller can request any
+    /// `u8`, and an out-of-range bit depth would otherwise silently produce
+    /// a codec with a different bit depth than requested).
     #[wasm_bindgen(constructor)]
     pub fn new(bits: u32) -> Result<WasmMuLawCodec, JsValue> {
         let bits_u8 =
             u8::try_from(bits).map_err(|_| JsValue::from_str("bits must fit in a u8 (0–255)"))?;
-        Ok(WasmMuLawCodec {
-            inner: crate::MuLawCodec::new(bits_u8),
-        })
+        crate::MuLawCodec::try_new(bits_u8)
+            .map(|inner| WasmMuLawCodec { inner })
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Quantize a continuous audio `sample` in `[-1.0, 1.0]` and return its integer code.
@@ -123,7 +126,27 @@ impl WasmMuLawCodec {
 
     /// Return the number of quantization levels (2^bits).
     pub fn num_levels(&self) -> u32 {
-        // MuLawCodec does not expose levels directly; derive from bits.
-        1u32 << self.inner.bits()
+        // `levels()` is computed once from a validated `bits` at
+        // construction time (see `MuLawCodec::try_new`); re-deriving it here
+        // via a fresh `1 << bits` shift would risk overflow if `bits` were
+        // ever unvalidated.
+        self.inner.levels() as u32
     }
 }
+
+// No `#[cfg(test)] mod tests` here: this binding is a thin, compiler-checked
+// pass-through to `MuLawCodec::try_new`/`levels()` (both already covered by
+// `mulaw.rs`'s `test_mulaw_try_new_rejects_invalid_bits` and friends), and
+// constructing a `wasm_bindgen`-wrapped error value natively is unsafe
+// outside a real `wasm-bindgen-test` harness — `JsValue::from_str` (used in
+// the `Err` path above) calls into `wasm_bindgen::__wbindgen_describe`,
+// which is compiled to abort the process (`SIGABRT`, not a catchable panic)
+// when there is no JS glue registered to answer it, as there isn't under
+// plain `cargo test`/`cargo nextest`. This was confirmed empirically while
+// preparing this fix: a native `#[test]` calling
+// `WasmMuLawCodec::new(0).is_err()` aborts the whole test process rather
+// than returning `Err`. Exercising this module's actual JS-facing behavior
+// requires `wasm-bindgen-test` + `wasm-bindgen-test-runner` against a
+// `wasm32-unknown-unknown` build, which this crate does not currently set
+// up; `cargo check --all-features` still type-checks every function here on
+// every run.

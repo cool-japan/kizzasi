@@ -47,20 +47,28 @@
 use crate::dynamic_quantization::QuantizedWeightStorage;
 use crate::error::{ModelError, ModelResult};
 use crate::huggingface::ModelConfig;
+// Architecture imports follow the same feature gates as the modules they come
+// from (see `[features]` in Cargo.toml): a build without `rwkv` has no
+// `crate::rwkv`, so importing it unconditionally would not compile.
+#[cfg(feature = "mamba")]
 use crate::mamba::{Mamba, MambaConfig};
+#[cfg(feature = "mamba")]
 use crate::mamba2::{Mamba2, Mamba2Config};
+#[cfg(feature = "rwkv")]
 use crate::rwkv::{Rwkv, RwkvConfig};
+#[cfg(feature = "rwkv")]
 use crate::rwkv7::{Rwkv7, Rwkv7Config};
+#[cfg(feature = "s4")]
 use crate::s4::{S4Config, S4D};
+#[cfg(feature = "s4")]
 use crate::s5::{S5Config, S5};
+#[cfg(feature = "transformer")]
 use crate::transformer::{Transformer, TransformerConfig};
 use crate::AutoregressiveModel;
 use crate::ModelType;
 use scirs2_core::ndarray::Array2;
 use std::collections::HashMap;
 use tracing::{debug, info, instrument, warn};
-// serde_json is used in helper methods (write_weights_temp)
-use serde_json;
 
 /// Model factory for creating model instances from configurations and weights
 ///
@@ -93,6 +101,17 @@ impl ModelFactory {
     /// - Required configuration fields are missing
     /// - Weights are incompatible with configuration
     #[instrument(skip(weights), fields(model_type = ?config.model_type))]
+    // With every architecture feature off, all match arms below are the
+    // "not compiled in" error arms, which do not consume `weights`.
+    #[cfg_attr(
+        not(any(
+            feature = "mamba",
+            feature = "rwkv",
+            feature = "s4",
+            feature = "transformer"
+        )),
+        allow(unused_variables)
+    )]
     pub fn create_from_config(
         config: &ModelConfig,
         weights: HashMap<String, QuantizedWeightStorage>,
@@ -105,31 +124,100 @@ impl ModelFactory {
 
         // Create appropriate model based on type
         match model_type {
-            ModelType::Mamba | ModelType::Mamba2 => {
+            #[cfg(feature = "mamba")]
+            ModelType::Mamba => {
                 let mamba_config = Self::hf_config_to_mamba_config(config)?;
                 let model = Self::create_mamba(mamba_config, weights)?;
                 Ok(Box::new(model))
             }
-            ModelType::Rwkv => {
-                let rwkv_config = Self::hf_config_to_rwkv_config(config)?;
-                let model = Self::create_rwkv(rwkv_config, weights)?;
+            #[cfg(not(feature = "mamba"))]
+            ModelType::Mamba => Err(ModelError::unsupported_operation(
+                "from_config",
+                "Mamba (rebuild kizzasi-model with the `mamba` feature)",
+            )),
+            #[cfg(feature = "mamba")]
+            ModelType::Mamba2 => {
+                let mamba2_config = Self::hf_config_to_mamba2_config(config)?;
+                let model = Self::create_mamba2(mamba2_config, weights)?;
                 Ok(Box::new(model))
             }
+            #[cfg(not(feature = "mamba"))]
+            ModelType::Mamba2 => Err(ModelError::unsupported_operation(
+                "from_config",
+                "Mamba2 (rebuild kizzasi-model with the `mamba` feature)",
+            )),
+            #[cfg(not(feature = "rwkv"))]
+            ModelType::Rwkv => Err(ModelError::unsupported_operation(
+                "from_config",
+                "RWKV (rebuild kizzasi-model with the `rwkv` feature)",
+            )),
+            #[cfg(feature = "rwkv")]
+            ModelType::Rwkv => {
+                // `detect_model_type` maps both "rwkv"/"rwkv6" and "rwkv7"
+                // to this same coarse `ModelType::Rwkv` — there is no
+                // `ModelType::Rwkv7` variant, because `ModelType` is also
+                // matched exhaustively by `kizzasi-inference::registry`
+                // (a different crate this fix cannot touch), so adding a
+                // variant there would be a breaking change out of scope
+                // here. Disambiguate from the raw config string instead, so
+                // an RWKV-7 checkpoint still builds a real `Rwkv7` model
+                // instead of silently mis-loading into an RWKV-v6 `Rwkv`.
+                if Self::config_names(config, "rwkv7") {
+                    let rwkv7_config = Self::hf_config_to_rwkv7_config(config)?;
+                    let model = Self::create_rwkv7(rwkv7_config, weights)?;
+                    Ok(Box::new(model))
+                } else {
+                    let rwkv_config = Self::hf_config_to_rwkv_config(config)?;
+                    let model = Self::create_rwkv(rwkv_config, weights)?;
+                    Ok(Box::new(model))
+                }
+            }
+            #[cfg(feature = "s4")]
             ModelType::S4 => {
                 let s4_config = Self::hf_config_to_s4_config(config)?;
                 let model = Self::create_s4(s4_config, weights)?;
                 Ok(Box::new(model))
             }
+            #[cfg(not(feature = "s4"))]
+            ModelType::S4 => Err(ModelError::unsupported_operation(
+                "from_config",
+                "S4 (rebuild kizzasi-model with the `s4` feature)",
+            )),
+            #[cfg(not(feature = "s4"))]
+            ModelType::S4D => Err(ModelError::unsupported_operation(
+                "from_config",
+                "S4D/S5 (rebuild kizzasi-model with the `s4` feature)",
+            )),
+            #[cfg(feature = "s4")]
             ModelType::S4D => {
-                let s5_config = Self::hf_config_to_s5_config(config)?;
-                let model = Self::create_s5(s5_config, weights)?;
-                Ok(Box::new(model))
+                // Same situation as RWKV above: `detect_model_type` maps
+                // both "s4d" and "s5" to this same `ModelType::S4D` (no
+                // `ModelType::S5` variant, for the same cross-crate reason).
+                // Disambiguate from the raw config string: "s5" builds the
+                // real S5 architecture (parallel-scan SSM); "s4d" builds the
+                // diagonal S4 kernel via `create_s4`, which is what the
+                // `S4D` struct actually is (see `S4Config::use_diagonal`).
+                if Self::config_names(config, "s5") {
+                    let s5_config = Self::hf_config_to_s5_config(config)?;
+                    let model = Self::create_s5(s5_config, weights)?;
+                    Ok(Box::new(model))
+                } else {
+                    let s4_config = Self::hf_config_to_s4_config(config)?;
+                    let model = Self::create_s4(s4_config, weights)?;
+                    Ok(Box::new(model))
+                }
             }
+            #[cfg(feature = "transformer")]
             ModelType::Transformer => {
                 let transformer_config = Self::hf_config_to_transformer_config(config)?;
                 let model = Self::create_transformer(transformer_config, weights)?;
                 Ok(Box::new(model))
             }
+            #[cfg(not(feature = "transformer"))]
+            ModelType::Transformer => Err(ModelError::unsupported_operation(
+                "from_config",
+                "Transformer (rebuild kizzasi-model with the `transformer` feature)",
+            )),
             ModelType::Rwkv5 => {
                 // RWKV v5 models are created directly, not from HF configs
                 Err(ModelError::unsupported_operation(
@@ -168,11 +256,19 @@ impl ModelFactory {
         }
     }
 
-    /// Convert quantized weights to `HashMap<String, Vec<f32>>` for JSON serialisation.
+    /// Convert quantized weights to a `HashMap<String, Vec<f32>>` parameter map.
     ///
     /// Each `QuantizedWeightStorage` value is dequantised to FP32 and then flattened
-    /// into a contiguous `Vec<f32>`.  The resulting map can be written directly with
-    /// `serde_json` and fed to any model's `load_weights_json` method.
+    /// into a contiguous `Vec<f32>`.  The resulting map is handed straight to a
+    /// model's `load_weights_map` method — it never touches the filesystem.
+    // Weight-application helpers used by every `create_*` constructor; with
+    // no architecture compiled in there is no constructor to use them.
+    #[cfg(any(
+        feature = "mamba",
+        feature = "rwkv",
+        feature = "s4",
+        feature = "transformer"
+    ))]
     fn quantized_to_f32_vecs(
         weights: &HashMap<String, QuantizedWeightStorage>,
     ) -> ModelResult<HashMap<String, Vec<f32>>> {
@@ -188,50 +284,32 @@ impl ModelFactory {
         Ok(out)
     }
 
-    /// Write a `HashMap<String, Vec<f32>>` to a temporary JSON file.
+    /// Reject a weight map whose names match nothing in the target model.
     ///
-    /// Returns the path of the created file.  The caller is responsible for
-    /// removing the file after use.
-    fn write_weights_temp(
-        f32_weights: &HashMap<String, Vec<f32>>,
-        tag: &str,
-    ) -> ModelResult<std::path::PathBuf> {
-        use std::io::Write;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-        // Combine thread ID with a monotonic counter to guarantee uniqueness even
-        // when the same thread runs multiple concurrent test closures.
-        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let thread_id = format!("{:?}", std::thread::current().id());
-        // Sanitise: keep only alphanumeric chars (thread IDs contain `(`, `)`, etc.)
-        let safe_id: String = thread_id.chars().filter(|c| c.is_alphanumeric()).collect();
-        let mut path = std::env::temp_dir();
-        let pid = std::process::id();
-        path.push(format!(
-            "kizzasi_factory_weights_{}_{}_{}_{}.json",
-            tag, pid, safe_id, counter
-        ));
-        // Use OpenOptions to truncate any pre-existing file content
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .map_err(|e| {
-                ModelError::simple_load_error(format!(
-                    "Failed to create temp weight file {}: {}",
-                    path.display(),
-                    e
-                ))
-            })?;
-        let mut writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(&mut writer, f32_weights).map_err(|e| {
-            ModelError::simple_load_error(format!("Failed to serialise weights to JSON: {}", e))
-        })?;
-        writer.flush().map_err(|e| {
-            ModelError::simple_load_error(format!("Failed to flush weight file: {}", e))
-        })?;
-        Ok(path)
+    /// Weight loading is deliberately partial — a caller may supply a subset of
+    /// tensors. But a map that matches *zero* parameters means the names came
+    /// from a different naming scheme entirely; returning `Ok` there would hand
+    /// back a randomly-initialised model while reporting a successful load.
+    // Weight-application helpers used by every `create_*` constructor; with
+    // no architecture compiled in there is no constructor to use them.
+    #[cfg(any(
+        feature = "mamba",
+        feature = "rwkv",
+        feature = "s4",
+        feature = "transformer"
+    ))]
+    fn require_weights_applied(model: &str, applied: usize, supplied: usize) -> ModelResult<()> {
+        if supplied > 0 && applied == 0 {
+            return Err(ModelError::load_error(
+                format!("{} weight injection", model),
+                format!(
+                    "none of the {} supplied tensors matched this model's parameter names; \
+                     the model would have kept its random initialisation",
+                    supplied
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Create Mamba model from config and weights
@@ -249,6 +327,7 @@ impl ModelFactory {
     /// - `layers.{i}.ssm.c_proj`: `[inner_dim, state_dim]`
     /// - `layers.{i}.out_proj`: `[inner_dim, hidden_dim]`
     #[instrument(skip(weights))]
+    #[cfg(feature = "mamba")]
     pub fn create_mamba(
         config: MambaConfig,
         weights: HashMap<String, QuantizedWeightStorage>,
@@ -262,11 +341,12 @@ impl ModelFactory {
 
         if !weights.is_empty() {
             let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
-            let tmp_path = Self::write_weights_temp(&f32_weights, "mamba")?;
-            let load_result = model.load_weights_json(&tmp_path);
-            let _ = std::fs::remove_file(&tmp_path);
-            load_result?;
-            debug!("Mamba model weights injected successfully");
+            let applied = model.load_weights_map(&f32_weights)?;
+            Self::require_weights_applied("Mamba", applied, f32_weights.len())?;
+            debug!(
+                "Mamba model weights injected successfully ({} tensors)",
+                applied
+            );
         } else {
             warn!("Mamba model created without weights (empty weights map)");
         }
@@ -277,6 +357,7 @@ impl ModelFactory {
 
     /// Create Mamba2 model from config and weights
     #[instrument(skip(weights))]
+    #[cfg(feature = "mamba")]
     pub fn create_mamba2(
         config: Mamba2Config,
         weights: HashMap<String, QuantizedWeightStorage>,
@@ -290,11 +371,12 @@ impl ModelFactory {
 
         if !weights.is_empty() {
             let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
-            let tmp_path = Self::write_weights_temp(&f32_weights, "mamba2")?;
-            let load_result = model.load_weights_json(&tmp_path);
-            let _ = std::fs::remove_file(&tmp_path);
-            load_result?;
-            debug!("Mamba2 model weights injected successfully");
+            let applied = model.load_weights_map(&f32_weights)?;
+            Self::require_weights_applied("Mamba2", applied, f32_weights.len())?;
+            debug!(
+                "Mamba2 model weights injected successfully ({} tensors)",
+                applied
+            );
         } else {
             warn!("Mamba2 model created without weights (empty weights map)");
         }
@@ -305,6 +387,7 @@ impl ModelFactory {
 
     /// Create RWKV model from config and weights
     #[instrument(skip(weights))]
+    #[cfg(feature = "rwkv")]
     pub fn create_rwkv(
         config: RwkvConfig,
         weights: HashMap<String, QuantizedWeightStorage>,
@@ -318,11 +401,12 @@ impl ModelFactory {
 
         if !weights.is_empty() {
             let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
-            let tmp_path = Self::write_weights_temp(&f32_weights, "rwkv")?;
-            let load_result = model.load_weights_json(&tmp_path);
-            let _ = std::fs::remove_file(&tmp_path);
-            load_result?;
-            debug!("RWKV model weights injected successfully");
+            let applied = model.load_weights_map(&f32_weights)?;
+            Self::require_weights_applied("RWKV", applied, f32_weights.len())?;
+            debug!(
+                "RWKV model weights injected successfully ({} tensors)",
+                applied
+            );
         } else {
             warn!("RWKV model created without weights (empty weights map)");
         }
@@ -333,6 +417,7 @@ impl ModelFactory {
 
     /// Create RWKV-v7 model from config and weights
     #[instrument(skip(weights))]
+    #[cfg(feature = "rwkv")]
     pub fn create_rwkv7(
         config: Rwkv7Config,
         weights: HashMap<String, QuantizedWeightStorage>,
@@ -346,11 +431,12 @@ impl ModelFactory {
 
         if !weights.is_empty() {
             let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
-            let tmp_path = Self::write_weights_temp(&f32_weights, "rwkv7")?;
-            let load_result = model.load_weights_json(&tmp_path);
-            let _ = std::fs::remove_file(&tmp_path);
-            load_result?;
-            debug!("RWKV-v7 model weights injected successfully");
+            let applied = model.load_weights_map(&f32_weights)?;
+            Self::require_weights_applied("RWKV-v7", applied, f32_weights.len())?;
+            debug!(
+                "RWKV-v7 model weights injected successfully ({} tensors)",
+                applied
+            );
         } else {
             warn!("RWKV-v7 model created without weights (empty weights map)");
         }
@@ -361,6 +447,7 @@ impl ModelFactory {
 
     /// Create S4 model from config and weights
     #[instrument(skip(weights))]
+    #[cfg(feature = "s4")]
     pub fn create_s4(
         config: S4Config,
         weights: HashMap<String, QuantizedWeightStorage>,
@@ -374,11 +461,12 @@ impl ModelFactory {
 
         if !weights.is_empty() {
             let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
-            let tmp_path = Self::write_weights_temp(&f32_weights, "s4")?;
-            let load_result = model.load_weights_json(&tmp_path);
-            let _ = std::fs::remove_file(&tmp_path);
-            load_result?;
-            debug!("S4D model weights injected successfully");
+            let applied = model.load_weights_map(&f32_weights)?;
+            Self::require_weights_applied("S4D", applied, f32_weights.len())?;
+            debug!(
+                "S4D model weights injected successfully ({} tensors)",
+                applied
+            );
         } else {
             warn!("S4D model created without weights (empty weights map)");
         }
@@ -389,6 +477,7 @@ impl ModelFactory {
 
     /// Create S5 model from config and weights
     #[instrument(skip(weights))]
+    #[cfg(feature = "s4")]
     pub fn create_s5(
         config: S5Config,
         weights: HashMap<String, QuantizedWeightStorage>,
@@ -402,11 +491,12 @@ impl ModelFactory {
 
         if !weights.is_empty() {
             let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
-            let tmp_path = Self::write_weights_temp(&f32_weights, "s5")?;
-            let load_result = model.load_weights_json(&tmp_path);
-            let _ = std::fs::remove_file(&tmp_path);
-            load_result?;
-            debug!("S5 model weights injected successfully");
+            let applied = model.load_weights_map(&f32_weights)?;
+            Self::require_weights_applied("S5", applied, f32_weights.len())?;
+            debug!(
+                "S5 model weights injected successfully ({} tensors)",
+                applied
+            );
         } else {
             warn!("S5 model created without weights (empty weights map)");
         }
@@ -417,6 +507,7 @@ impl ModelFactory {
 
     /// Create Transformer model from config and weights
     #[instrument(skip(weights))]
+    #[cfg(feature = "transformer")]
     pub fn create_transformer(
         config: TransformerConfig,
         weights: HashMap<String, QuantizedWeightStorage>,
@@ -430,11 +521,12 @@ impl ModelFactory {
 
         if !weights.is_empty() {
             let f32_weights = Self::quantized_to_f32_vecs(&weights)?;
-            let tmp_path = Self::write_weights_temp(&f32_weights, "transformer")?;
-            let load_result = model.load_weights_json(&tmp_path);
-            let _ = std::fs::remove_file(&tmp_path);
-            load_result?;
-            debug!("Transformer model weights injected successfully");
+            let applied = model.load_weights_map(&f32_weights)?;
+            Self::require_weights_applied("Transformer", applied, f32_weights.len())?;
+            debug!(
+                "Transformer model weights injected successfully ({} tensors)",
+                applied
+            );
         } else {
             warn!("Transformer model created without weights (empty weights map)");
         }
@@ -443,9 +535,40 @@ impl ModelFactory {
         Ok(model)
     }
 
+    /// Case-insensitively check whether `config.model_type` equals `needle`,
+    /// or any entry of `config.architecture` contains `needle`.
+    ///
+    /// Used by [`Self::create_from_config`] to disambiguate architectures
+    /// that share one coarse [`ModelType`] variant (RWKV-6 vs RWKV-7, S4D vs
+    /// S5) from the original config string, since `ModelType` itself cannot
+    /// grow new variants for this without breaking `kizzasi-inference`'s
+    /// exhaustive match over it.
+    ///
+    /// Only the `rwkv` and `s4` arms need this disambiguation, so a build
+    /// without either feature has no caller for it.
+    #[cfg(any(feature = "rwkv", feature = "s4"))]
+    fn config_names(config: &ModelConfig, needle: &str) -> bool {
+        let matches_type = config
+            .model_type
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(needle));
+        let matches_arch = config.architecture.as_ref().is_some_and(|archs| {
+            archs
+                .iter()
+                .any(|a| a.to_lowercase().contains(&needle.to_lowercase()))
+        });
+        matches_type || matches_arch
+    }
+
     /// Detect model type from HuggingFace configuration
     ///
     /// Checks both `model_type` and `architectures` fields to determine the model type.
+    ///
+    /// Note: `"rwkv7"` and `"s5"` intentionally collapse to the same coarse
+    /// [`ModelType::Rwkv`] / [`ModelType::S4D`] as their v6/S4D siblings —
+    /// see [`Self::create_from_config`], which re-inspects the raw config
+    /// string via [`Self::config_names`] to route to the correct concrete
+    /// architecture despite the shared `ModelType`.
     fn detect_model_type(config: &ModelConfig) -> ModelResult<ModelType> {
         // Check model_type field
         if let Some(model_type) = &config.model_type {
@@ -484,6 +607,7 @@ impl ModelFactory {
     }
 
     /// Convert HuggingFace ModelConfig to MambaConfig
+    #[cfg(feature = "mamba")]
     fn hf_config_to_mamba_config(config: &ModelConfig) -> ModelResult<MambaConfig> {
         let hidden_dim = config
             .hidden_dim
@@ -507,7 +631,41 @@ impl ModelFactory {
         })
     }
 
+    /// Convert HuggingFace ModelConfig to Mamba2Config
+    #[cfg(feature = "mamba")]
+    fn hf_config_to_mamba2_config(config: &ModelConfig) -> ModelResult<Mamba2Config> {
+        let hidden_dim = config
+            .hidden_dim
+            .ok_or_else(|| ModelError::simple_load_error("Missing required field: hidden_size"))?;
+
+        let num_layers = config.num_layers.ok_or_else(|| {
+            ModelError::simple_load_error("Missing required field: num_hidden_layers")
+        })?;
+
+        let state_dim = config.state_dim.unwrap_or(64); // Mamba2 default (typically 64-128)
+        let num_heads = config
+            .num_attention_heads
+            .unwrap_or_else(|| (hidden_dim / 64).max(1))
+            .max(1);
+        let head_dim = hidden_dim / num_heads;
+
+        Ok(Mamba2Config {
+            input_dim: 1,
+            hidden_dim,
+            state_dim,
+            num_heads,
+            head_dim,
+            expand_factor: 2,    // Mamba2 default
+            conv_kernel_size: 4, // Mamba2 default
+            num_layers,
+            dropout: 0.0,
+            use_rms_norm: true,
+            chunk_size: 256, // Mamba2 SSD default
+        })
+    }
+
     /// Convert HuggingFace ModelConfig to RwkvConfig
+    #[cfg(feature = "rwkv")]
     fn hf_config_to_rwkv_config(config: &ModelConfig) -> ModelResult<RwkvConfig> {
         let hidden_dim = config
             .hidden_dim
@@ -529,12 +687,49 @@ impl ModelFactory {
             num_heads,
             head_dim,
             dropout: 0.0,
-            time_decay_init: 0.99, // RWKV default
-            use_rms_norm: false,   // Standard LayerNorm
+            // `time_decay_init` lives in RWKV's log-log space: the per-step
+            // decay is `exp(-exp(w))`. The reference implementations initialise
+            // it around -5.0 (decay ≈ 0.993). A value of 0.99 would mean a decay
+            // of exp(-exp(0.99)) ≈ 0.068 — effectively a one-step memory.
+            time_decay_init: -5.0,
+            use_rms_norm: false, // Standard LayerNorm
+        })
+    }
+
+    /// Convert HuggingFace ModelConfig to Rwkv7Config
+    #[cfg(feature = "rwkv")]
+    fn hf_config_to_rwkv7_config(config: &ModelConfig) -> ModelResult<Rwkv7Config> {
+        let hidden_dim = config
+            .hidden_dim
+            .ok_or_else(|| ModelError::simple_load_error("Missing required field: hidden_size"))?;
+
+        let num_layers = config.num_layers.ok_or_else(|| {
+            ModelError::simple_load_error("Missing required field: num_hidden_layers")
+        })?;
+
+        let num_heads = config
+            .num_attention_heads
+            .unwrap_or_else(|| (hidden_dim / 64).max(1))
+            .max(1);
+        let head_dim = hidden_dim / num_heads;
+        let context_length = config.max_position_embeddings.unwrap_or(16384);
+
+        Ok(Rwkv7Config {
+            input_dim: 1,
+            hidden_dim,
+            num_layers,
+            num_heads,
+            head_dim,
+            expand_factor: 3.5, // RWKV-7 default FFN expansion
+            context_length,
+            // See the matching comment on `hf_config_to_rwkv_config` above:
+            // same log-log decay space, same reference-implementation init.
+            time_decay_init: -5.0,
         })
     }
 
     /// Convert HuggingFace ModelConfig to S4Config
+    #[cfg(feature = "s4")]
     fn hf_config_to_s4_config(config: &ModelConfig) -> ModelResult<S4Config> {
         let hidden_dim = config
             .hidden_dim
@@ -560,6 +755,7 @@ impl ModelFactory {
     }
 
     /// Convert HuggingFace ModelConfig to S5Config
+    #[cfg(feature = "s4")]
     fn hf_config_to_s5_config(config: &ModelConfig) -> ModelResult<S5Config> {
         let hidden_dim = config
             .hidden_dim
@@ -582,6 +778,7 @@ impl ModelFactory {
     }
 
     /// Convert HuggingFace ModelConfig to TransformerConfig
+    #[cfg(feature = "transformer")]
     fn hf_config_to_transformer_config(config: &ModelConfig) -> ModelResult<TransformerConfig> {
         let hidden_dim = config
             .hidden_dim
@@ -748,6 +945,114 @@ mod tests {
     }
 
     #[test]
+    fn test_create_from_config_mamba2_routes_to_mamba2_not_mamba() {
+        // Regression test for id102: "mamba2" used to route through
+        // `hf_config_to_mamba_config` (which hardcodes `use_mamba2: false`)
+        // and `create_mamba`, silently building a Mamba-v1 model.
+        let config = ModelConfig {
+            architecture: None,
+            hidden_dim: Some(256),
+            num_layers: Some(2),
+            vocab_size: None,
+            max_position_embeddings: None,
+            state_dim: None, // omitted: Mamba defaults to 16, Mamba2 to 64
+            num_attention_heads: None,
+            model_type: Some("mamba2".to_string()),
+            extra: HashMap::new(),
+        };
+
+        let model = ModelFactory::create_from_config(&config, HashMap::new())
+            .expect("mamba2 config should build successfully");
+
+        assert_eq!(model.model_type(), ModelType::Mamba2);
+        assert_eq!(
+            model.state_dim(),
+            64,
+            "state_dim=64 is Mamba2Config's default; Mamba's default is 16, \
+             so this also proves hf_config_to_mamba2_config (not \
+             hf_config_to_mamba_config) was used"
+        );
+    }
+
+    #[test]
+    fn test_create_from_config_rwkv7_routes_to_rwkv7_not_rwkv6() {
+        // Regression test for id102: "rwkv7" used to detect as the same
+        // coarse `ModelType::Rwkv` as v6 and route through `create_rwkv`
+        // (RWKV-v6), silently building the wrong architecture.
+        //
+        // Discriminated via weight-key schema: `w_a` ("bonus/attention
+        // gate") is an RWKV-7-only concept (see `Rwkv7TimeMixing`); RWKV-v6
+        // has no such key. If routing regressed to RWKV-v6, this weight map
+        // would match nothing and `create_rwkv` would return an error via
+        // `require_weights_applied`.
+        let hidden_dim = 8usize;
+        let config = ModelConfig {
+            architecture: None,
+            hidden_dim: Some(hidden_dim),
+            num_layers: Some(1),
+            vocab_size: None,
+            max_position_embeddings: None,
+            state_dim: None,
+            num_attention_heads: Some(2),
+            model_type: Some("rwkv7".to_string()),
+            extra: HashMap::new(),
+        };
+
+        let mut weights = HashMap::new();
+        let arr = Array2::<f32>::zeros((hidden_dim, hidden_dim));
+        weights.insert(
+            "layers.0.time_mixing.w_a".to_string(),
+            QuantizedWeightStorage::FP32(arr),
+        );
+
+        let model = ModelFactory::create_from_config(&config, weights)
+            .expect("rwkv7 config with a w_a weight should route to Rwkv7 and apply it");
+        assert_eq!(model.hidden_dim(), hidden_dim);
+    }
+
+    #[test]
+    fn test_create_from_config_s5_and_s4d_route_to_different_structs() {
+        // Regression test for id102: "s4d" and "s5" both detected as the
+        // same coarse `ModelType::S4D` and both routed through `create_s5`,
+        // so an S4D checkpoint silently built an S5 model. `S5::model_type`
+        // returns `ModelType::S4` (it has no dedicated variant) while
+        // `S4D::model_type` returns `ModelType::S4D` — different concrete
+        // structs, distinguishable via this pre-existing asymmetry.
+        let base = ModelConfig {
+            architecture: None,
+            hidden_dim: Some(16),
+            num_layers: Some(1),
+            vocab_size: None,
+            max_position_embeddings: None,
+            state_dim: Some(8),
+            num_attention_heads: None,
+            model_type: None,
+            extra: HashMap::new(),
+        };
+
+        let s4d_config = ModelConfig {
+            model_type: Some("s4d".to_string()),
+            ..base.clone()
+        };
+        let s4d_model = ModelFactory::create_from_config(&s4d_config, HashMap::new())
+            .expect("s4d config should build successfully");
+        assert_eq!(s4d_model.model_type(), ModelType::S4D);
+
+        let s5_config = ModelConfig {
+            model_type: Some("s5".to_string()),
+            ..base
+        };
+        let s5_model = ModelFactory::create_from_config(&s5_config, HashMap::new())
+            .expect("s5 config should build successfully");
+        assert_eq!(
+            s5_model.model_type(),
+            ModelType::S4,
+            "S5::model_type() == ModelType::S4 is what proves the S5 struct \
+             (not S4D) was built for an 's5' model_type"
+        );
+    }
+
+    #[test]
     fn test_hf_config_to_mamba_config() {
         let config = ModelConfig {
             architecture: None,
@@ -860,7 +1165,7 @@ mod tests {
             num_heads: 4,
             head_dim: 32,
             dropout: 0.0,
-            time_decay_init: 0.99,
+            time_decay_init: -5.0,
             use_rms_norm: false,
         };
 
@@ -897,13 +1202,11 @@ mod tests {
 
     /// Shared mutex to serialise the factory weight-injection tests.
     ///
-    /// These tests write + read + delete temporary JSON files via the factory's
-    /// `write_weights_temp` helper.  Although each invocation uses a unique
-    /// file path (via an atomic counter), the test binary runs all unit tests
-    /// concurrently by default, and the OS file-system operations are not
-    /// linearisable across threads under high contention.  Holding this mutex
-    /// for the duration of each weight-injection test prevents any interleaving
-    /// that could cause partial reads or premature deletions.
+    /// The factory itself no longer touches the filesystem, but these tests
+    /// still stage reference weights through temporary JSON files, and
+    /// [`test_factory_injection_writes_no_temp_files`] scans the shared temp
+    /// directory. Holding this mutex keeps those file-system observations from
+    /// interleaving across the concurrently-running unit tests.
     fn factory_injection_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1043,6 +1346,155 @@ mod tests {
 
         // Step 4: verify model is functional — hidden_dim matches
         assert_eq!(model.hidden_dim(), 32);
+    }
+
+    /// Count the temp-directory entries the old on-disk injection path used to
+    /// leave behind.
+    fn factory_temp_weight_files() -> usize {
+        let dir = std::env::temp_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("kizzasi_factory_weights_")
+            })
+            .count()
+    }
+
+    /// The factory must inject weights in-process.
+    ///
+    /// It used to serialise the whole parameter set to a temporary JSON file
+    /// and read it straight back — an f32 → decimal-text → f32 round-trip that
+    /// needed a multiple of the model size in free temp space and leaked the
+    /// file if the process died mid-load.
+    #[cfg(feature = "mamba")]
+    #[test]
+    fn test_factory_injection_writes_no_temp_files() {
+        let _guard = factory_injection_lock();
+        use crate::dynamic_quantization::QuantizedWeightStorage;
+        use crate::mamba::MambaConfig;
+
+        let config = MambaConfig {
+            input_dim: 2,
+            hidden_dim: 16,
+            state_dim: 4,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 1,
+            dropout: 0.0,
+            use_mamba2: false,
+        };
+
+        let mut quant_weights: HashMap<String, QuantizedWeightStorage> = HashMap::new();
+        let values: Vec<f32> = (0..(config.input_dim * config.hidden_dim))
+            .map(|i| i as f32 * 0.25)
+            .collect();
+        let arr = Array2::from_shape_vec((1, values.len()), values).expect("reshape");
+        quant_weights.insert("input_proj".to_string(), QuantizedWeightStorage::FP32(arr));
+
+        let before = factory_temp_weight_files();
+        let model = ModelFactory::create_mamba(config, quant_weights).expect("create_mamba");
+        let after = factory_temp_weight_files();
+
+        assert_eq!(
+            before, after,
+            "factory must not stage weights through a temp file"
+        );
+        assert_eq!(model.hidden_dim(), 16);
+    }
+
+    /// A malformed weight entry must surface as a typed error, proving the map
+    /// really reaches the model's `load_weights_map` rather than being dropped.
+    #[cfg(feature = "mamba")]
+    #[test]
+    fn test_factory_injection_reports_shape_mismatch() {
+        use crate::dynamic_quantization::QuantizedWeightStorage;
+        use crate::mamba::MambaConfig;
+
+        let config = MambaConfig {
+            input_dim: 2,
+            hidden_dim: 16,
+            state_dim: 4,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 1,
+            dropout: 0.0,
+            use_mamba2: false,
+        };
+
+        let mut quant_weights: HashMap<String, QuantizedWeightStorage> = HashMap::new();
+        // input_proj must be 2×16 = 32 values; give it 5.
+        let arr = Array2::from_shape_vec((1, 5), vec![0.0f32; 5]).expect("reshape");
+        quant_weights.insert("input_proj".to_string(), QuantizedWeightStorage::FP32(arr));
+
+        let msg = match ModelFactory::create_mamba(config, quant_weights) {
+            Ok(_) => panic!("a wrong-shaped weight must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("input_proj"),
+            "error should name the offending tensor, got: {msg}"
+        );
+    }
+
+    /// A weight map whose names match nothing must be an error, not a silent
+    /// "injected successfully" over a randomly-initialised model.
+    #[cfg(feature = "mamba")]
+    #[test]
+    fn test_factory_rejects_weight_map_that_matches_nothing() {
+        use crate::dynamic_quantization::QuantizedWeightStorage;
+        use crate::mamba::MambaConfig;
+
+        let config = MambaConfig {
+            input_dim: 2,
+            hidden_dim: 16,
+            state_dim: 4,
+            expand_factor: 2,
+            conv_kernel_size: 4,
+            num_layers: 1,
+            dropout: 0.0,
+            use_mamba2: false,
+        };
+
+        let mut quant_weights: HashMap<String, QuantizedWeightStorage> = HashMap::new();
+        let arr = Array2::from_shape_vec((1, 4), vec![0.0f32; 4]).expect("reshape");
+        quant_weights.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            QuantizedWeightStorage::FP32(arr),
+        );
+
+        let msg = match ModelFactory::create_mamba(config, quant_weights) {
+            Ok(_) => panic!("a weight map matching no parameter must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("matched"),
+            "error should explain that nothing matched, got: {msg}"
+        );
+    }
+
+    /// The same guard must protect S5, whose parameter names differ entirely
+    /// from the HuggingFace conventions callers usually start from.
+    #[test]
+    fn test_factory_rejects_unmatched_weights_for_s5() {
+        use crate::dynamic_quantization::QuantizedWeightStorage;
+
+        let config = S5Config::new(2, 8, 1);
+        let mut quant_weights: HashMap<String, QuantizedWeightStorage> = HashMap::new();
+        let arr = Array2::from_shape_vec((1, 4), vec![1.0f32; 4]).expect("reshape");
+        quant_weights.insert(
+            "backbone.layers.0.mixer.A_log".to_string(),
+            QuantizedWeightStorage::FP32(arr),
+        );
+
+        assert!(
+            ModelFactory::create_s5(config, quant_weights).is_err(),
+            "S5 must not report success for a weight map it ignored entirely"
+        );
     }
 
     /// Test that PyTorchConverter weight name conversion works in pytorch_compat.

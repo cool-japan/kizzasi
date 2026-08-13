@@ -229,12 +229,14 @@ fn test_fourier_pipeline() {
     let signal = Array1::linspace(0.0, 1.0, 64);
 
     let encoded = tokenizer.encode(&signal).expect("Encoding failed");
-    // Fourier with magnitude_only=false stores both magnitude and phase (2*num_bins)
-    assert_eq!(encoded.len(), 64); // 2 * 32 bins
+    // token[0] is the original-length header (needed so `decode` can run
+    // the inverse transform at the right size); tokens[1..] store both
+    // magnitude and phase per bin (2 * 32 bins).
+    assert_eq!(encoded.len(), 65);
 
     let decoded = tokenizer.decode(&encoded).expect("Decoding failed");
-    // Check that decoding produces valid output
-    assert!(!decoded.is_empty());
+    // Check that decoding produces valid output of the original length.
+    assert_eq!(decoded.len(), signal.len());
     assert!(decoded.iter().all(|&x| x.is_finite()));
 }
 
@@ -275,18 +277,37 @@ fn test_entropy_coding_pipeline() {
     let decoded = huffman_decoder.decode(&encoded).expect("Decoding failed");
     assert_eq!(decoded, data);
 
-    // Note: Arithmetic coding encoder/decoder may have implementation limitations
-    // Verifying that encoding/decoding runs without errors
+    // Arithmetic coding - exact round-trip, adaptive and static.
+    //
+    // The decoder must be built from the *initial* model the encoder started
+    // with. The previous version of this test decoded an adaptive stream with
+    // a completely different frequency table and asserted only that the output
+    // had the right length, which the old (non-renormalising) coder satisfied
+    // while returning garbage symbols.
     let alphabet_size = *data.iter().max().expect("Data is non-empty") as usize + 1;
+
     let mut arith_encoder = ArithmeticEncoder::new(alphabet_size);
     let encoded = arith_encoder.encode(&data, true).expect("Encoding failed");
     assert!(!encoded.is_empty());
 
-    let arith_decoder = ArithmeticDecoder::new(freq_table);
+    let initial_model = ArithmeticEncoder::new(alphabet_size);
+    let arith_decoder = ArithmeticDecoder::new(initial_model.frequencies().clone());
     let decoded = arith_decoder.decode(&encoded).expect("Decoding failed");
-    // Verify basic properties
-    assert_eq!(decoded.len(), data.len());
-    assert!(decoded.iter().all(|&x| x <= 4));
+    assert_eq!(
+        decoded, data,
+        "adaptive arithmetic round-trip must be exact"
+    );
+
+    // The static path round-trips against the measured histogram.
+    let mut static_encoder = ArithmeticEncoder::from_frequencies(freq_table.clone());
+    let static_encoded = static_encoder
+        .encode(&data, false)
+        .expect("Static encoding failed");
+    let static_decoder = ArithmeticDecoder::new(freq_table);
+    let static_decoded = static_decoder
+        .decode(&static_encoded)
+        .expect("Static decoding failed");
+    assert_eq!(static_decoded, data);
 }
 
 /// Test transformer tokenizer pipeline

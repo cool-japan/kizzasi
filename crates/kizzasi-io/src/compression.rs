@@ -212,7 +212,7 @@ impl SignalCompressor {
         min_val: f32,
         max_val: f32,
     ) -> IoResult<Vec<u8>> {
-        if bits == 0 || bits > 16 {
+        if !quantize_bits_valid(bits) {
             return Err(IoError::InvalidConfig(
                 "Quantization bits must be 1-16".to_string(),
             ));
@@ -220,16 +220,22 @@ impl SignalCompressor {
 
         let levels = (1u32 << bits) - 1;
         let range = max_val - min_val;
+        // A degenerate (zero-width) range means every sample equals
+        // min_val == max_val. Normalize to 0 instead of dividing by ~0, but
+        // still emit one quantized value per input sample: a previous
+        // version short-circuited to a single output byte here, which
+        // silently dropped every sample but the first on decompress (see
+        // `decompress_quantize`, which trusts `original_length`).
+        let degenerate_range = range.abs() < 1e-10;
 
-        if range.abs() < 1e-10 {
-            // All values are the same
-            return Ok(vec![0]);
-        }
-
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(signal.len() * if bits <= 8 { 1 } else { 2 });
 
         for &sample in signal {
-            let normalized = ((sample - min_val) / range).clamp(0.0, 1.0);
+            let normalized = if degenerate_range {
+                0.0
+            } else {
+                ((sample - min_val) / range).clamp(0.0, 1.0)
+            };
             let quantized = (normalized * levels as f32).round() as u16;
 
             if bits <= 8 {
@@ -294,14 +300,19 @@ impl SignalCompressor {
         let mut i = 0;
 
         while i + 6 <= data.len() {
-            let count_bytes: [u8; 2] = data[i..i + 2]
-                .try_into()
-                .expect("RLE decode: slice must be exactly 2 bytes");
+            // Both slices are exactly 2 and 4 bytes long by construction of
+            // the ranges above, so `try_into()` cannot actually fail here --
+            // but `map_err` (rather than `expect`) keeps this function
+            // panic-free in non-test library code even if that invariant is
+            // ever violated by a future edit.
+            let count_bytes: [u8; 2] = data[i..i + 2].try_into().map_err(|_| {
+                IoError::ParseError("RLE decode: count chunk must be 2 bytes".to_string())
+            })?;
             let count = u16::from_le_bytes(count_bytes);
 
-            let value_bytes: [u8; 4] = data[i + 2..i + 6]
-                .try_into()
-                .expect("RLE decode: slice must be exactly 4 bytes");
+            let value_bytes: [u8; 4] = data[i + 2..i + 6].try_into().map_err(|_| {
+                IoError::ParseError("RLE decode: value chunk must be 4 bytes".to_string())
+            })?;
             let value = f32::from_le_bytes(value_bytes);
 
             for _ in 0..count {
@@ -315,18 +326,21 @@ impl SignalCompressor {
     }
 
     fn decompress_delta(&self, data: &[u8], first_sample: f32) -> IoResult<Vec<f32>> {
-        let mut signal = vec![first_sample];
+        // Track the running reconstructed value directly instead of
+        // re-reading it back out via `Vec::last()` (which would need an
+        // `expect`/`unwrap` to justify why the vector, seeded with
+        // `first_sample`, can never be empty).
+        let mut signal = Vec::with_capacity(data.len() / 4 + 1);
+        signal.push(first_sample);
+        let mut current = first_sample;
 
         for chunk in data.chunks_exact(4) {
             let bytes: [u8; 4] = chunk
                 .try_into()
                 .map_err(|_| IoError::ParseError("Invalid delta data".to_string()))?;
             let delta = f32::from_le_bytes(bytes);
-            let next = signal
-                .last()
-                .expect("Delta decode: signal must be non-empty")
-                + delta;
-            signal.push(next);
+            current += delta;
+            signal.push(current);
         }
 
         Ok(signal)
@@ -334,14 +348,13 @@ impl SignalCompressor {
 
     fn decompress_delta_rle(&self, data: &[u8], first_sample: f32) -> IoResult<Vec<f32>> {
         let deltas = self.decompress_rle(data)?;
-        let mut signal = vec![first_sample];
+        let mut signal = Vec::with_capacity(deltas.len() + 1);
+        signal.push(first_sample);
+        let mut current = first_sample;
 
         for delta in deltas {
-            let next = signal
-                .last()
-                .expect("Delta decode: signal must be non-empty")
-                + delta;
-            signal.push(next);
+            current += delta;
+            signal.push(current);
         }
 
         Ok(signal)
@@ -355,6 +368,12 @@ impl SignalCompressor {
         max_val: f32,
         length: usize,
     ) -> IoResult<Vec<f32>> {
+        if !quantize_bits_valid(bits) {
+            return Err(IoError::ParseError(
+                "Quantization bits must be 1-16".to_string(),
+            ));
+        }
+
         let levels = (1u32 << bits) - 1;
         let range = max_val - min_val;
         let mut signal = Vec::with_capacity(length);
@@ -367,9 +386,9 @@ impl SignalCompressor {
             }
         } else {
             for chunk in data.chunks_exact(2) {
-                let bytes: [u8; 2] = chunk
-                    .try_into()
-                    .expect("Quantization decode: chunk must be 2 bytes");
+                let bytes: [u8; 2] = chunk.try_into().map_err(|_| {
+                    IoError::ParseError("Quantization decode: chunk must be 2 bytes".to_string())
+                })?;
                 let quantized = u16::from_le_bytes(bytes);
                 let normalized = quantized as f32 / levels as f32;
                 let value = min_val + normalized * range;
@@ -381,14 +400,39 @@ impl SignalCompressor {
     }
 
     fn decompress_dpcm(&self, data: &[u8], order: usize, first_sample: f32) -> IoResult<Vec<f32>> {
+        if order == 0 {
+            return Err(IoError::ParseError(
+                "DPCM decode: predictor order must be > 0".to_string(),
+            ));
+        }
+
+        // `order * 4` is attacker/corruption-controlled (it comes straight
+        // from the caller-supplied `CompressedSignal`), so it must be
+        // checked for overflow and validated against the actual data length
+        // before being used as a slice bound. Both loops below must use the
+        // SAME validated `init_bytes` -- a previous version validated only
+        // the first loop and let the second slice `data[init_bytes..]`
+        // straight through, panicking whenever `init_bytes > data.len()`.
+        let init_bytes = order.checked_mul(4).ok_or_else(|| {
+            IoError::ParseError("DPCM decode: predictor order overflow".to_string())
+        })?;
+
+        if init_bytes > data.len() {
+            return Err(IoError::ParseError(format!(
+                "DPCM decode: predictor order {} requires {} initial bytes but only {} are available",
+                order,
+                init_bytes,
+                data.len()
+            )));
+        }
+
         let mut signal = Vec::new();
 
         // Read initial samples
-        let init_bytes = order * 4;
-        for chunk in data[..init_bytes.min(data.len())].chunks_exact(4) {
-            let bytes: [u8; 4] = chunk
-                .try_into()
-                .expect("DPCM decode: chunk must be 4 bytes");
+        for chunk in data[..init_bytes].chunks_exact(4) {
+            let bytes: [u8; 4] = chunk.try_into().map_err(|_| {
+                IoError::ParseError("DPCM decode: chunk must be 4 bytes".to_string())
+            })?;
             signal.push(f32::from_le_bytes(bytes));
         }
 
@@ -398,9 +442,9 @@ impl SignalCompressor {
 
         // Reconstruct from residuals
         for chunk in data[init_bytes..].chunks_exact(4) {
-            let bytes: [u8; 4] = chunk
-                .try_into()
-                .expect("DPCM decode: chunk must be 4 bytes");
+            let bytes: [u8; 4] = chunk.try_into().map_err(|_| {
+                IoError::ParseError("DPCM decode: chunk must be 4 bytes".to_string())
+            })?;
             let residual = f32::from_le_bytes(bytes);
             let predicted = self.linear_predict(&signal[signal.len().saturating_sub(order)..]);
             signal.push(predicted + residual);
@@ -408,6 +452,13 @@ impl SignalCompressor {
 
         Ok(signal)
     }
+}
+
+/// Shared bit-depth validation for `CompressionMethod::Quantize`, used by
+/// both the compress and decompress paths so they cannot silently drift out
+/// of sync with each other again.
+fn quantize_bits_valid(bits: u8) -> bool {
+    (1..=16).contains(&bits)
 }
 
 /// Adaptive compressor that selects best method
@@ -537,5 +588,139 @@ mod tests {
         let ratio = compressor.compression_ratio(&signal, &compressed);
 
         assert!(ratio > 10.0); // Should compress very well
+    }
+
+    // === Regression tests: decompress_dpcm out-of-bounds panic (critical) ===
+
+    #[test]
+    fn test_decompress_dpcm_truncated_data_returns_error_not_panic() {
+        let compressor = SignalCompressor::new(CompressionMethod::DPCM { predictor_order: 8 });
+        let compressed = CompressedSignal {
+            method: CompressionMethod::DPCM { predictor_order: 8 },
+            // Far too short for order=8 (needs 32 bytes just for the seed
+            // samples): must error, not panic on `data[init_bytes..]`.
+            data: vec![0u8; 4],
+            original_length: 100,
+            metadata: CompressionMetadata::default(),
+        };
+        let result = compressor.decompress(&compressed);
+        assert!(result.is_err(), "expected an error, got {:?}", result);
+    }
+
+    #[test]
+    fn test_decompress_dpcm_huge_order_does_not_overflow_or_panic() {
+        let compressor = SignalCompressor::new(CompressionMethod::DPCM {
+            predictor_order: usize::MAX / 2,
+        });
+        let compressed = CompressedSignal {
+            method: CompressionMethod::DPCM {
+                predictor_order: usize::MAX / 2,
+            },
+            data: vec![0u8; 16],
+            original_length: 10,
+            metadata: CompressionMetadata::default(),
+        };
+        // `order * 4` would overflow usize here; must be a clean error.
+        let result = compressor.decompress(&compressed);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_dpcm_order_zero_is_rejected() {
+        let compressor = SignalCompressor::new(CompressionMethod::DPCM { predictor_order: 0 });
+        let compressed = CompressedSignal {
+            method: CompressionMethod::DPCM { predictor_order: 0 },
+            data: vec![0u8; 16],
+            original_length: 4,
+            metadata: CompressionMetadata::default(),
+        };
+        assert!(compressor.decompress(&compressed).is_err());
+    }
+
+    #[test]
+    fn test_dpcm_round_trip_still_works() {
+        let signal = vec![1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5];
+        let compressor = SignalCompressor::new(CompressionMethod::DPCM { predictor_order: 2 });
+        let compressed = compressor.compress(&signal).unwrap();
+        let decompressed = compressor.decompress(&compressed).unwrap();
+        assert_eq!(decompressed.len(), signal.len());
+        for (a, b) in signal.iter().zip(decompressed.iter()) {
+            assert!((a - b).abs() < 1e-4);
+        }
+    }
+
+    // === Regression tests: constant-signal Quantize data loss (high) ===
+
+    #[test]
+    fn test_compress_quantize_constant_signal_preserves_length() {
+        let signal = vec![3.0; 10_000];
+        let compressor = SignalCompressor::new(CompressionMethod::Quantize { bits: 8 });
+        let compressed = compressor.compress(&signal).unwrap();
+        let decompressed = compressor.decompress(&compressed).unwrap();
+
+        assert_eq!(
+            decompressed.len(),
+            signal.len(),
+            "constant-signal round trip must not silently truncate to a single sample"
+        );
+        for &value in &decompressed {
+            assert!((value - 3.0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn test_adaptive_compressor_constant_signal_round_trips() {
+        // AdaptiveCompressor picks the smallest encoding, which used to be
+        // the lossy 1-byte Quantize path for any near-constant signal.
+        let signal = vec![-2.5; 500];
+        let compressor = AdaptiveCompressor::new();
+        let compressed = compressor.compress(&signal).unwrap();
+        let decompressed = compressor.decompress(&compressed).unwrap();
+        assert_eq!(decompressed.len(), signal.len());
+    }
+
+    // === Regression tests: decompress_quantize bit validation (high) ===
+
+    #[test]
+    fn test_decompress_quantize_rejects_zero_bits() {
+        let compressor = SignalCompressor::new(CompressionMethod::Quantize { bits: 0 });
+        let compressed = CompressedSignal {
+            method: CompressionMethod::Quantize { bits: 0 },
+            data: vec![1, 2, 3],
+            original_length: 3,
+            metadata: CompressionMetadata {
+                min_value: 0.0,
+                max_value: 1.0,
+                ..Default::default()
+            },
+        };
+        let result = compressor.decompress(&compressed);
+        assert!(result.is_err(), "bits=0 must error, not divide by zero");
+    }
+
+    #[test]
+    fn test_decompress_quantize_rejects_excessive_bits() {
+        let compressor = SignalCompressor::new(CompressionMethod::Quantize { bits: 200 });
+        let compressed = CompressedSignal {
+            method: CompressionMethod::Quantize { bits: 200 },
+            data: vec![1, 2, 3, 4],
+            original_length: 2,
+            metadata: CompressionMetadata {
+                min_value: 0.0,
+                max_value: 1.0,
+                ..Default::default()
+            },
+        };
+        // bits=200 would overflow `1u32 << bits`; must error cleanly.
+        let result = compressor.decompress(&compressed);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quantize_bits_validation_matches_compress_and_decompress() {
+        // compress() already validated bits=0/>16; decompress() must now
+        // agree instead of silently producing inf/NaN.
+        let compressor = SignalCompressor::new(CompressionMethod::Quantize { bits: 0 });
+        assert!(compressor.compress(&[1.0, 2.0]).is_err());
     }
 }

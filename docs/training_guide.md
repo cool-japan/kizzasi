@@ -829,7 +829,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - [Architecture Overview](architecture_overview.md) — crate structure and core traits
 - [PyTorch Migration Guide](pytorch_migration.md) — loading pre-trained weights from GGUF / SafeTensors
-- [Performance Tuning Guide](performance_tuning.md) — SIMD, CUDA, mixed precision
+- [Performance Tuning Guide](performance_tuning.md) — SIMD, GPU backends, mixed precision
 - [Constraints and Guardrails](cross_modal_integration.md) — constraint-aware training loss
 - `crates/kizzasi-core/examples/train_ssm.rs` — runnable end-to-end SSM training example
 - `crates/kizzasi/examples/fine_tuning.rs` — fine-tuning a pretrained Mamba model

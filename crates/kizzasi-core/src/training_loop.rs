@@ -5,18 +5,18 @@
 //! - [`ConstraintLoss`] — bridges kizzasi-logic constraints with candle tensor ops
 //! - [`Loss`] — MSE, MAE, Huber, and cross-entropy loss functions
 //! - [`Trainer`] — full training loop with scheduler, metrics, validation, and checkpointing
-//! - [`CheckpointMetadata`] — serialisable checkpoint state for training resumption
+//!
+//! Checkpoint persistence (`save_checkpoint` / `load_checkpoint` and
+//! `CheckpointMetadata`) lives in [`training_checkpoint`](super::training_checkpoint).
 
-use crate::config::KizzasiConfig;
 use crate::dataloader::TimeSeriesDataLoader;
 use crate::error::{CoreError, CoreResult};
 use crate::metrics::{MetricsLogger, TrainingMetrics};
+use crate::optimizer::KizzasiAdamW;
 use crate::scheduler::LRScheduler;
 use crate::training_core::{SchedulerType, TrainableSSM, TrainingConfig};
 use candle_core::backprop::GradStore;
 use candle_core::Tensor;
-use candle_nn::{AdamW, Optimizer};
-use serde::{Deserialize, Serialize};
 
 /// Constraint-aware loss wrapper
 ///
@@ -177,21 +177,33 @@ impl Loss {
 /// Training utilities with scheduler, metrics, and validation
 pub struct Trainer {
     pub(crate) model: TrainableSSM,
-    pub(crate) optimizer: AdamW,
+    pub(crate) optimizer: KizzasiAdamW,
     pub(crate) config: TrainingConfig,
     pub(crate) scheduler: Option<Box<dyn LRScheduler>>,
     pub(crate) metrics: TrainingMetrics,
     pub(crate) logger: MetricsLogger,
     pub(crate) current_step: usize,
+    /// Horizon handed to step-based schedulers.
+    ///
+    /// Seeded with a placeholder (`epochs * DEFAULT_STEPS_PER_EPOCH`) because
+    /// the batch count is unknown until a data loader shows up, then replaced
+    /// with the true `num_batches * epochs` by [`Trainer::set_total_steps`],
+    /// which [`Trainer::fit`] calls before the first epoch.
+    pub(crate) total_steps: usize,
 }
+
+/// Steps-per-epoch assumed before a data loader reveals the real batch count.
+pub(crate) const DEFAULT_STEPS_PER_EPOCH: usize = 100;
 
 impl Trainer {
     /// Create a new trainer
     pub fn new(model: TrainableSSM, config: TrainingConfig) -> CoreResult<Self> {
         let optimizer = model.create_optimizer()?;
 
-        // Create scheduler based on config
-        let scheduler = Self::create_scheduler(&config);
+        // Create scheduler based on config. The horizon is provisional until
+        // `fit` (or an explicit `set_total_steps`) supplies the real one.
+        let total_steps = (config.epochs * DEFAULT_STEPS_PER_EPOCH).max(1);
+        let scheduler = Self::create_scheduler(&config, total_steps);
 
         let metrics = TrainingMetrics::new();
 
@@ -207,15 +219,42 @@ impl Trainer {
             metrics,
             logger,
             current_step: 0,
+            total_steps,
         })
     }
 
-    /// Create scheduler from config
-    fn create_scheduler(config: &TrainingConfig) -> Option<Box<dyn LRScheduler>> {
+    /// Reparameterise the scheduler for a known training horizon.
+    ///
+    /// Step-based schedules (linear/cosine/one-cycle/polynomial) are defined
+    /// over `total_steps`; feeding them a guess makes the decay end early or
+    /// never finish. [`Trainer::fit`] calls this with
+    /// `train_loader.num_batches() * epochs` before the first epoch, and
+    /// callers driving [`Trainer::train_epoch`] directly should call it too.
+    ///
+    /// `total_steps` is clamped to at least 1.
+    pub fn set_total_steps(&mut self, total_steps: usize) {
+        let total_steps = total_steps.max(1);
+        if total_steps == self.total_steps {
+            return;
+        }
+        self.total_steps = total_steps;
+        self.scheduler = Self::create_scheduler(&self.config, total_steps);
+    }
+
+    /// The horizon currently used by step-based schedulers
+    pub fn total_steps(&self) -> usize {
+        self.total_steps
+    }
+
+    /// Create scheduler from config for a given training horizon
+    pub(crate) fn create_scheduler(
+        config: &TrainingConfig,
+        total_steps: usize,
+    ) -> Option<Box<dyn LRScheduler>> {
         use crate::scheduler::*;
 
         config.scheduler.as_ref().map(|sched_type| {
-            let total_steps = config.epochs * 100; // Rough estimate, can be updated later
+            let total_steps = total_steps.max(1);
 
             match sched_type {
                 SchedulerType::Constant => {
@@ -268,12 +307,42 @@ impl Trainer {
         })
     }
 
-    /// Get current learning rate
-    fn get_current_lr(&self) -> f64 {
+    /// Get the learning rate the scheduler prescribes for the current step
+    pub fn get_current_lr(&self) -> f64 {
         self.scheduler
             .as_ref()
             .map(|s| s.get_lr(self.current_step))
             .unwrap_or(self.config.learning_rate)
+    }
+
+    /// The learning rate the optimizer will actually apply on its next step
+    pub fn optimizer_learning_rate(&self) -> f64 {
+        self.optimizer.learning_rate()
+    }
+
+    /// Extract a scalar tensor as `f32` regardless of its dtype.
+    ///
+    /// Mixed-precision runs produce an F16/BF16 loss; `to_vec0::<f32>` would
+    /// reject those outright, so cast first.
+    fn scalar_to_f32(value: &Tensor) -> CoreResult<f32> {
+        value
+            .to_dtype(candle_core::DType::F32)
+            .map_err(|e| CoreError::Generic(format!("Failed to cast scalar to f32: {}", e)))?
+            .to_vec0::<f32>()
+            .map_err(|e| CoreError::Generic(format!("Failed to extract scalar value: {}", e)))
+    }
+
+    /// Effective loss-scaling factor.
+    ///
+    /// A non-finite or non-positive configured value is treated as "no
+    /// scaling" instead of poisoning every gradient with NaN/Inf.
+    fn effective_loss_scale(&self) -> f32 {
+        let scale = self.config.loss_scale;
+        if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        }
     }
 
     /// Train for one epoch
@@ -282,14 +351,22 @@ impl Trainer {
     ///
     /// 1. Forward pass through the model
     /// 2. Loss evaluation
-    /// 3. Explicit backward pass to materialise a [`GradStore`]
-    /// 4. Optional global-norm gradient clipping (`config.grad_clip`)
-    /// 5. Gradient-norm telemetry (when `config.track_metrics` is set)
-    /// 6. Optimizer step against the (possibly clipped) gradients
+    /// 3. Loss scaling by `config.loss_scale` (mixed-precision underflow guard)
+    /// 4. Explicit backward pass to materialise a [`GradStore`]
+    /// 5. Gradient unscaling — undone *before* clipping so `config.grad_clip`
+    ///    keeps its configured meaning
+    /// 6. Non-finite gradient check (the batch is skipped rather than stepped)
+    /// 7. Optional global-norm gradient clipping (`config.grad_clip`)
+    /// 8. Gradient-norm telemetry (when `config.track_metrics` is set)
+    /// 9. Optimizer step against the (possibly clipped) gradients
+    ///
+    /// The scheduled learning rate is pushed into the optimizer at the top of
+    /// every batch, independently of `config.track_metrics` — the schedule
+    /// drives training, the metric is only telemetry.
     ///
     /// Performing the backward pass explicitly (rather than via
-    /// [`Optimizer::backward_step`]) lets us inspect and clip the gradients
-    /// before they are consumed by the optimizer.
+    /// [`candle_nn::Optimizer::backward_step`]) lets us inspect, unscale and clip the
+    /// gradients before they are consumed by the optimizer.
     pub fn train_epoch<F>(
         &mut self,
         data_loader: &[(Tensor, Tensor)],
@@ -302,34 +379,85 @@ impl Trainer {
         let num_batches = data_loader.len();
         let epoch = self.current_step / num_batches.max(1);
 
+        let loss_scale = self.effective_loss_scale();
+        let scaling_enabled = loss_scale != 1.0;
+
         for (batch_idx, (inputs, targets)) in data_loader.iter().enumerate() {
-            // Update learning rate from scheduler
+            // Apply the scheduled learning rate to the optimizer.
             let lr = self.get_current_lr();
+            self.optimizer.set_learning_rate(lr);
             if self.config.track_metrics {
                 self.metrics.record_learning_rate(lr);
             }
 
-            // Forward pass
-            let predictions = self.model.forward(inputs)?;
+            // Forward + backward. With gradient checkpointing the model drives
+            // both halves so it can recompute activations segment by segment;
+            // otherwise the graph from the plain forward pass is reused.
+            let (loss_val, mut grads) = if self.config.use_gradient_checkpointing {
+                self.model
+                    .forward_backward_checkpointed(inputs, targets, &loss_fn, loss_scale)?
+            } else {
+                let predictions = self.model.forward(inputs)?;
 
-            // Compute loss
-            let loss = loss_fn(&predictions, targets)?;
+                // Compute loss (unscaled — this is what telemetry reports)
+                let loss = loss_fn(&predictions, targets)?;
+                let loss_val = Self::scalar_to_f32(&loss)?;
 
-            // Backward pass — retain the gradient store so we can inspect and
-            // clip the gradients before stepping the optimizer.
-            let mut grads = loss
-                .backward()
-                .map_err(|e| CoreError::Generic(format!("Backward pass failed: {}", e)))?;
+                // Scale the loss before the backward pass so small
+                // mixed-precision gradients do not flush to zero.
+                let backward_root = if scaling_enabled {
+                    loss.affine(loss_scale as f64, 0.0)
+                        .map_err(|e| CoreError::Generic(format!("Loss scaling failed: {}", e)))?
+                } else {
+                    loss
+                };
+
+                // Backward pass — retain the gradient store so we can inspect,
+                // unscale and clip the gradients before stepping the optimizer.
+                let mut grads = backward_root
+                    .backward()
+                    .map_err(|e| CoreError::Generic(format!("Backward pass failed: {}", e)))?;
+
+                // Undo the loss scaling before anything reads the gradient
+                // magnitudes.
+                if scaling_enabled {
+                    self.scale_gradients(&mut grads, 1.0 / loss_scale as f64)?;
+                }
+
+                (loss_val, grads)
+            };
+
+            let mut grad_norm = self.compute_grad_norm(&grads)?;
+
+            // A non-finite gradient would corrupt the optimizer's moment
+            // estimates permanently; drop the batch instead.
+            if !grad_norm.is_finite() {
+                tracing::warn!(
+                    "Skipping optimizer step for epoch {} batch {}: non-finite gradient norm ({})",
+                    epoch,
+                    batch_idx,
+                    grad_norm
+                );
+                total_loss += loss_val;
+                if self.config.track_metrics {
+                    self.metrics.record_train_loss(epoch, loss_val);
+                    self.logger.log_batch(epoch, batch_idx, loss_val);
+                }
+                self.current_step += 1;
+                continue;
+            }
 
             // Gradient clipping (global-norm) before metrics so that the
             // recorded value matches what is actually applied.
             if let Some(max_norm) = self.config.grad_clip {
-                self.clip_gradients(&mut grads, max_norm)?;
+                if max_norm.is_finite() && max_norm > 0.0 && grad_norm > max_norm {
+                    self.scale_gradients(&mut grads, (max_norm / grad_norm) as f64)?;
+                    grad_norm = max_norm;
+                }
             }
 
             // Track gradient norm metric (post-clip, matches optimizer input).
             if self.config.track_metrics {
-                let grad_norm = self.compute_grad_norm(&grads)?;
                 self.metrics.record_grad_norm(grad_norm);
             }
 
@@ -339,9 +467,6 @@ impl Trainer {
                 .map_err(|e| CoreError::Generic(format!("Optimizer step failed: {}", e)))?;
 
             // Accumulate loss
-            let loss_val = loss
-                .to_vec0::<f32>()
-                .map_err(|e| CoreError::Generic(format!("Failed to extract loss value: {}", e)))?;
             total_loss += loss_val;
 
             // Loss / batch telemetry
@@ -358,14 +483,17 @@ impl Trainer {
 
     /// Compute the global L2 norm of all parameter gradients.
     ///
-    /// Iterates the model's [`VarMap`] and accumulates `||g||_2^2` for every
+    /// Iterates the model's [`candle_nn::VarMap`] and accumulates `||g||_2^2` for every
     /// variable that has a corresponding gradient in `grads`, then returns
     /// the square root.
     ///
     /// Variables without a gradient (e.g. detached parameters, or parameters
     /// the current loss does not depend on) are skipped — they contribute 0
     /// to the norm.
-    fn compute_grad_norm(&self, grads: &GradStore) -> CoreResult<f32> {
+    ///
+    /// Exposed for callers driving their own training loop instead of
+    /// [`Trainer::train_epoch`].
+    pub fn compute_grad_norm(&self, grads: &GradStore) -> CoreResult<f32> {
         let mut sum_sq: f64 = 0.0;
 
         for var in self.model.varmap().all_vars() {
@@ -402,7 +530,11 @@ impl Trainer {
     /// `max_norm` is interpreted as a finite positive threshold; non-positive
     /// or non-finite values are treated as "no clipping" so that misconfigured
     /// hyperparameters do not silently zero out the gradients.
-    fn clip_gradients(&self, grads: &mut GradStore, max_norm: f32) -> CoreResult<()> {
+    ///
+    /// [`Trainer::train_epoch`] performs the same clipping inline (reusing the
+    /// norm it has already computed); this entry point is for callers driving
+    /// their own loop.
+    pub fn clip_gradients(&self, grads: &mut GradStore, max_norm: f32) -> CoreResult<()> {
         if !max_norm.is_finite() || max_norm <= 0.0 {
             return Ok(());
         }
@@ -412,15 +544,21 @@ impl Trainer {
             return Ok(());
         }
 
-        let scale = (max_norm / total_norm) as f64;
+        self.scale_gradients(grads, (max_norm / total_norm) as f64)
+    }
 
+    /// Multiply every parameter gradient in `grads` by `factor` in place.
+    ///
+    /// Used for loss-scale removal and for global-norm clipping. Variables
+    /// without a gradient are skipped.
+    fn scale_gradients(&self, grads: &mut GradStore, factor: f64) -> CoreResult<()> {
         // Collect the vars first so we are not holding immutable borrows on
         // `grads` while mutating it.
         let vars = self.model.varmap().all_vars();
         for var in vars.iter() {
             let scaled = match grads.get(var) {
                 Some(g) => g
-                    .affine(scale, 0.0)
+                    .affine(factor, 0.0)
                     .map_err(|e| CoreError::Generic(format!("grad scale failed: {}", e)))?,
                 None => continue,
             };
@@ -446,10 +584,7 @@ impl Trainer {
             let loss = loss_fn(&predictions, targets)?;
 
             // Accumulate loss
-            let loss_val = loss
-                .to_vec0::<f32>()
-                .map_err(|e| CoreError::Generic(format!("Failed to extract loss value: {}", e)))?;
-            total_loss += loss_val;
+            total_loss += Self::scalar_to_f32(&loss)?;
         }
 
         Ok(total_loss / num_batches as f32)
@@ -500,6 +635,22 @@ impl Trainer {
     /// are extracted with the same machinery but reuse the loader's
     /// configured shuffle behaviour (validation loaders typically have
     /// `shuffle == false`).
+    ///
+    /// # Validation split
+    ///
+    /// When `val_loader` is `None` and `config.validation_split` lies in
+    /// `(0, 1)`, the trailing fraction of `train_loader`'s series is split off
+    /// chronologically as the validation set (see
+    /// [`TimeSeriesDataLoader::split_chronological`]) using
+    /// `config.batch_size`. Early stopping then runs on *validation* loss. If
+    /// the series is too short to split, the run continues without validation
+    /// and logs a warning — it is never silently ignored.
+    ///
+    /// # Scheduler horizon
+    ///
+    /// Before the first epoch the scheduler is reparameterised for the true
+    /// horizon, `train_loader.num_batches() * config.epochs`, so step-based
+    /// schedules complete exactly at the end of training.
     pub fn fit<F>(
         &mut self,
         mut train_loader: TimeSeriesDataLoader,
@@ -510,6 +661,36 @@ impl Trainer {
         F: Fn(&Tensor, &Tensor) -> CoreResult<Tensor> + Copy,
     {
         use std::time::Instant;
+
+        // Derive a validation set from `validation_split` when the caller did
+        // not hand one over.
+        let split = self.config.validation_split;
+        if val_loader.is_none() && split.is_finite() && split > 0.0 && split < 1.0 {
+            match train_loader.split_chronological(split, self.config.batch_size.max(1)) {
+                Ok((train_part, val_part)) => {
+                    tracing::info!(
+                        "Derived validation set from validation_split={}: {} train / {} val batches",
+                        split,
+                        train_part.num_batches(),
+                        val_part.num_batches()
+                    );
+                    train_loader = train_part;
+                    val_loader = Some(val_part);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "validation_split={} could not be honoured ({}); \
+                         training without validation and early stopping on training loss",
+                        split,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Now that the true batch count is known, rebuild the scheduler for
+        // the real horizon instead of the placeholder estimate.
+        self.set_total_steps(train_loader.num_batches().max(1) * self.config.epochs.max(1));
 
         // Snapshot device on the model's home device; `train_epoch` and
         // `evaluate` both move tensors to this device implicitly via the
@@ -593,193 +774,6 @@ impl Trainer {
     pub fn current_step(&self) -> usize {
         self.current_step
     }
-
-    /// Save checkpoint to disk
-    ///
-    /// Saves model weights, optimizer state, training configuration, metrics, and metadata.
-    ///
-    /// # Arguments
-    /// * `path` - Directory to save checkpoint files
-    /// * `name` - Checkpoint name (without extension)
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// trainer.save_checkpoint("checkpoints", "epoch_10")?;
-    /// // Creates: checkpoints/epoch_10.safetensors and checkpoints/epoch_10.json
-    /// ```
-    pub fn save_checkpoint<P: AsRef<std::path::Path>>(
-        &self,
-        path: P,
-        name: &str,
-    ) -> CoreResult<()> {
-        use std::fs;
-        use std::path::PathBuf;
-
-        let checkpoint_dir = path.as_ref();
-        fs::create_dir_all(checkpoint_dir).map_err(|e| {
-            CoreError::Generic(format!("Failed to create checkpoint directory: {}", e))
-        })?;
-
-        // Save model weights to safetensors
-        let weights_path: PathBuf = checkpoint_dir.join(format!("{}.safetensors", name));
-        self.model
-            .save_weights(&weights_path)
-            .map_err(|e| CoreError::Generic(format!("Failed to save model weights: {}", e)))?;
-
-        // Create checkpoint metadata
-        let metadata = CheckpointMetadata {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            current_step: self.current_step,
-            current_epoch: self.metrics.summary().total_epochs,
-            config: self.config.clone(),
-            metrics: self.metrics.clone(),
-        };
-
-        // Save metadata to JSON
-        let metadata_path: PathBuf = checkpoint_dir.join(format!("{}.json", name));
-        let metadata_json = serde_json::to_string_pretty(&metadata).map_err(|e| {
-            CoreError::Generic(format!("Failed to serialize checkpoint metadata: {}", e))
-        })?;
-
-        fs::write(&metadata_path, metadata_json).map_err(|e| {
-            CoreError::Generic(format!("Failed to write checkpoint metadata: {}", e))
-        })?;
-
-        tracing::info!(
-            "Checkpoint saved: weights={}, metadata={}",
-            weights_path.display(),
-            metadata_path.display()
-        );
-
-        Ok(())
-    }
-
-    /// Load checkpoint and resume training
-    ///
-    /// Creates a new Trainer from a saved checkpoint, restoring model weights,
-    /// configuration, and training state.
-    ///
-    /// # Arguments
-    /// * `path` - Directory containing checkpoint files
-    /// * `name` - Checkpoint name (without extension)
-    /// * `model_config` - Model configuration (must match saved model)
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let trainer = Trainer::load_checkpoint("checkpoints", "epoch_10", model_config)?;
-    /// // Continue training from epoch 10
-    /// ```
-    pub fn load_checkpoint<P: AsRef<std::path::Path>>(
-        path: P,
-        name: &str,
-        model_config: KizzasiConfig,
-    ) -> CoreResult<Self> {
-        use std::fs;
-        use std::path::PathBuf;
-
-        let checkpoint_dir = path.as_ref();
-
-        // Load metadata from JSON
-        let metadata_path: PathBuf = checkpoint_dir.join(format!("{}.json", name));
-        let metadata_json = fs::read_to_string(&metadata_path).map_err(|e| {
-            CoreError::Generic(format!("Failed to read checkpoint metadata: {}", e))
-        })?;
-
-        let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json).map_err(|e| {
-            CoreError::Generic(format!("Failed to parse checkpoint metadata: {}", e))
-        })?;
-
-        // Load model weights
-        let weights_path: PathBuf = checkpoint_dir.join(format!("{}.safetensors", name));
-        let mut model = TrainableSSM::new(model_config, metadata.config.clone())?;
-        model
-            .load_weights(&weights_path)
-            .map_err(|e| CoreError::Generic(format!("Failed to load model weights: {}", e)))?;
-
-        // Create trainer with loaded state
-        let optimizer = model.create_optimizer()?;
-        let scheduler = Self::create_scheduler(&metadata.config);
-
-        let logger = MetricsLogger::new()
-            .with_verbose(metadata.config.track_metrics)
-            .with_log_interval(metadata.config.log_interval);
-
-        tracing::info!(
-            "Checkpoint loaded: version={}, step={}, epoch={}",
-            metadata.version,
-            metadata.current_step,
-            metadata.current_epoch
-        );
-
-        Ok(Self {
-            model,
-            optimizer,
-            config: metadata.config,
-            scheduler,
-            metrics: metadata.metrics,
-            logger,
-            current_step: metadata.current_step,
-        })
-    }
-
-    /// Save checkpoint with automatic naming (epoch-based)
-    ///
-    /// Convenience method that automatically names checkpoints based on current epoch.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// trainer.save_checkpoint_auto("checkpoints")?;
-    /// // Creates: checkpoints/checkpoint_epoch_5.safetensors, etc.
-    /// ```
-    pub fn save_checkpoint_auto<P: AsRef<std::path::Path>>(&self, path: P) -> CoreResult<()> {
-        let current_epoch = self.metrics.summary().total_epochs;
-        let name = format!("checkpoint_epoch_{}", current_epoch);
-        self.save_checkpoint(path, &name)
-    }
-
-    /// Save checkpoint if this is the best epoch (lowest validation loss)
-    ///
-    /// Automatically saves a "best" checkpoint when validation loss improves.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// // After each validation epoch
-    /// trainer.save_best_checkpoint("checkpoints")?;
-    /// ```
-    pub fn save_best_checkpoint<P: AsRef<std::path::Path>>(&self, path: P) -> CoreResult<()> {
-        let summary = self.metrics.summary();
-
-        // Only save if this is the best epoch
-        // Note: total_epochs is 1-indexed (count), best_epoch is 0-indexed (epoch number)
-        if let (Some(best_epoch), Some(_best_loss)) = (summary.best_epoch, summary.best_val_loss) {
-            // Current epoch is total_epochs - 1 (convert from count to 0-indexed)
-            let current_epoch = summary.total_epochs.saturating_sub(1);
-            if current_epoch == best_epoch {
-                tracing::info!("New best validation loss! Saving best checkpoint");
-                return self.save_checkpoint(path, "best");
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Checkpoint metadata for training state persistence
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckpointMetadata {
-    /// Package version when checkpoint was created
-    pub version: String,
-    /// ISO 8601 timestamp
-    pub timestamp: String,
-    /// Current training step
-    pub current_step: usize,
-    /// Current epoch number
-    pub current_epoch: usize,
-    /// Training configuration
-    pub config: TrainingConfig,
-    /// Training metrics history
-    pub metrics: TrainingMetrics,
 }
 
 #[cfg(test)]
@@ -824,6 +818,441 @@ mod tests {
         assert!(trainer.is_ok());
         let trainer = trainer.unwrap();
         assert!(trainer.scheduler.is_some());
+    }
+
+    /// Build a trainer plus a two-batch dataset for scheduler/loss-scale tests.
+    fn build_step_test_trainer(
+        training_config: TrainingConfig,
+    ) -> (Trainer, Vec<(Tensor, Tensor)>) {
+        use crate::config::KizzasiConfig;
+        use crate::training_core::TrainableSSM;
+
+        let model_config = KizzasiConfig::new()
+            .input_dim(2)
+            .output_dim(2)
+            .hidden_dim(8)
+            .state_dim(4)
+            .num_layers(1);
+
+        let model = TrainableSSM::new(model_config, training_config.clone()).unwrap();
+        let device = model.device().clone();
+        let trainer = Trainer::new(model, training_config).unwrap();
+
+        let inputs = Tensor::new(&[[[0.1f32, 0.2], [0.3, 0.4], [0.5, 0.6]]], &device).unwrap();
+        let targets = Tensor::new(&[[[1.0f32, -1.0], [0.5, -0.5], [-0.2, 0.8]]], &device).unwrap();
+
+        (trainer, vec![(inputs, targets)])
+    }
+
+    #[test]
+    fn test_scheduler_lr_is_applied_to_optimizer() {
+        // Regression: the scheduled LR used to be computed and logged but never
+        // pushed into the optimizer, so every schedule was a no-op.
+        let training_config = TrainingConfig {
+            learning_rate: 1e-2,
+            track_metrics: false,
+            grad_clip: None,
+            early_stopping_patience: None,
+            ..Default::default()
+        }
+        .with_scheduler(SchedulerType::Linear {
+            warmup_steps: 2,
+            final_lr: 1e-6,
+        });
+
+        let (mut trainer, batches) = build_step_test_trainer(training_config);
+        trainer.set_total_steps(10);
+
+        // Step 0 sits at the very start of the linear warmup.
+        let lr_before = trainer.optimizer_learning_rate();
+        trainer.train_epoch(&batches, Loss::mse).unwrap();
+        let lr_step0 = trainer.optimizer_learning_rate();
+        assert_eq!(
+            lr_step0, 0.0,
+            "linear warmup starts at 0; optimizer LR was {lr_step0}"
+        );
+        assert!(
+            lr_before != lr_step0,
+            "optimizer LR never changed (was {lr_before})"
+        );
+
+        // Two more steps take us past the warmup into the decay phase.
+        trainer.train_epoch(&batches, Loss::mse).unwrap();
+        trainer.train_epoch(&batches, Loss::mse).unwrap();
+
+        let lr_step2 = trainer.optimizer_learning_rate();
+        assert!(
+            lr_step2 > 0.0,
+            "optimizer LR should be positive after warmup, got {lr_step2}"
+        );
+
+        // The optimizer holds the LR of the last *applied* step, i.e. the step
+        // just before `current_step`.
+        let applied_step = trainer.current_step() - 1;
+        let expected = trainer
+            .scheduler
+            .as_ref()
+            .expect("scheduler configured")
+            .get_lr(applied_step);
+        assert!(
+            (lr_step2 - expected).abs() < 1e-12,
+            "optimizer LR {lr_step2} does not match the schedule at step {applied_step} ({expected})"
+        );
+    }
+
+    /// Snapshot every model parameter, keyed by name and sorted, so two runs
+    /// are comparable. `VarMap::all_vars()` iterates a `HashMap` and therefore
+    /// yields a different order in every run.
+    fn named_parameter_snapshot(trainer: &Trainer) -> Vec<(String, Vec<f32>)> {
+        let data = trainer
+            .model
+            .varmap()
+            .data()
+            .lock()
+            .expect("varmap mutex poisoned");
+        let mut snapshot: Vec<(String, Vec<f32>)> = data
+            .iter()
+            .map(|(name, var)| {
+                let values = var
+                    .as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                (name.clone(), values)
+            })
+            .collect();
+        snapshot.sort_by(|a, b| a.0.cmp(&b.0));
+        snapshot
+    }
+
+    #[test]
+    fn test_no_scheduler_keeps_configured_learning_rate() {
+        let training_config = TrainingConfig {
+            learning_rate: 3e-3,
+            track_metrics: false,
+            early_stopping_patience: None,
+            ..Default::default()
+        };
+
+        let (mut trainer, batches) = build_step_test_trainer(training_config);
+        trainer.train_epoch(&batches, Loss::mse).unwrap();
+
+        assert!(
+            (trainer.optimizer_learning_rate() - 3e-3).abs() < 1e-12,
+            "LR drifted without a scheduler: {}",
+            trainer.optimizer_learning_rate()
+        );
+    }
+
+    #[test]
+    fn test_set_total_steps_reparameterises_scheduler() {
+        // Regression: the horizon used to be hard-coded to `epochs * 100`, so a
+        // cosine schedule never reached its terminal LR for real datasets.
+        let training_config = TrainingConfig {
+            learning_rate: 1e-2,
+            epochs: 2,
+            track_metrics: false,
+            early_stopping_patience: None,
+            ..Default::default()
+        }
+        .with_scheduler(SchedulerType::Cosine {
+            warmup_steps: 0,
+            min_lr: 1e-6,
+        });
+
+        let (mut trainer, _batches) = build_step_test_trainer(training_config);
+
+        // Placeholder horizon: epochs * DEFAULT_STEPS_PER_EPOCH.
+        assert_eq!(trainer.total_steps(), 2 * DEFAULT_STEPS_PER_EPOCH);
+
+        trainer.set_total_steps(20);
+        assert_eq!(trainer.total_steps(), 20);
+
+        trainer.current_step = 20;
+        let terminal_lr = trainer.get_current_lr();
+        assert!(
+            (terminal_lr - 1e-6).abs() < 1e-9,
+            "cosine schedule should land on min_lr at the final step, got {terminal_lr}"
+        );
+
+        // With the old placeholder horizon the same step is nowhere near the end.
+        trainer.set_total_steps(200);
+        let mid_lr = trainer.get_current_lr();
+        assert!(
+            mid_lr > terminal_lr * 100.0,
+            "a longer horizon must leave far more LR to decay, got {mid_lr}"
+        );
+    }
+
+    #[test]
+    fn test_fit_uses_true_batch_count_for_scheduler_horizon() {
+        use crate::config::KizzasiConfig;
+        use crate::dataloader::{DataLoaderConfig, TimeSeriesDataLoader};
+        use crate::training_core::TrainableSSM;
+        use scirs2_core::ndarray::Array2;
+
+        let n_steps = 160usize;
+        let raw: Vec<f32> = (0..n_steps).map(|t| ((t as f32) * 0.1).sin()).collect();
+        let data = Array2::from_shape_vec((n_steps, 1), raw).unwrap();
+
+        let dl_config = DataLoaderConfig::default()
+            .with_window_size(8)
+            .with_horizon(8)
+            .with_batch_size(4)
+            .with_shuffle(false);
+        let loader = TimeSeriesDataLoader::new(data, dl_config).unwrap();
+
+        let model_config = KizzasiConfig::new()
+            .input_dim(1)
+            .output_dim(1)
+            .hidden_dim(8)
+            .state_dim(4)
+            .num_layers(1);
+
+        let training_config = TrainingConfig {
+            learning_rate: 1e-3,
+            epochs: 2,
+            batch_size: 4,
+            track_metrics: true,
+            early_stopping_patience: None,
+            validation_split: 0.0,
+            ..Default::default()
+        }
+        .with_scheduler(SchedulerType::Cosine {
+            warmup_steps: 0,
+            min_lr: 1e-6,
+        });
+
+        let expected_steps = loader.num_batches() * 2;
+        let model = TrainableSSM::new(model_config, training_config.clone()).unwrap();
+        let mut trainer = Trainer::new(model, training_config).unwrap();
+
+        trainer.fit(loader, None, Loss::mse).unwrap();
+
+        assert_eq!(
+            trainer.total_steps(),
+            expected_steps,
+            "fit must derive the horizon from num_batches * epochs"
+        );
+        assert_eq!(trainer.current_step(), expected_steps);
+        // The schedule must actually be exhausted by the end of training.
+        let final_lr = trainer.get_current_lr();
+        assert!(
+            (final_lr - 1e-6).abs() < 1e-9,
+            "cosine schedule did not finish: final LR {final_lr}"
+        );
+    }
+
+    #[test]
+    fn test_loss_scaling_is_unscaled_before_the_step() {
+        // Regression: `with_fp16()` set `loss_scale = 128.0` and the trainer
+        // ignored it. Now that scaling is applied, the *unscaling* must be exact
+        // — a scaled run and an unscaled run must produce the same parameter
+        // update from the same initial weights.
+        fn run(loss_scale: f32) -> Vec<(String, Vec<f32>)> {
+            let training_config = TrainingConfig {
+                learning_rate: 1e-2,
+                track_metrics: false,
+                grad_clip: None,
+                early_stopping_patience: None,
+                loss_scale,
+                ..Default::default()
+            };
+
+            let (mut trainer, batches) = build_step_test_trainer(training_config);
+
+            // Pin the initial weights so both runs start from the same point.
+            for var in trainer.model.varmap().all_vars() {
+                let ones = Tensor::ones(var.shape(), var.dtype(), var.device()).unwrap();
+                let seeded = ones.affine(0.05, 0.01).unwrap();
+                var.set(&seeded).unwrap();
+            }
+
+            trainer.train_epoch(&batches, Loss::mse).unwrap();
+            named_parameter_snapshot(&trainer)
+        }
+
+        let unscaled = run(1.0);
+        let scaled = run(128.0);
+
+        assert_eq!(unscaled.len(), scaled.len());
+        assert!(!unscaled.is_empty());
+        for ((u_name, u_vals), (s_name, s_vals)) in unscaled.iter().zip(scaled.iter()) {
+            assert_eq!(u_name, s_name, "parameter sets differ between runs");
+            assert_eq!(u_vals.len(), s_vals.len());
+            for (i, (u, s)) in u_vals.iter().zip(s_vals.iter()).enumerate() {
+                assert!(
+                    (u - s).abs() < 1e-6,
+                    "{u_name}[{i}] diverged between loss_scale=1 and loss_scale=128: {u} vs {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_finite_gradients_skip_the_optimizer_step() {
+        // A NaN loss must not be allowed to poison AdamW's moment estimates.
+        let training_config = TrainingConfig {
+            learning_rate: 1e-2,
+            track_metrics: false,
+            grad_clip: None,
+            early_stopping_patience: None,
+            ..Default::default()
+        };
+
+        let (mut trainer, batches) = build_step_test_trainer(training_config);
+
+        let before: Vec<f32> = trainer
+            .model
+            .varmap()
+            .all_vars()
+            .iter()
+            .flat_map(|v| {
+                v.as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect();
+
+        let nan_loss = |p: &Tensor, t: &Tensor| -> CoreResult<Tensor> {
+            let base = Loss::mse(p, t)?;
+            base.affine(f64::NAN, 0.0)
+                .map_err(|e| CoreError::Generic(format!("{e}")))
+        };
+
+        trainer.train_epoch(&batches, nan_loss).unwrap();
+
+        let after: Vec<f32> = trainer
+            .model
+            .varmap()
+            .all_vars()
+            .iter()
+            .flat_map(|v| {
+                v.as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(before.len(), after.len());
+        for (b, a) in before.iter().zip(after.iter()) {
+            assert_eq!(b, a, "parameters must be untouched when gradients are NaN");
+        }
+        // The step counter still advances so the schedule stays aligned.
+        assert_eq!(trainer.current_step(), 1);
+    }
+
+    #[test]
+    fn test_fit_derives_validation_split_when_no_loader_supplied() {
+        use crate::config::KizzasiConfig;
+        use crate::dataloader::{DataLoaderConfig, TimeSeriesDataLoader};
+        use crate::training_core::TrainableSSM;
+        use scirs2_core::ndarray::Array2;
+
+        let n_steps = 240usize;
+        let raw: Vec<f32> = (0..n_steps).map(|t| ((t as f32) * 0.07).cos()).collect();
+        let data = Array2::from_shape_vec((n_steps, 1), raw).unwrap();
+
+        let dl_config = DataLoaderConfig::default()
+            .with_window_size(8)
+            .with_horizon(8)
+            .with_batch_size(4)
+            .with_shuffle(false);
+        let loader = TimeSeriesDataLoader::new(data, dl_config).unwrap();
+
+        let model_config = KizzasiConfig::new()
+            .input_dim(1)
+            .output_dim(1)
+            .hidden_dim(8)
+            .state_dim(4)
+            .num_layers(1);
+
+        let training_config = TrainingConfig {
+            learning_rate: 1e-3,
+            epochs: 2,
+            batch_size: 2,
+            track_metrics: true,
+            early_stopping_patience: None,
+            validation_split: 0.25,
+            ..Default::default()
+        };
+
+        let model = TrainableSSM::new(model_config, training_config.clone()).unwrap();
+        let mut trainer = Trainer::new(model, training_config).unwrap();
+
+        trainer.fit(loader, None, Loss::mse).unwrap();
+
+        // Regression: `validation_split` used to be dead, so no validation loss
+        // was ever recorded when the caller passed `None`.
+        assert!(
+            trainer.metrics().val_loss(0).is_some(),
+            "validation_split did not produce a validation set"
+        );
+        assert!(trainer.metrics().val_loss(1).is_some());
+    }
+
+    #[test]
+    fn test_derived_validation_split_does_not_trip_early_stopping_immediately() {
+        // `validation_split` and `early_stopping_patience` are both non-zero by
+        // default, so activating the split also activates early stopping. Guard
+        // against it firing on the very first epochs and truncating a run that
+        // previously always went the distance.
+        use crate::config::KizzasiConfig;
+        use crate::dataloader::{DataLoaderConfig, TimeSeriesDataLoader};
+        use crate::training_core::TrainableSSM;
+        use scirs2_core::ndarray::Array2;
+
+        let n_steps = 240usize;
+        let raw: Vec<f32> = (0..n_steps).map(|t| ((t as f32) * 0.05).sin()).collect();
+        let data = Array2::from_shape_vec((n_steps, 1), raw).unwrap();
+
+        let dl_config = DataLoaderConfig::default()
+            .with_window_size(8)
+            .with_horizon(8)
+            .with_batch_size(4)
+            .with_shuffle(false);
+        let loader = TimeSeriesDataLoader::new(data, dl_config).unwrap();
+
+        let model_config = KizzasiConfig::new()
+            .input_dim(1)
+            .output_dim(1)
+            .hidden_dim(8)
+            .state_dim(4)
+            .num_layers(1);
+
+        // Defaults for validation_split (0.2) and early_stopping_patience (5).
+        let training_config = TrainingConfig {
+            learning_rate: 1e-3,
+            epochs: 3,
+            batch_size: 4,
+            track_metrics: true,
+            ..Default::default()
+        };
+        assert_eq!(training_config.validation_split, 0.2);
+        assert_eq!(training_config.early_stopping_patience, Some(5));
+
+        let expected_batches = loader
+            .split_chronological(0.2, 4)
+            .expect("series is long enough to split")
+            .0
+            .num_batches();
+
+        let model = TrainableSSM::new(model_config, training_config.clone()).unwrap();
+        let mut trainer = Trainer::new(model, training_config).unwrap();
+        trainer.fit(loader, None, Loss::mse).unwrap();
+
+        for epoch in 0..3 {
+            assert!(
+                trainer.metrics().val_loss(epoch).is_some(),
+                "epoch {epoch} did not run; early stopping fired too eagerly"
+            );
+        }
+        assert_eq!(trainer.current_step(), expected_batches * 3);
     }
 
     #[test]
@@ -952,179 +1381,6 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[test]
-    fn test_checkpoint_save_load() {
-        use crate::config::KizzasiConfig;
-        use crate::training_core::TrainableSSM;
-        use std::env;
-        use std::fs;
-
-        let temp_dir = env::temp_dir().join("kizzasi_checkpoint_test");
-        fs::create_dir_all(&temp_dir).unwrap();
-
-        // Create a model
-        let config = KizzasiConfig::new()
-            .input_dim(3)
-            .output_dim(3)
-            .hidden_dim(64)
-            .state_dim(8)
-            .num_layers(2);
-
-        let training_config = TrainingConfig {
-            epochs: 5,
-            learning_rate: 1e-3,
-            ..Default::default()
-        };
-
-        let model = TrainableSSM::new(config.clone(), training_config.clone()).unwrap();
-        let trainer = Trainer::new(model, training_config).unwrap();
-
-        // Save checkpoint
-        trainer
-            .save_checkpoint(&temp_dir, "test_checkpoint")
-            .unwrap();
-
-        // Verify files exist
-        assert!(temp_dir.join("test_checkpoint.safetensors").exists());
-        assert!(temp_dir.join("test_checkpoint.json").exists());
-
-        // Load checkpoint
-        let loaded_trainer =
-            Trainer::load_checkpoint(&temp_dir, "test_checkpoint", config).unwrap();
-
-        // Verify loaded config matches
-        assert_eq!(loaded_trainer.config.epochs, 5);
-        assert_eq!(loaded_trainer.config.learning_rate, 1e-3);
-        assert_eq!(loaded_trainer.current_step, 0);
-
-        // Clean up
-        fs::remove_dir_all(&temp_dir).unwrap();
-    }
-
-    #[test]
-    fn test_checkpoint_auto_save() {
-        use crate::config::KizzasiConfig;
-        use crate::training_core::TrainableSSM;
-        use std::env;
-        use std::fs;
-
-        let temp_dir = env::temp_dir().join("kizzasi_checkpoint_auto_test");
-        fs::create_dir_all(&temp_dir).unwrap();
-
-        let config = KizzasiConfig::new()
-            .input_dim(3)
-            .output_dim(3)
-            .hidden_dim(64)
-            .state_dim(8)
-            .num_layers(2);
-
-        let training_config = TrainingConfig::default();
-        let model = TrainableSSM::new(config, training_config.clone()).unwrap();
-        let mut trainer = Trainer::new(model, training_config).unwrap();
-
-        // Record some metrics to simulate training
-        trainer.metrics.record_train_loss(0, 0.5);
-
-        // Save checkpoint with auto naming
-        trainer.save_checkpoint_auto(&temp_dir).unwrap();
-
-        // Verify file exists with auto-generated name
-        assert!(temp_dir.join("checkpoint_epoch_1.safetensors").exists());
-        assert!(temp_dir.join("checkpoint_epoch_1.json").exists());
-
-        // Clean up
-        fs::remove_dir_all(&temp_dir).unwrap();
-    }
-
-    #[test]
-    fn test_checkpoint_best_save() {
-        use crate::config::KizzasiConfig;
-        use crate::training_core::TrainableSSM;
-        use std::env;
-        use std::fs;
-
-        let temp_dir = env::temp_dir().join("kizzasi_checkpoint_best_test");
-        fs::create_dir_all(&temp_dir).unwrap();
-
-        let config = KizzasiConfig::new()
-            .input_dim(3)
-            .output_dim(3)
-            .hidden_dim(64)
-            .state_dim(8)
-            .num_layers(2);
-
-        let training_config = TrainingConfig::default();
-        let model = TrainableSSM::new(config, training_config.clone()).unwrap();
-        let mut trainer = Trainer::new(model, training_config).unwrap();
-
-        // Simulate training epoch 0 (not best yet)
-        trainer.metrics.record_train_loss(0, 1.2);
-        trainer.metrics.record_val_loss(0, 1.0);
-        trainer.save_best_checkpoint(&temp_dir).unwrap();
-
-        // Epoch 0 is the best so far, so checkpoint should be saved
-        assert!(temp_dir.join("best.safetensors").exists());
-        assert!(temp_dir.join("best.json").exists());
-
-        // Simulate training epoch 1 with worse loss (should not overwrite)
-        trainer.metrics.record_train_loss(1, 0.9);
-        trainer.metrics.record_val_loss(1, 1.2);
-
-        // Remove old best to test that it doesn't get overwritten
-        fs::remove_file(temp_dir.join("best.safetensors")).unwrap();
-        fs::remove_file(temp_dir.join("best.json")).unwrap();
-
-        trainer.save_best_checkpoint(&temp_dir).unwrap();
-        // Should not save because epoch 1 is not the best
-        assert!(!temp_dir.join("best.safetensors").exists());
-
-        // Clean up
-        fs::remove_dir_all(&temp_dir).unwrap();
-    }
-
-    #[test]
-    fn test_checkpoint_metadata() {
-        use crate::config::KizzasiConfig;
-        use crate::training_core::TrainableSSM;
-        use std::env;
-        use std::fs;
-
-        let temp_dir = env::temp_dir().join("kizzasi_checkpoint_metadata_test");
-        fs::create_dir_all(&temp_dir).unwrap();
-
-        let config = KizzasiConfig::new()
-            .input_dim(3)
-            .output_dim(3)
-            .hidden_dim(64)
-            .state_dim(8)
-            .num_layers(2);
-
-        let training_config = TrainingConfig::default();
-        let model = TrainableSSM::new(config, training_config.clone()).unwrap();
-        let mut trainer = Trainer::new(model, training_config).unwrap();
-
-        // Add some metrics
-        trainer.metrics.record_train_loss(0, 0.5);
-        trainer.metrics.record_val_loss(0, 0.45);
-
-        // Save checkpoint
-        trainer.save_checkpoint(&temp_dir, "metadata_test").unwrap();
-
-        // Load and verify metadata
-        let metadata_path = temp_dir.join("metadata_test.json");
-        let metadata_json = fs::read_to_string(&metadata_path).unwrap();
-        let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json).unwrap();
-
-        assert_eq!(metadata.version, env!("CARGO_PKG_VERSION"));
-        assert!(!metadata.timestamp.is_empty());
-        assert_eq!(metadata.current_step, 0);
-        assert!(metadata.metrics.val_loss(0).is_some());
-        assert_eq!(metadata.metrics.val_loss(0).unwrap(), 0.45);
-
-        // Clean up
-        fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     /// Build a minimal trainer suitable for gradient-norm and convergence

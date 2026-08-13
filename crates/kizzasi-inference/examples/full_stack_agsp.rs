@@ -57,9 +57,10 @@ fn main() -> InferenceResult<()> {
         .engine_config(engine_config)
         .model(Box::new(model))
         .tokenizer(Box::new(tokenizer))
-        .with_constraints()
+        // Constraints are enabled below by `set_guardrails`, once the guardrail
+        // set exists — enabling them here without one is a configuration error.
         .build()?;
-    println!("  Pipeline ready with tokenizer, model, and constraints\n");
+    println!("  Pipeline ready with tokenizer and model\n");
 
     // 5. Create safety guardrails
     println!("Step 5: Setting up safety constraints...");

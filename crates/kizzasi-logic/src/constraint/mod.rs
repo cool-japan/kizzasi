@@ -21,6 +21,12 @@ pub use basic::{
     TemporalChecker, TemporalConstraint, TemporalConstraintBuilder,
 };
 
+// Crate-internal only: `BoundInterval` is `pub(crate)` in `basic`, but the
+// `basic` module itself is private, so `constraint_analysis` (a sibling
+// module) needs this re-export to reach it for exact interval-arithmetic
+// feasibility/dependency analysis.
+pub(crate) use basic::BoundInterval;
+
 // Re-export from linear module
 pub use linear::{AffineEquality, LinearConstraint, LinearConstraintSet, LinearConstraintType};
 

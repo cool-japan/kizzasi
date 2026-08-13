@@ -4,6 +4,7 @@
 //! implementations for efficient constraint evaluation.
 
 use crate::constraint::ViolationComputable;
+use rayon::prelude::*;
 use scirs2_core::ndarray::Array2;
 use std::collections::HashMap;
 
@@ -128,7 +129,11 @@ pub struct CacheStats {
 // Parallel Constraint Checking
 // ============================================================================
 
-/// Parallel constraint checker using rayon (when available)
+/// Parallel constraint checker using rayon.
+///
+/// Splits the point batch across rayon's global thread pool; each point is
+/// evaluated against every constraint independently, so the outer loop over
+/// points is embarrassingly parallel.
 pub struct ParallelConstraintChecker<C> {
     constraints: Vec<C>,
 }
@@ -139,39 +144,35 @@ impl<C: ViolationComputable + Send + Sync> ParallelConstraintChecker<C> {
         Self { constraints }
     }
 
-    /// Check points in parallel (sequential fallback if rayon not available)
+    /// Check points in parallel across rayon's thread pool.
     pub fn check_batch(&self, points: &Array2<f32>) -> Vec<bool> {
         let (n_points, _) = points.dim();
-        let mut results = Vec::with_capacity(n_points);
 
-        // Sequential implementation (can be parallelized with rayon)
-        for i in 0..n_points {
-            let point = points.row(i);
-            let point_slice: Vec<f32> = point.iter().copied().collect();
-            let satisfied = self.constraints.iter().all(|c| c.check(&point_slice));
-            results.push(satisfied);
-        }
-
-        results
+        (0..n_points)
+            .into_par_iter()
+            .map(|i| {
+                let point = points.row(i);
+                let point_slice: Vec<f32> = point.iter().copied().collect();
+                self.constraints.iter().all(|c| c.check(&point_slice))
+            })
+            .collect()
     }
 
-    /// Compute violations in parallel
+    /// Compute violations in parallel across rayon's thread pool.
     pub fn violation_batch(&self, points: &Array2<f32>) -> Vec<f32> {
         let (n_points, _) = points.dim();
-        let mut violations = Vec::with_capacity(n_points);
 
-        for i in 0..n_points {
-            let point = points.row(i);
-            let point_slice: Vec<f32> = point.iter().copied().collect();
-            let total: f32 = self
-                .constraints
-                .iter()
-                .map(|c| c.violation(&point_slice))
-                .sum();
-            violations.push(total);
-        }
-
-        violations
+        (0..n_points)
+            .into_par_iter()
+            .map(|i| {
+                let point = points.row(i);
+                let point_slice: Vec<f32> = point.iter().copied().collect();
+                self.constraints
+                    .iter()
+                    .map(|c| c.violation(&point_slice))
+                    .sum()
+            })
+            .collect()
     }
 }
 
@@ -197,15 +198,30 @@ impl<C: ViolationComputable> LazyConstraintEvaluator<C> {
         self.constraints.push((constraint, is_critical));
     }
 
-    /// Check constraints lazily (stop on first critical violation)
+    /// Check constraints lazily: stop immediately on the first *critical*
+    /// violation, but still evaluate every non-critical constraint so the
+    /// returned `bool` reflects true full satisfaction.
+    ///
+    /// Returns `(all_satisfied, stopped_at)`. `stopped_at` is the index of
+    /// the first critical violation, or `self.constraints.len()` if none was
+    /// found (regardless of whether a non-critical constraint was violated).
+    ///
+    /// Previously this returned `true` whenever no *critical* constraint was
+    /// violated, silently reporting "satisfied" for a point that violated
+    /// every non-critical constraint — indistinguishable from genuine full
+    /// satisfaction to a caller that only looked at the `bool`.
     pub fn check_lazy(&self, point: &[f32]) -> (bool, usize) {
+        let mut non_critical_violated = false;
         for (i, (constraint, is_critical)) in self.constraints.iter().enumerate() {
-            if !constraint.check(point) && *is_critical {
-                // Critical constraint violated, stop immediately
-                return (false, i);
+            if !constraint.check(point) {
+                if *is_critical {
+                    // Critical constraint violated, stop immediately.
+                    return (false, i);
+                }
+                non_critical_violated = true;
             }
         }
-        (true, self.constraints.len())
+        (!non_critical_violated, self.constraints.len())
     }
 
     /// Compute violation with early stopping
@@ -312,9 +328,18 @@ impl<C: ViolationComputable> VectorizedConstraints<C> {
 // ============================================================================
 
 /// Adaptive constraint ordering for efficient early termination
+///
+/// The constraint permutation is maintained incrementally (see
+/// [`Self::check_adaptive`]) rather than re-sorted from scratch on every
+/// call, so the ordering overhead does not dominate the checks it exists to
+/// reduce.
 pub struct AdaptiveConstraintOrder<C> {
     constraints: Vec<C>,
     violation_counts: Vec<usize>,
+    /// Permutation of `0..constraints.len()`, kept sorted by descending
+    /// `violation_counts` so the most-frequently-violated constraint is
+    /// checked first.
+    order: Vec<usize>,
     check_count: usize,
 }
 
@@ -325,26 +350,51 @@ impl<C: ViolationComputable> AdaptiveConstraintOrder<C> {
         Self {
             constraints,
             violation_counts: vec![0; n],
+            order: (0..n).collect(),
             check_count: 0,
         }
     }
 
-    /// Check constraints in adaptive order
+    /// Check constraints in adaptive order.
+    ///
+    /// On a violation, the violated constraint's count is incremented and it
+    /// is bubbled toward the front of `order` only as far as its new count
+    /// warrants — amortized O(1) bookkeeping per call instead of a full
+    /// `O(n log n)` re-sort plus a fresh heap allocation every time.
     pub fn check_adaptive(&mut self, point: &[f32]) -> bool {
         self.check_count += 1;
 
-        // Sort constraints by violation frequency (most violated first)
-        let mut indices: Vec<usize> = (0..self.constraints.len()).collect();
-        indices.sort_by_key(|&i| std::cmp::Reverse(self.violation_counts[i]));
-
-        for &i in &indices {
-            if !self.constraints[i].check(point) {
-                self.violation_counts[i] += 1;
+        for pos in 0..self.order.len() {
+            let i = self.order[pos];
+            let Some(constraint) = self.constraints.get(i) else {
+                continue;
+            };
+            if !constraint.check(point) {
+                if let Some(count) = self.violation_counts.get_mut(i) {
+                    *count += 1;
+                }
+                self.promote(pos);
                 return false;
             }
         }
 
         true
+    }
+
+    /// Move `order[pos]` toward the front while its violation count exceeds
+    /// its predecessor's, keeping `order` sorted by descending count.
+    fn promote(&mut self, mut pos: usize) {
+        while pos > 0 {
+            let prev = pos - 1;
+            let current = self.order[pos];
+            let predecessor = self.order[prev];
+            if self.violation_counts[current] > self.violation_counts[predecessor] {
+                self.order.swap(pos, prev);
+                pos = prev;
+            } else {
+                break;
+            }
+        }
     }
 
     /// Get violation statistics
@@ -367,6 +417,11 @@ impl<C: ViolationComputable> AdaptiveConstraintOrder<C> {
     pub fn reset_statistics(&mut self) {
         self.violation_counts.fill(0);
         self.check_count = 0;
+        // The stale counts backing `order` are gone; restore identity order
+        // (O(n), but only on an explicit reset — not per check).
+        for (idx, slot) in self.order.iter_mut().enumerate() {
+            *slot = idx;
+        }
     }
 }
 
@@ -405,6 +460,62 @@ mod tests {
 
         let results = checker.check_batch(&points);
         assert_eq!(results, vec![false, true, false, true]);
+    }
+
+    /// Regression (finding 128): `ParallelConstraintChecker` used to be a
+    /// plain sequential loop despite its name, docs, and `Send + Sync`
+    /// bounds. Assert parity with `BatchConstraintChecker` on the same
+    /// batch (this is also the crate's first test coverage of the type at
+    /// all — it previously had none).
+    #[test]
+    fn test_parallel_constraint_checker_matches_batch_checker() {
+        let c1 = ConstraintBuilder::new()
+            .name("x_positive")
+            .greater_eq(0.0)
+            .build()
+            .unwrap();
+        let c2 = ConstraintBuilder::new()
+            .name("x_bounded")
+            .less_eq(10.0)
+            .build()
+            .unwrap();
+        let c1b = ConstraintBuilder::new()
+            .name("x_positive")
+            .greater_eq(0.0)
+            .build()
+            .unwrap();
+        let c2b = ConstraintBuilder::new()
+            .name("x_bounded")
+            .less_eq(10.0)
+            .build()
+            .unwrap();
+
+        let points = Array2::from_shape_vec(
+            (5, 1),
+            vec![
+                -1.0, // violates c1
+                5.0,  // satisfies both
+                15.0, // violates c2
+                3.0,  // satisfies both
+                0.0,  // boundary: satisfies both
+            ],
+        )
+        .unwrap();
+
+        let mut batch_checker = BatchConstraintChecker::new(vec![c1, c2]);
+        let parallel_checker = ParallelConstraintChecker::new(vec![c1b, c2b]);
+
+        assert_eq!(
+            parallel_checker.check_batch(&points),
+            batch_checker.check_batch(&points)
+        );
+
+        let batch_violations = batch_checker.violation_batch(&points);
+        let parallel_violations = parallel_checker.violation_batch(&points);
+        assert_eq!(batch_violations.len(), parallel_violations.len());
+        for (b, p) in batch_violations.iter().zip(parallel_violations.iter()) {
+            assert!((b - p).abs() < 1e-6, "batch={b} parallel={p}");
+        }
     }
 
     #[test]
@@ -470,6 +581,39 @@ mod tests {
         // Satisfies all
         let (satisfied, stopped_at) = evaluator.check_lazy(&[5.0]);
         assert!(satisfied);
+        assert_eq!(stopped_at, 2);
+    }
+
+    /// Regression (finding 142): a violated *non-critical* constraint must
+    /// not be reported as "satisfied". Previously `check_lazy` returned
+    /// `true` whenever no critical constraint was violated, discarding the
+    /// non-critical result entirely.
+    #[test]
+    fn test_lazy_evaluation_reports_non_critical_violation() {
+        let c1 = ConstraintBuilder::new()
+            .name("critical")
+            .greater_eq(0.0)
+            .build()
+            .unwrap();
+
+        let c2 = ConstraintBuilder::new()
+            .name("non_critical")
+            .less_eq(100.0)
+            .build()
+            .unwrap();
+
+        let mut evaluator = LazyConstraintEvaluator::new();
+        evaluator.add_constraint(c1, true); // critical
+        evaluator.add_constraint(c2, false); // non-critical
+
+        // Satisfies the critical constraint but violates the non-critical
+        // one: must NOT be reported as fully satisfied.
+        let (satisfied, stopped_at) = evaluator.check_lazy(&[500.0]);
+        assert!(
+            !satisfied,
+            "a violated non-critical constraint must not read as satisfied"
+        );
+        // No *critical* violation was found, so the scan still ran to completion.
         assert_eq!(stopped_at, 2);
     }
 

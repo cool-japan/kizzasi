@@ -120,14 +120,31 @@ fn bench_batch_processing(c: &mut Criterion) {
             BenchmarkId::from_parameter(batch_size),
             batch_size,
             |b, &batch_size| {
+                // The scheduler needs a model to serve requests; build it once so
+                // the benchmark measures scheduling and inference, not setup.
+                let model = S4D::new(
+                    S4Config::new()
+                        .input_dim(32)
+                        .hidden_dim(64)
+                        .state_dim(16)
+                        .num_layers(2)
+                        .diagonal(true),
+                )
+                .unwrap();
+                let mut scheduler = BatchScheduler::with_model(
+                    batch_config.clone(),
+                    engine_config.clone(),
+                    Box::new(model),
+                )
+                .unwrap();
+
                 b.iter(|| {
-                    let mut scheduler =
-                        BatchScheduler::new(batch_config.clone(), engine_config.clone()).unwrap();
+                    scheduler.reset();
 
                     // Submit requests
                     for _ in 0..batch_size {
                         let input = Array1::from_elem(32, 0.5);
-                        scheduler.submit(black_box(input), 10);
+                        scheduler.submit(black_box(input), 10).unwrap();
                     }
 
                     // Process batch
@@ -349,7 +366,6 @@ fn bench_full_pipeline(c: &mut Criterion) {
     let mut pipeline = PipelineBuilder::new()
         .engine_config(engine_config)
         .model(Box::new(s4_model))
-        .with_constraints()
         .build()
         .unwrap();
 

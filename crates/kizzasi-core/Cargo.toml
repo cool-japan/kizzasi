@@ -12,14 +12,53 @@ categories = ["algorithms", "science"]
 readme = "README.md"
 documentation = "https://docs.rs/kizzasi-core"
 homepage = "https://github.com/cool-japan/kizzasi"
+# Keep stray editor/backup files out of the published crate and docs.rs
+# source browsing (a stale, already-diverged `src/device.rs.bak` previously
+# shipped this way).
+exclude = ["*.bak", "**/*.bak"]
 
 [features]
 default = ["std"]
 std = []
-# GPU features (optional)
-# Note: cuda feature only works on Linux/Windows, ignored on macOS
-cuda = []
-metal = []
+# `metal` is a REAL backend switch: it forwards to candle's own Metal backend,
+# so `DeviceType::Metal` / `DeviceConfig::create_device()` /
+# `is_metal_available()` / `get_best_device()` start returning a live GPU
+# device instead of failing.
+#
+# It routes through the `kizzasi-metal` shim rather than naming
+# `candle-core/metal` directly, and that indirection is load-bearing. Cargo
+# features are not target-aware, so `metal = ["candle-core/metal"]` also fired
+# on Linux and Windows, where candle's Metal backend pulls `objc2` -- a crate
+# whose `lib.rs` is a `compile_error!` off Apple. That broke
+# `cargo build/test --all-features` on every non-Apple host, including the
+# command the README documents. `kizzasi-metal` moves the candle dependency
+# into target-scoped tables, which `resolver = "2"` *does* evaluate per target,
+# so the feature is now buildable everywhere and live only on Apple. See that
+# crate's module docs for why the renamed-alias alternative was rejected.
+#
+# On a non-Apple host the feature is inert but honest: `DeviceType::Metal`
+# still exists, and asking for it returns a device error naming the target
+# rather than silently degrading to CPU.
+#
+# NOTE: FFI. The Metal backend talks to Apple's Metal framework through
+# objc2; that is Apple system FFI, which is why this feature is off by
+# default and the default build stays pure Rust.
+metal = ["dep:kizzasi-metal"]
+#
+# There is deliberately NO `cuda` feature. candle's `cuda` feature pulls
+# `cudarc` + `candle-kernels`, whose build scripts invoke `nvcc` and abort the
+# build when no NVIDIA toolkit is present, and Cargo cannot make a feature
+# conditional on the host having a toolchain -- so a `cuda` flag would break
+# `--all-features` on every machine without CUDA (all Apple machines, most CI
+# runners). Forwarding it only on Linux/Windows via a renamed target-scoped
+# `package = "candle-core"` alias was tried and rejected by Cargo itself:
+# `cargo metadata --filter-platform` errors with "depends on crate
+# candle-core v0.11.0 multiple times with different names", which breaks
+# cargo-nextest and cargo-deny. Rather than ship a flag that gates nothing,
+# CUDA is simply not offered; `device.rs` documents that and
+# `DeviceType`/`get_best_device()` no longer pretend otherwise. Cross-platform
+# GPU acceleration is available through the `kizzasi-webgpu` backend (see the
+# `webgpu` feature on the `kizzasi` facade crate).
 # parallel feature uses scirs2-core parallel (already included in default features)
 
 [dependencies]
@@ -36,21 +75,16 @@ chrono.workspace = true
 safetensors.workspace = true
 half.workspace = true
 
+# CPU-only by default; the `metal` feature above adds candle's Metal backend
+# on Apple targets through the `kizzasi-metal` shim.
+candle-core.workspace = true
+candle-nn.workspace = true
+kizzasi-metal = { workspace = true, optional = true }
+
 [dev-dependencies]
 tracing-subscriber.workspace = true
 proptest.workspace = true
 criterion.workspace = true
-
-# Platform-specific Candle dependencies
-# CUDA is only supported on Linux and Windows (not macOS)
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-candle-core = { version = "0.11.0", default-features = false, features = [] }
-candle-nn = { version = "0.11.0", default-features = false, features = [] }
-
-# macOS uses Metal (or CPU-only by default)
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.11.0", default-features = false, features = [] }
-candle-nn = { version = "0.11.0", default-features = false, features = [] }
 
 [[bench]]
 name = "parallel_scan_bench"

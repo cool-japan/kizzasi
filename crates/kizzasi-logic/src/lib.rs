@@ -14,6 +14,7 @@
 mod advanced_constraints;
 mod advanced_projection;
 mod approximate_satisfaction;
+mod array_utils;
 pub mod compiler;
 mod constraint;
 mod constraint_analysis;
@@ -28,6 +29,7 @@ mod gpu_acceleration;
 mod guardrail;
 mod incremental_solver;
 pub mod logic_prog;
+mod lp_simplex;
 mod mpc;
 mod multiobjective;
 mod online_learning;
@@ -78,9 +80,9 @@ pub use constraint_sensitivity::{
 };
 pub use decomposition::{
     block_utils, ADMMConfig, BendersConfig, BendersCut, BendersDecomposition,
-    BendersIterationResult, Block, BlockCoordinateDescent, ConsensusADMM, DecompositionError,
-    DecompositionLevel, DecompositionResult, DualDecomposition, HierarchicalDecomposition,
-    Subproblem,
+    BendersIterationResult, BendersSubproblemSolution, Block, BlockCoordinateDescent,
+    ConsensusADMM, DecompositionError, DecompositionLevel, DecompositionResult, DualDecomposition,
+    HierarchicalDecomposition, Subproblem,
 };
 pub use differential_constraints::{
     DerivativeConstraint, DerivativeOrder, DifferentialAlgebraicConstraint,

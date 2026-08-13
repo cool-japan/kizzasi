@@ -42,6 +42,7 @@
 //! # }
 //! ```
 
+use scirs2_core::random::{rng, RngExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,28 +89,59 @@ pub enum MetricValue {
 }
 
 /// Histogram for tracking value distributions.
+///
+/// Once the reservoir is full, samples are replaced using Vitter's
+/// Algorithm R, so the retained set stays a uniform random sample of
+/// everything recorded. (The previous implementation indexed by the sample
+/// *value* — `values[value as usize % max_size]` — which is not sampling at
+/// all: a steady 0.4 ms workload overwrote slot 0 forever while a single
+/// 900 ms spike sat in slot 900 permanently, freezing every reported
+/// percentile.)
 #[derive(Debug, Clone)]
 struct Histogram {
     values: Vec<f64>,
     max_size: usize,
+    /// Total samples seen, including those not retained.
+    seen: u64,
 }
 
 impl Histogram {
     fn new(max_size: usize) -> Self {
+        // A zero-capacity reservoir cannot hold anything and previously made
+        // `record` divide by zero *while holding the metrics mutex*, poisoning
+        // it for the lifetime of the process.
+        let max_size = max_size.max(1);
         Self {
             values: Vec::with_capacity(max_size),
             max_size,
+            seen: 0,
         }
     }
 
     fn record(&mut self, value: f64) {
-        if self.values.len() >= self.max_size {
-            // Simple reservoir sampling
-            let idx = (value as usize) % self.max_size;
-            self.values[idx] = value;
-        } else {
+        self.seen = self.seen.saturating_add(1);
+
+        if self.values.len() < self.max_size {
             self.values.push(value);
+            return;
         }
+
+        // Algorithm R: replace a uniformly chosen retained sample with
+        // probability max_size / seen.
+        let mut generator = rng();
+        let index = generator.random_range(0..self.seen);
+        if index < self.max_size as u64 {
+            let slot = index as usize;
+            if let Some(entry) = self.values.get_mut(slot) {
+                *entry = value;
+            }
+        }
+    }
+
+    /// Total number of samples recorded, including evicted ones.
+    #[cfg(test)]
+    fn seen(&self) -> u64 {
+        self.seen
     }
 
     fn percentile(&self, p: f64) -> Option<f64> {
@@ -259,7 +291,10 @@ impl MetricsCollector {
             } => {
                 self.total_predictions.fetch_add(1, Ordering::Relaxed);
                 if self.config.track_latency {
-                    let mut state = self.state.lock().expect("MetricsCollector mutex poisoned");
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     state.latency_histogram.record(latency_us as f64 / 1000.0); // Convert to ms
                 }
             }
@@ -269,14 +304,20 @@ impl MetricsCollector {
             } => {
                 self.total_batch_predictions.fetch_add(1, Ordering::Relaxed);
                 if self.config.track_latency {
-                    let mut state = self.state.lock().expect("MetricsCollector mutex poisoned");
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     state.latency_histogram.record(latency_us as f64 / 1000.0);
                 }
             }
             MetricEvent::Error { category } => {
                 self.total_errors.fetch_add(1, Ordering::Relaxed);
                 if self.config.track_errors {
-                    let mut state = self.state.lock().expect("MetricsCollector mutex poisoned");
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     *state.error_counts.entry(category).or_insert(0) += 1;
                 }
             }
@@ -288,10 +329,16 @@ impl MetricsCollector {
             }
             MetricEvent::Custom { name, value, .. } => {
                 if let MetricValue::Counter(val) = value {
-                    let mut state = self.state.lock().expect("MetricsCollector mutex poisoned");
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     *state.custom_counters.entry(name).or_insert(0.0) += val as f64;
                 } else if let MetricValue::Gauge(val) = value {
-                    let mut state = self.state.lock().expect("MetricsCollector mutex poisoned");
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     state.custom_counters.insert(name, val);
                 }
             }
@@ -309,7 +356,10 @@ impl MetricsCollector {
         let total_resets = self.total_resets.load(Ordering::Relaxed);
         let total_forks = self.total_forks.load(Ordering::Relaxed);
 
-        let state = self.state.lock().expect("MetricsCollector mutex poisoned");
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let avg_latency_ms = state.latency_histogram.mean().unwrap_or(0.0);
         let p50_latency_ms = state.latency_histogram.percentile(0.5).unwrap_or(0.0);
@@ -359,7 +409,10 @@ impl MetricsCollector {
         self.total_resets.store(0, Ordering::Relaxed);
         self.total_forks.store(0, Ordering::Relaxed);
 
-        let mut state = self.state.lock().expect("MetricsCollector mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *state = MetricsState::new(self.config.histogram_size);
     }
 
@@ -509,6 +562,56 @@ mod tests {
         assert!((hist.mean().unwrap() - 50.5).abs() < 1.0);
         assert!((hist.percentile(0.5).unwrap() - 50.0).abs() < 2.0);
         assert!(hist.percentile(0.95).unwrap() > 90.0);
+    }
+
+    #[test]
+    fn test_histogram_reservoir_is_value_independent() {
+        // A steady sub-millisecond workload plus one huge outlier. Indexing
+        // the reservoir by the sample value used to pin every 0.4 ms sample to
+        // slot 0 and leave the 900 ms spike in slot 900 forever, so p50 and
+        // p99 were both permanently wrong.
+        let mut hist = Histogram::new(1000);
+        hist.record(900.0);
+        for _ in 0..100_000 {
+            hist.record(0.4);
+        }
+
+        let p50 = hist.percentile(0.5).unwrap_or(f64::NAN);
+        let p99 = hist.percentile(0.99).unwrap_or(f64::NAN);
+        assert!((p50 - 0.4).abs() < 1e-6, "p50 was {p50}");
+        assert!(p99 < 900.0, "p99 was {p99}");
+        assert_eq!(hist.seen(), 100_001);
+    }
+
+    #[test]
+    fn test_histogram_zero_capacity_does_not_panic() {
+        // `histogram_size` is a public field, so 0 is reachable; it used to
+        // divide by zero while holding the metrics mutex, poisoning it.
+        let mut hist = Histogram::new(0);
+        hist.record(1.0);
+        hist.record(2.0);
+        assert!(hist.percentile(0.5).is_some());
+    }
+
+    #[test]
+    fn test_zero_histogram_size_config_keeps_metrics_usable() {
+        let config = MetricsConfig {
+            name: "zero".to_string(),
+            histogram_size: 0,
+            track_latency: true,
+            track_errors: true,
+        };
+        let metrics = MetricsCollector::with_config(config);
+
+        metrics.record(MetricEvent::Prediction {
+            latency_us: 1000,
+            input_dim: 4,
+            output_dim: 4,
+        });
+
+        // Must still be usable afterwards (no poisoned mutex, no panic).
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.total_predictions, 1);
     }
 
     #[test]

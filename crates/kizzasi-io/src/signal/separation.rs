@@ -203,9 +203,8 @@ impl FastICA {
         // Compute covariance matrix
         let cov = data.t().dot(data) / n_samples as f32;
 
-        // Simplified eigenvalue decomposition (for small matrices)
-        // In production, use proper eigendecomposition from linalg crate
-        let (eigenvalues, eigenvectors) = Self::simple_eig(&cov)?;
+        let (eigenvalues, eigenvectors) = Self::symmetric_eigen(&cov)?;
+        Self::check_positive_semi_definite(&eigenvalues)?;
 
         // Compute whitening matrix: W = D^{-1/2} E^T
         let mut whitening = eigenvectors.t().to_owned();
@@ -222,46 +221,57 @@ impl FastICA {
         Ok((whitened, whitening))
     }
 
-    /// Simplified eigenvalue decomposition (power iteration)
-    fn simple_eig(matrix: &Array2<f32>) -> IoResult<(Vec<f32>, Array2<f32>)> {
-        let n = matrix.nrows();
-        let mut eigenvalues = Vec::new();
-        let mut eigenvectors = Array2::zeros((n, n));
-        let mut remaining = matrix.clone();
+    /// Symmetric eigenvalue decomposition of a covariance-like matrix.
+    ///
+    /// Delegates to `scirs2_linalg::eigh`, which is deterministic (no RNG
+    /// involved) and numerically robust. A previous version hand-rolled a
+    /// power iteration seeded from `thread_rng()` with a fixed 100
+    /// iterations and no convergence check, so identical input produced
+    /// different eigenvectors (and hence different separated sources) from
+    /// run to run, could silently fail to converge for clustered
+    /// eigenvalues, and accumulated deflation error across components.
+    ///
+    /// The input is symmetrized (`(M + M^T) / 2`) before decomposition:
+    /// floating-point rounding in the caller's matrix product (e.g. from a
+    /// blocked/parallel `dot()`) is not guaranteed to be bit-exactly
+    /// symmetric even when the matrix is mathematically symmetric, and
+    /// `eigh` rejects inputs that aren't exactly symmetric.
+    fn symmetric_eigen(matrix: &Array2<f32>) -> IoResult<(Vec<f32>, Array2<f32>)> {
+        let transposed = matrix.t().to_owned();
+        let symmetric = (matrix + &transposed) * 0.5;
 
-        for k in 0..n {
-            // Power iteration to find largest eigenvalue/eigenvector
-            let mut v = Array1::from_shape_fn(n, |_| thread_rng().gen_range(-1.0..1.0));
-            v = &v / v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let (eigenvalues, eigenvectors) = scirs2_linalg::eigh(&symmetric.view(), None)
+            .map_err(|e| IoError::SignalError(format!("Eigendecomposition failed: {e}")))?;
 
-            for _ in 0..100 {
-                let v_new = remaining.dot(&v);
-                let norm = v_new.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if norm < 1e-10 {
-                    break;
-                }
-                v = &v_new / norm;
+        Ok((eigenvalues.iter().copied().collect(), eigenvectors))
+    }
+
+    /// Reject an eigenvalue set whose minimum is negative beyond ordinary
+    /// floating-point noise. A valid covariance matrix is positive
+    /// semi-definite; a meaningfully negative eigenvalue means something
+    /// upstream is wrong (e.g. a badly conditioned or corrupted
+    /// covariance) rather than something safe to silently clamp away, as
+    /// `whiten`'s `.max(1e-10)` does for genuinely-tiny eigenvalues. The
+    /// tolerance is relative to the largest eigenvalue's magnitude, rather
+    /// than a fixed absolute cutoff, so that ordinary rounding noise from a
+    /// near-singular (e.g. rank-deficient/collinear) covariance -- whose
+    /// smallest eigenvalue is legitimately very close to zero -- is not
+    /// mistaken for a real problem.
+    fn check_positive_semi_definite(eigenvalues: &[f32]) -> IoResult<()> {
+        let max_abs = eigenvalues.iter().fold(0.0f32, |acc, &e| acc.max(e.abs()));
+        let tolerance = 1e-4 * max_abs.max(1.0);
+        if let Some(&min_eigenvalue) = eigenvalues
+            .iter()
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            if min_eigenvalue < -tolerance {
+                return Err(IoError::SignalError(format!(
+                    "Covariance matrix is not positive semi-definite (min eigenvalue \
+                     {min_eigenvalue}, tolerance {tolerance})"
+                )));
             }
-
-            // Compute eigenvalue
-            let av = remaining.dot(&v);
-            let eigenvalue = av.dot(&v);
-            eigenvalues.push(eigenvalue);
-
-            // Store eigenvector
-            for i in 0..n {
-                eigenvectors[[i, k]] = v[i];
-            }
-
-            // Deflate matrix
-            let vv = v
-                .clone()
-                .insert_axis(Axis(1))
-                .dot(&v.clone().insert_axis(Axis(0)));
-            remaining = &remaining - &(&vv * eigenvalue);
         }
-
-        Ok((eigenvalues, eigenvectors))
+        Ok(())
     }
 
     /// Gram-Schmidt orthogonalization
@@ -471,7 +481,7 @@ impl PCA {
         let cov = centered.t().dot(&centered) / n_samples as f32;
 
         // Eigendecomposition
-        let (eigenvalues, eigenvectors) = FastICA::simple_eig(&cov)?;
+        let (eigenvalues, eigenvectors) = FastICA::symmetric_eigen(&cov)?;
 
         // Sort by eigenvalue (descending)
         let mut indices: Vec<usize> = (0..eigenvalues.len()).collect();
@@ -557,8 +567,14 @@ impl TemporalDecorrelation {
 
         cov_delay /= (n_samples - self.tau) as f32;
 
-        // Eigendecomposition of time-delayed covariance
-        let (_, eigenvectors) = FastICA::simple_eig(&cov_delay)?;
+        // Eigendecomposition of the time-delayed covariance. `cov_delay`
+        // is not symmetric in general (correlating channel j at time i with
+        // channel k at time i+tau differs from the reverse), and
+        // `symmetric_eigen` symmetrizes its input before decomposing --
+        // this is intentional and matches the standard SOBI/TDSEP approach
+        // of eigendecomposing the symmetrized time-delayed covariance
+        // `(C_tau + C_tau^T) / 2` for this class of decorrelation methods.
+        let (_, eigenvectors) = FastICA::symmetric_eigen(&cov_delay)?;
 
         // Separate sources
         let separated = mixed.dot(&eigenvectors);
@@ -654,5 +670,86 @@ mod tests {
 
         let reconstructed = pca.inverse_transform(&transformed, &components);
         assert_eq!(reconstructed.nrows(), 3);
+    }
+
+    // === Regression tests: deterministic whitening eigendecomposition
+    // (medium, id=312) ===
+
+    #[test]
+    fn test_symmetric_eigen_is_deterministic_across_calls() {
+        // A previous version seeded its power iteration from a process-
+        // global thread_rng(), so identical input could yield different
+        // eigenvectors (and hence different separated sources) on
+        // different calls. scirs2_linalg::eigh has no such randomness.
+        let matrix = arr2(&[[4.0, 1.0], [1.0, 3.0]]);
+        let (vals1, vecs1) = FastICA::symmetric_eigen(&matrix).unwrap();
+        let (vals2, vecs2) = FastICA::symmetric_eigen(&matrix).unwrap();
+        assert_eq!(vals1, vals2);
+        assert_eq!(vecs1, vecs2);
+    }
+
+    #[test]
+    fn test_symmetric_eigen_matches_known_eigenvalues() {
+        // diag(2, 3) has eigenvalues {2, 3} exactly.
+        let matrix = arr2(&[[2.0, 0.0], [0.0, 3.0]]);
+        let (mut vals, _) = FastICA::symmetric_eigen(&matrix).unwrap();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        assert!((vals[0] - 2.0).abs() < 1e-4, "vals={vals:?}");
+        assert!((vals[1] - 3.0).abs() < 1e-4, "vals={vals:?}");
+    }
+
+    #[test]
+    fn test_symmetric_eigen_tolerates_slightly_asymmetric_input() {
+        // Matrix products computed via `.dot()` are not guaranteed to be
+        // bit-exactly symmetric even when the underlying math is; a
+        // previous power-iteration implementation did not care, but
+        // scirs2_linalg::eigh requires exact symmetry, so symmetric_eigen
+        // must symmetrize its input before decomposing rather than
+        // erroring out on ordinary floating-point noise.
+        let matrix = arr2(&[[2.0, 1.000_000_1], [1.0, 3.0]]);
+        let result = FastICA::symmetric_eigen(&matrix);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn test_check_positive_semi_definite_rejects_meaningfully_negative_eigenvalue() {
+        // {3, -1}: not a valid covariance eigenspectrum. whiten() must
+        // report this instead of silently clamping the negative eigenvalue
+        // to 1e-10 and proceeding (note: whiten() itself always computes
+        // `data.t().dot(data)`, which is mathematically guaranteed PSD, so
+        // this checks the guard directly with a hand-constructed
+        // eigenvalue set rather than trying to smuggle a non-PSD matrix
+        // through whiten()'s data->covariance step).
+        let result = FastICA::check_positive_semi_definite(&[3.0, -1.0]);
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    #[test]
+    fn test_check_positive_semi_definite_tolerates_rounding_noise() {
+        // A near-zero eigenvalue landing just below zero due to ordinary
+        // floating-point rounding (exactly what a rank-deficient/collinear
+        // covariance produces) must not be rejected.
+        let result = FastICA::check_positive_semi_definite(&[2.5, -1e-6]);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn test_check_positive_semi_definite_accepts_all_positive() {
+        let result = FastICA::check_positive_semi_definite(&[1.0, 2.0, 3.0]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_fastica_on_collinear_signals_does_not_spuriously_fail() {
+        // Regression guard: a near-singular (rank-deficient) covariance
+        // from perfectly collinear signals produces one eigenvalue very
+        // close to (and potentially just below) zero. The tolerance in
+        // `whiten()` is relative to the largest eigenvalue precisely so
+        // this ordinary floating-point noise does not trip the
+        // not-positive-semi-definite guard.
+        let mixed = arr2(&[[1.0, 2.0], [2.0, 4.0], [3.0, 6.0], [4.0, 8.0], [5.0, 10.0]]);
+        let ica = FastICA::new(2, None, None);
+        let result = ica.fit_transform(&mixed);
+        assert!(result.is_ok(), "{result:?}");
     }
 }

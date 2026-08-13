@@ -22,19 +22,27 @@
 //! # }).unwrap();
 //! ```
 
+#[cfg(feature = "hf-hub")]
 use crate::error::{ModelError, ModelResult};
+#[cfg(feature = "hf-hub")]
 use scirs2_core::ndarray::Array2;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "hf-hub")]
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+#[cfg(feature = "hf-hub")]
 use std::fs;
+#[cfg(feature = "hf-hub")]
 use std::io::Write;
+#[cfg(feature = "hf-hub")]
 use std::path::PathBuf;
 
 /// HuggingFace Hub API base URL
+#[cfg(feature = "hf-hub")]
 const HUGGINGFACE_HUB_URL: &str = "https://huggingface.co";
 
 /// Default cache directory (follows XDG Base Directory Specification on Unix)
+#[cfg(feature = "hf-hub")]
 fn default_cache_dir() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
@@ -105,6 +113,11 @@ pub struct ModelConfig {
 }
 
 /// HuggingFace Hub client
+///
+/// Requires the `hf-hub` feature: it owns a `reqwest::Client`, and reqwest's
+/// TLS stack is the crate's only C dependency (see the feature's note in
+/// `Cargo.toml`). [`ModelConfig`] above is always available.
+#[cfg(feature = "hf-hub")]
 #[derive(Debug, Clone)]
 pub struct HuggingFaceHub {
     /// API token for authentication (optional)
@@ -120,6 +133,7 @@ pub struct HuggingFaceHub {
     pub verify_integrity: bool,
 }
 
+#[cfg(feature = "hf-hub")]
 impl HuggingFaceHub {
     /// Create a new HuggingFace Hub client with default settings
     ///
@@ -134,7 +148,7 @@ impl HuggingFaceHub {
         let cache_dir = default_cache_dir();
 
         let client = reqwest::Client::builder()
-            .user_agent("kizzasi/0.1.0")
+            .user_agent(concat!("kizzasi/", env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .map_err(|e| {
@@ -475,22 +489,26 @@ impl HuggingFaceHub {
     }
 }
 
-impl Default for HuggingFaceHub {
-    fn default() -> Self {
-        Self::new().expect("Failed to create default HuggingFaceHub")
-    }
-}
+// Intentionally no `Default` impl: `HuggingFaceHub::new()` is fallible (it
+// builds a `reqwest::Client`, which can fail on TLS/root-certificate
+// initialization in locked-down environments), and `Default::default()` has
+// no way to propagate that failure — the only options are panicking (this
+// crate's no-panics-in-library-code policy forbids that) or silently
+// swallowing the error. Callers must use the fallible `HuggingFaceHub::new()`
+// directly.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "hf-hub")]
     #[test]
     fn test_default_cache_dir() {
         let cache_dir = default_cache_dir();
         assert!(cache_dir.to_string_lossy().contains("huggingface"));
     }
 
+    #[cfg(feature = "hf-hub")]
     #[test]
     fn test_hub_creation() {
         let hub = HuggingFaceHub::new();
@@ -500,6 +518,7 @@ mod tests {
         assert!(hub.cache_dir.to_string_lossy().contains("huggingface"));
     }
 
+    #[cfg(feature = "hf-hub")]
     #[test]
     fn test_custom_cache_dir() {
         let custom_dir = PathBuf::from("/tmp/test_cache");
@@ -510,6 +529,7 @@ mod tests {
         assert_eq!(hub.cache_dir, custom_dir);
     }
 
+    #[cfg(feature = "hf-hub")]
     #[test]
     fn test_with_token() {
         let hub = HuggingFaceHub::new()
@@ -519,6 +539,7 @@ mod tests {
         assert_eq!(hub.token.as_deref(), Some("test_token_12345"));
     }
 
+    #[cfg(feature = "hf-hub")]
     #[test]
     fn test_with_verification() {
         let hub = HuggingFaceHub::new().unwrap().with_verification(false);
@@ -556,6 +577,7 @@ mod tests {
         assert_eq!(repo_path, "state-spaces--mamba-130m");
     }
 
+    #[cfg(feature = "hf-hub")]
     #[tokio::test]
     async fn test_cache_size_empty() {
         let temp_dir = std::env::temp_dir().join("kizzasi_test_cache_empty");

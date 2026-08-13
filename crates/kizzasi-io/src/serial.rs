@@ -180,9 +180,20 @@ impl From<FlowControl> for TokioFlowControl {
 }
 
 /// Serial port stream
+///
+/// Holds a single `tokio_serial::SerialStream` wrapped in one `BufReader`.
+/// A previous version opened the port twice (once unbuffered for
+/// `read_bytes`, once more via a second `BufReader` for `read_line`/
+/// `read_until`), giving two independent kernel handles on the same tty:
+/// incoming bytes went to whichever handle happened to read first, so
+/// mixing `read_bytes()` with `read_line()`/`read_until()` silently split
+/// and lost data (and on Unix, exclusive-access serial backends could fail
+/// the second `open` outright with EBUSY). All reads now go through the
+/// same `BufReader`, and control operations (`bytes_to_read`, `clear_*`,
+/// `set_baud_rate`, ...) reach the single underlying port via
+/// `get_ref()`/`get_mut()`.
 pub struct SerialStream {
     config: SerialConfig,
-    port: tokio_serial::SerialStream,
     reader: BufReader<tokio_serial::SerialStream>,
 }
 
@@ -200,29 +211,15 @@ impl SerialStream {
 
         info!("Serial port opened: {}", config.port);
 
-        // Clone port for reader
-        let reader_port = tokio_serial::new(&config.port, config.baud_rate)
-            .data_bits(config.data_bits.into())
-            .parity(config.parity.into())
-            .stop_bits(config.stop_bits.into())
-            .flow_control(config.flow_control.into())
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .open_native_async()
-            .map_err(|e| IoError::ConnectionFailed(format!("Failed to open serial port: {}", e)))?;
+        let reader = BufReader::with_capacity(config.buffer_size, port);
 
-        let reader = BufReader::with_capacity(config.buffer_size, reader_port);
-
-        Ok(Self {
-            config,
-            port,
-            reader,
-        })
+        Ok(Self { config, reader })
     }
 
     /// Read raw bytes
     pub async fn read_bytes(&mut self, max_len: usize) -> IoResult<Bytes> {
         let mut buffer = vec![0u8; max_len];
-        match self.port.read(&mut buffer).await {
+        match self.reader.read(&mut buffer).await {
             Ok(n) => {
                 debug!("Serial read {} bytes", n);
                 Ok(Bytes::from(buffer[..n].to_vec()))
@@ -272,7 +269,8 @@ impl SerialStream {
 
     /// Write data
     pub async fn write(&mut self, data: &[u8]) -> IoResult<()> {
-        self.port
+        self.reader
+            .get_mut()
             .write_all(data)
             .await
             .map_err(|e| IoError::SendFailed(format!("Serial write error: {}", e)))?;
@@ -289,7 +287,8 @@ impl SerialStream {
 
     /// Flush output buffer
     pub async fn flush(&mut self) -> IoResult<()> {
-        self.port
+        self.reader
+            .get_mut()
             .flush()
             .await
             .map_err(|e| IoError::SendFailed(format!("Serial flush error: {}", e)))
@@ -297,42 +296,48 @@ impl SerialStream {
 
     /// Get the number of bytes available to read
     pub fn bytes_to_read(&self) -> IoResult<u32> {
-        self.port
+        self.reader
+            .get_ref()
             .bytes_to_read()
             .map_err(|e| IoError::ReadFailed(format!("Failed to get bytes to read: {}", e)))
     }
 
     /// Get the number of bytes waiting to be written
     pub fn bytes_to_write(&self) -> IoResult<u32> {
-        self.port
+        self.reader
+            .get_ref()
             .bytes_to_write()
             .map_err(|e| IoError::SendFailed(format!("Failed to get bytes to write: {}", e)))
     }
 
     /// Clear input buffer
     pub fn clear_input_buffer(&self) -> IoResult<()> {
-        self.port
+        self.reader
+            .get_ref()
             .clear(tokio_serial::ClearBuffer::Input)
             .map_err(|e| IoError::ConfigError(format!("Failed to clear input buffer: {}", e)))
     }
 
     /// Clear output buffer
     pub fn clear_output_buffer(&self) -> IoResult<()> {
-        self.port
+        self.reader
+            .get_ref()
             .clear(tokio_serial::ClearBuffer::Output)
             .map_err(|e| IoError::ConfigError(format!("Failed to clear output buffer: {}", e)))
     }
 
     /// Clear all buffers
     pub fn clear_all_buffers(&self) -> IoResult<()> {
-        self.port
+        self.reader
+            .get_ref()
             .clear(tokio_serial::ClearBuffer::All)
             .map_err(|e| IoError::ConfigError(format!("Failed to clear buffers: {}", e)))
     }
 
     /// Set baud rate
     pub fn set_baud_rate(&mut self, baud_rate: u32) -> IoResult<()> {
-        self.port
+        self.reader
+            .get_mut()
             .set_baud_rate(baud_rate)
             .map_err(|e| IoError::ConfigError(format!("Failed to set baud rate: {}", e)))?;
 

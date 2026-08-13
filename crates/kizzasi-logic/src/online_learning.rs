@@ -59,8 +59,8 @@ impl OnlineConstraintLearner {
 
     /// Refine constraint based on a single observation
     fn refine_constraint(&mut self, sample: &Array1<f32>, is_feasible: bool) -> LogicResult<()> {
-        let sample_slice = sample.as_slice().unwrap_or(&[]);
-        let current_satisfied = self.constraint.check(sample_slice);
+        let sample_slice = crate::array_utils::contiguous(sample);
+        let current_satisfied = self.constraint.check(&sample_slice);
 
         // If prediction matches observation, no update needed
         if current_satisfied == is_feasible {
@@ -69,7 +69,7 @@ impl OnlineConstraintLearner {
 
         // Compute gradient for constraint refinement
         // For a·x <= b, we adjust 'a' and 'b' to better fit the data
-        let violation = self.constraint.violation(sample_slice);
+        let violation = self.constraint.violation(&sample_slice);
 
         // Update using perceptron-like rule
         // Positive update_scale → loosen (raise b); negative → tighten (lower b)
@@ -83,7 +83,7 @@ impl OnlineConstraintLearner {
 
         self.constraint.shift_rhs(update_scale);
         self.constraint.update_coefficients_towards(
-            sample_slice,
+            &sample_slice,
             update_scale.signum() * self.learning_rate * 0.1,
         );
 
@@ -111,7 +111,9 @@ impl OnlineConstraintLearner {
             .data_buffer
             .iter()
             .filter(|(sample, is_feasible)| {
-                let satisfied = self.constraint.check(sample.as_slice().unwrap_or(&[]));
+                let satisfied = self
+                    .constraint
+                    .check(&crate::array_utils::contiguous(sample));
                 satisfied == *is_feasible
             })
             .count();
@@ -261,11 +263,11 @@ impl ActiveConstraintBoundaryLearner {
             .min_by(|(s1, _), (s2, _)| {
                 let v1 = self
                     .constraint
-                    .violation(s1.as_slice().unwrap_or(&[]))
+                    .violation(&crate::array_utils::contiguous(s1))
                     .abs();
                 let v2 = self
                     .constraint
-                    .violation(s2.as_slice().unwrap_or(&[]))
+                    .violation(&crate::array_utils::contiguous(s2))
                     .abs();
                 v1.partial_cmp(&v2).unwrap_or(std::cmp::Ordering::Equal)
             })
@@ -276,7 +278,7 @@ impl ActiveConstraintBoundaryLearner {
     pub fn add_labeled_sample(&mut self, sample: Array1<f32>, is_feasible: bool) {
         let violation = self
             .constraint
-            .violation(sample.as_slice().unwrap_or(&[]))
+            .violation(&crate::array_utils::contiguous(&sample))
             .abs();
 
         // Add to boundary samples if near boundary
@@ -292,7 +294,7 @@ impl ActiveConstraintBoundaryLearner {
     pub fn add_unlabeled_sample(&mut self, sample: Array1<f32>) {
         let violation = self
             .constraint
-            .violation(sample.as_slice().unwrap_or(&[]))
+            .violation(&crate::array_utils::contiguous(&sample))
             .abs();
 
         if violation < self.uncertainty_threshold {
@@ -334,24 +336,24 @@ impl ActiveConstraintBoundaryLearner {
         for epoch in 0..max_epochs {
             let lr = base_lr / (1.0 + epoch as f32);
             for (sample, is_feasible) in &labeled {
-                let sample_slice = sample.as_slice().unwrap_or(&[]);
-                let predicted_feasible = self.constraint.check(sample_slice);
+                let sample_slice = crate::array_utils::contiguous(sample);
+                let predicted_feasible = self.constraint.check(&sample_slice);
                 if predicted_feasible == *is_feasible {
                     continue; // Correctly classified — no update needed
                 }
                 // Mis-classified: nudge the boundary
-                let violation = self.constraint.violation(sample_slice);
+                let violation = self.constraint.violation(&sample_slice);
                 let margin = violation.max(lr); // At least lr to guarantee movement
                 if *is_feasible {
                     // Sample should be feasible but constraint says violated → loosen boundary
                     self.constraint.shift_rhs(margin * lr);
                     self.constraint
-                        .update_coefficients_towards(sample_slice, -lr * 0.1);
+                        .update_coefficients_towards(&sample_slice, -lr * 0.1);
                 } else {
                     // Sample should be infeasible but constraint says satisfied → tighten boundary
                     self.constraint.shift_rhs(-margin * lr);
                     self.constraint
-                        .update_coefficients_towards(sample_slice, lr * 0.1);
+                        .update_coefficients_towards(&sample_slice, lr * 0.1);
                 }
             }
         }
@@ -407,7 +409,9 @@ impl FeedbackConstraintTuner {
 
     /// Add user feedback for a sample
     pub fn add_feedback(&mut self, sample: &Array1<f32>, satisfaction: f32) -> LogicResult<()> {
-        let violation = self.constraint.violation(sample.as_slice().unwrap_or(&[]));
+        let violation = self
+            .constraint
+            .violation(&crate::array_utils::contiguous(sample));
         self.feedback_history.push((violation, satisfaction));
 
         // Tune constraint based on feedback

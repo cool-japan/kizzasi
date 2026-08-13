@@ -11,7 +11,7 @@ use rumqttc::{AsyncClient, Broker, Event, EventLoop, MqttOptions, Packet, QoS};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{oneshot, watch, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// Default request timeout when waiting for an MQTT response.
@@ -34,8 +34,10 @@ pub struct MqttAdapter {
     /// Output topic
     output_topic: String,
 
-    /// Running state
-    running: Arc<RwLock<bool>>,
+    /// Running state, and the signal `stop()` uses to interrupt an in-flight
+    /// `run()` call blocked on `eventloop.poll()` (or its reconnect-backoff
+    /// sleep). See `GrpcAdapter`/`WebSocketAdapter` for the same pattern.
+    running: watch::Sender<bool>,
 
     /// Pending request/response correlations.
     ///
@@ -82,6 +84,7 @@ impl MqttAdapter {
         mqttoptions.set_keep_alive(30u16);
 
         let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
+        let (running, _) = watch::channel(false);
 
         Ok(Self {
             client,
@@ -89,12 +92,13 @@ impl MqttAdapter {
             engine: Arc::new(RwLock::new(engine)),
             input_topic: input_topic.into(),
             output_topic: output_topic.into(),
-            running: Arc::new(RwLock::new(false)),
+            running,
             pending: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    /// Start processing MQTT messages
+    /// Start processing MQTT messages, until [`NetworkAdapter::stop`] is
+    /// called.
     pub async fn run(&self) -> InferenceResult<()> {
         // Subscribe to input topic
         self.client
@@ -103,13 +107,23 @@ impl MqttAdapter {
             .map_err(|e| InferenceError::NetworkError(e.to_string()))?;
 
         info!("MQTT adapter subscribed to topic: {}", self.input_topic);
-        *self.running.write().await = true;
+        let _ = self.running.send_replace(true);
+        let mut shutdown_rx = self.running.subscribe();
 
         // Process events
-        while *self.running.read().await {
-            let event = {
-                let mut eventloop = self.eventloop.write().await;
-                eventloop.poll().await
+        loop {
+            let event = tokio::select! {
+                biased;
+
+                _ = shutdown_rx.wait_for(|running| !*running) => {
+                    break;
+                }
+                event = async {
+                    let mut eventloop = self.eventloop.write().await;
+                    eventloop.poll().await
+                } => {
+                    event
+                }
             };
 
             match event {
@@ -136,9 +150,12 @@ impl MqttAdapter {
                     let start = std::time::Instant::now();
                     let input = request.to_array();
 
-                    let output = {
+                    let outputs = {
                         let engine = self.engine.write().await;
-                        match engine.step_async(input).await {
+                        match engine
+                            .step_async_with(input, &(&request.config).into())
+                            .await
+                        {
                             Ok(out) => out,
                             Err(e) => {
                                 error!("Inference error for request {}: {}", request_id, e);
@@ -150,12 +167,9 @@ impl MqttAdapter {
                     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                     // Create response
-                    let response = InferenceResponse::new(
-                        request_id.clone(),
-                        output.to_vec(),
-                        latency_ms,
-                        output.len(),
-                    );
+                    let (output, num_tokens) = super::flatten_outputs(&outputs);
+                    let response =
+                        InferenceResponse::new(request_id.clone(), output, latency_ms, num_tokens);
 
                     // If there is a pending in-process caller waiting for this request_id,
                     // resolve it directly via the oneshot channel — no MQTT round-trip needed.
@@ -198,12 +212,20 @@ impl MqttAdapter {
                 }
                 Err(e) => {
                     error!("MQTT connection error: {}", e);
-                    // Try to reconnect
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Try to reconnect, but stay interruptible: a `stop()`
+                    // during the backoff must not have to wait out the full
+                    // 5 seconds before `run()` returns.
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.wait_for(|running| !*running) => break,
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
                 }
             }
         }
 
+        let _ = self.running.send_replace(false);
+        info!("MQTT adapter stopped");
         Ok(())
     }
 
@@ -271,20 +293,18 @@ impl MqttAdapter {
 }
 
 impl NetworkAdapter for MqttAdapter {
-    async fn start(&mut self) -> InferenceResult<()> {
+    async fn start(&self) -> InferenceResult<()> {
         self.run().await
     }
 
-    async fn stop(&mut self) -> InferenceResult<()> {
-        *self.running.write().await = false;
-        info!("MQTT adapter stopped");
+    async fn stop(&self) -> InferenceResult<()> {
+        let _ = self.running.send_replace(false);
+        info!("MQTT adapter stop requested");
         Ok(())
     }
 
     fn is_running(&self) -> bool {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async { *self.running.read().await })
-        })
+        *self.running.borrow()
     }
 }
 
@@ -333,5 +353,67 @@ mod tests {
         let engine3 = StreamingEngine::new(stream_config3).unwrap();
         let adapter3 = MqttAdapter::new("broker:1883", "client3", "in", "out", engine3);
         assert!(adapter3.is_ok());
+    }
+
+    /// Regression: `NetworkAdapter::stop()` used to flip a flag `run()`
+    /// never read, and even after fixing the read, the loop's own 5-second
+    /// reconnect backoff was not itself interruptible. `start()` must now
+    /// actually resolve promptly after `stop()`, whether it is currently
+    /// blocked polling the (unreachable) broker or backing off from a
+    /// connection error.
+    ///
+    /// Points at a just-closed local port (rather than a real broker
+    /// hostname) so the connection is refused immediately and
+    /// deterministically, without depending on external network access.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_network_adapter_stop_unblocks_start() {
+        use crate::streaming::StreamConfig;
+        use std::net::TcpListener as StdTcpListener;
+
+        let closed_addr = {
+            let listener =
+                StdTcpListener::bind("127.0.0.1:0").expect("OS should assign a free port");
+            listener.local_addr().expect("local_addr must be set")
+            // `listener` is dropped here, closing the port.
+        };
+
+        let engine = StreamingEngine::new(StreamConfig::default()).unwrap();
+        let adapter = Arc::new(
+            MqttAdapter::new(
+                &format!("mqtt://{}", closed_addr),
+                "stop-test-client",
+                "agsp/input",
+                "agsp/output",
+                engine,
+            )
+            .expect("adapter construction must succeed"),
+        );
+
+        let adapter_for_task = adapter.clone();
+        let handle = tokio::spawn(async move { adapter_for_task.start().await });
+
+        // Poll rather than a single fixed sleep: robust against scheduling
+        // jitter when many tests run concurrently.
+        let mut became_running = false;
+        for _ in 0..100 {
+            if adapter.is_running() {
+                became_running = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            became_running,
+            "adapter should report running after start()"
+        );
+
+        adapter.stop().await.expect("stop must succeed");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+        assert!(
+            result.is_ok(),
+            "start() must resolve promptly after stop(), well under the 5s reconnect backoff"
+        );
+        assert!(!adapter.is_running());
     }
 }

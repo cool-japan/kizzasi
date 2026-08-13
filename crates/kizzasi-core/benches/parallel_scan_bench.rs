@@ -12,10 +12,13 @@
 //!
 //! * `AddOp` — scalar `f32` addition. Has an identity (`0.0`), so the
 //!   parallel path actually reaches `scirs2-core`'s Blelloch implementation.
-//! * `SSMScanOp` — the production SSM associative operator with no identity.
-//!   `parallel_scan` falls back to a sequential reduction here, so this group
-//!   measures the overhead of the dispatch and the SSM combine itself rather
-//!   than parallel speedup.
+//! * `SSMScanOp` — the production SSM associative operator. It now carries a
+//!   real identity element (`(ones(state_dim), zeros(state_dim))`, keyed by
+//!   the state dimension the operator is constructed with), so `parallel_scan`
+//!   also reaches the Blelloch implementation for this operator family, not
+//!   just for `AddOp` -- this group measures actual SSM parallel-scan
+//!   speedup, not merely dispatch overhead on top of a forced sequential
+//!   fallback.
 //!
 //! Each benchmark reports throughput as elements per second.
 
@@ -34,9 +37,9 @@ use std::hint::black_box;
 ///   work-efficient Blelloch parallel scan.
 const SIZES: &[usize] = &[32, 64, 128, 256, 1024, 4096, 16384];
 
-/// Reduced set of sizes for the SSM operator, which has no identity and
-/// always falls back to a sequential reduction inside `parallel_scan`.
-/// Running 16384-element SSM scans bloats wall time without adding signal.
+/// Reduced set of sizes for the SSM operator. Running 16384-element SSM
+/// scans bloats wall time without adding signal beyond what 1024 already
+/// shows.
 const SSM_SIZES: &[usize] = &[64, 256, 1024];
 
 /// SSM state dimension used for the per-element `SSMElement` payload.
@@ -109,7 +112,7 @@ fn sequential_ssm_scan(data: &[SSMElement]) -> Vec<SSMElement> {
     if data.is_empty() {
         return Vec::new();
     }
-    let op = SSMScanOp;
+    let op = SSMScanOp::new(SSM_STATE_DIM);
     let mut out = Vec::with_capacity(data.len());
     out.push(data[0].clone());
     for i in 1..data.len() {
@@ -179,14 +182,15 @@ fn bench_sequential_scan_ssm(c: &mut Criterion) {
     group.finish();
 }
 
-/// `parallel_scan` invoked with `SSMScanOp` (no identity). Falls back to a
-/// sequential reduction inside `parallel_scan_impl`; this measures the
-/// dispatch overhead relative to the raw sequential SSM scan above.
+/// `parallel_scan` invoked with `SSMScanOp` (now carrying a real identity for
+/// `state_dim = SSM_STATE_DIM`). Reaches `scirs2-core`'s Blelloch
+/// implementation inside `parallel_scan_impl` for `n >= 64`, exercising the
+/// actual parallel path rather than a forced sequential fallback.
 fn bench_parallel_scan_ssm(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan/parallel_ssm");
     for &n in SSM_SIZES {
         let data = make_ssm_data(n, SSM_STATE_DIM);
-        let op = SSMScanOp;
+        let op = SSMScanOp::new(SSM_STATE_DIM);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| parallel_scan(black_box(&data), &op, true));

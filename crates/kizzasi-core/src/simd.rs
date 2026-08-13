@@ -7,17 +7,61 @@
 //! - State space model recurrence steps
 //!
 //! Uses explicit SIMD when available, with fallback to optimized scalar code.
+//!
+//! # Dispatch
+//!
+//! The entry points here are thin dispatchers. On x86-64 they route to
+//! [`crate::simd_avx512`], which performs runtime `avx512f`/`avx2` detection;
+//! on aarch64 they route to [`crate::simd_aarch64`]/[`crate::simd_neon`],
+//! which use NEON intrinsics. Every other target uses the unrolled scalar
+//! kernels in this module, which are also exported directly (`*_scalar`) so
+//! cross-backend equality can be asserted in tests.
 
 use scirs2_core::ndarray::{Array1, Array2, ArrayView1};
 
 /// Process 8 elements at a time for SIMD operations
 const SIMD_WIDTH: usize = 8;
 
-/// Optimized dot product with loop unrolling
+/// Dot product, dispatched to the widest vector kernel available on this target.
+///
+/// The inputs are truncated to their common length, so a caller that passes
+/// mismatched slices gets the well-defined prefix product instead of a panic
+/// or (as previously) a silent zero.
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    let len = a.len();
+    let len = a.len().min(b.len());
+    dot_product_dispatch(&a[..len], &b[..len])
+}
+
+/// x86-64: runtime AVX-512 / AVX2 dispatch with a scalar fallback.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dot_product_dispatch(a: &[f32], b: &[f32]) -> f32 {
+    crate::simd_avx512::dot_product_avx512(a, b)
+}
+
+/// aarch64: NEON FMA kernel.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_product_dispatch(a: &[f32], b: &[f32]) -> f32 {
+    crate::simd_aarch64::dot_product_f32(a, b)
+}
+
+/// Portable fallback for targets without a vector kernel.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn dot_product_dispatch(a: &[f32], b: &[f32]) -> f32 {
+    dot_product_scalar(a, b)
+}
+
+/// Portable dot product with 4-way accumulator unrolling.
+///
+/// This is the reference implementation the vector backends must agree with.
+#[inline]
+pub fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let len = a.len().min(b.len());
     let chunks = len / SIMD_WIDTH;
     let remainder = len % SIMD_WIDTH;
 
@@ -49,24 +93,37 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Optimized dot product for ndarray views
+///
+/// Contiguous views go straight to the vector kernel. Strided views cannot be
+/// viewed as a slice, so they are folded element-wise — the historical
+/// `as_slice().unwrap_or_default()` handed the kernel an *empty* slice and
+/// silently returned `0.0` for any non-contiguous input.
 #[inline]
 pub fn dot_view(a: ArrayView1<f32>, b: ArrayView1<f32>) -> f32 {
-    dot_product(
-        a.as_slice().unwrap_or_default(),
-        b.as_slice().unwrap_or_default(),
-    )
+    match (a.as_slice(), b.as_slice()) {
+        (Some(a_slice), Some(b_slice)) => dot_product(a_slice, b_slice),
+        _ => a.iter().zip(b.iter()).map(|(x, y)| x * y).sum(),
+    }
 }
 
 /// Optimized matrix-vector multiplication: y = M * x
+///
+/// `y` is written only up to `min(m.nrows(), y.len())` rows; if `y` is
+/// shorter than `m` has rows, the extra rows are simply not computed rather
+/// than indexing out of bounds. Column-length mismatches between `m` and `x`
+/// are handled by [`dot_view`]'s own well-defined prefix truncation.
 #[inline]
 pub fn matvec(m: &Array2<f32>, x: &Array1<f32>, y: &mut Array1<f32>) {
-    let rows = m.nrows();
+    let rows = m.nrows().min(y.len());
     let cols = m.ncols();
     debug_assert_eq!(cols, x.len());
-    debug_assert_eq!(rows, y.len());
-    // SIMD inner kernel: emit a TRACE-level span so it is compiled out in
-    // release builds with the default tracing filter, keeping the hot path
-    // overhead-free for callers that don't opt into trace logging.
+    debug_assert_eq!(m.nrows(), y.len());
+    // SIMD inner kernel: emit a TRACE-level span so tracing-subscriber can
+    // identify it when trace logging is opted into, without adding overhead
+    // under the default DEBUG/INFO filter. In a release build there is no
+    // cost at all: the workspace enables `tracing`'s `release_max_level_info`
+    // feature (root Cargo.toml), which compiles `trace_span!` away entirely.
+    // In debug builds it stays a small, subscriber-filtered runtime cost.
     let _span = tracing::trace_span!("simd::matvec", rows = rows, cols = cols).entered();
 
     // Process 4 rows at a time if possible
@@ -94,12 +151,44 @@ pub fn matvec(m: &Array2<f32>, x: &Array1<f32>, y: &mut Array1<f32>) {
     }
 }
 
-/// Optimized element-wise addition: c = a + b
+/// Element-wise addition `c = a + b`, dispatched to the target's vector kernel.
 #[inline]
 pub fn vec_add(a: &[f32], b: &[f32], c: &mut [f32]) {
     debug_assert_eq!(a.len(), b.len());
     debug_assert_eq!(a.len(), c.len());
-    let len = a.len();
+    let len = a.len().min(b.len()).min(c.len());
+    vec_add_dispatch(&a[..len], &b[..len], &mut c[..len]);
+}
+
+/// x86-64: AVX-512 element-wise add with a scalar fallback.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn vec_add_dispatch(a: &[f32], b: &[f32], c: &mut [f32]) {
+    crate::simd_avx512::elementwise::add_avx512(a, b, c);
+}
+
+/// aarch64: NEON element-wise add.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn vec_add_dispatch(a: &[f32], b: &[f32], c: &mut [f32]) {
+    crate::simd_aarch64::add_f32(a, b, c);
+}
+
+/// Portable fallback for targets without a vector kernel.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn vec_add_dispatch(a: &[f32], b: &[f32], c: &mut [f32]) {
+    vec_add_scalar(a, b, c);
+}
+
+/// Portable element-wise addition with loop unrolling.
+///
+/// Reference implementation the vector backends must agree with.
+#[inline]
+pub fn vec_add_scalar(a: &[f32], b: &[f32], c: &mut [f32]) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), c.len());
+    let len = a.len().min(b.len()).min(c.len());
     let chunks = len / SIMD_WIDTH;
     let remainder = len % SIMD_WIDTH;
 
@@ -122,11 +211,15 @@ pub fn vec_add(a: &[f32], b: &[f32], c: &mut [f32]) {
 }
 
 /// Optimized element-wise multiply: c = a * b
+///
+/// Inputs are truncated to their common length (matching [`dot_product`]'s
+/// documented behaviour), so mismatched slice lengths yield the well-defined
+/// prefix product instead of an out-of-bounds index panic.
 #[inline]
 pub fn vec_mul(a: &[f32], b: &[f32], c: &mut [f32]) {
     debug_assert_eq!(a.len(), b.len());
     debug_assert_eq!(a.len(), c.len());
-    let len = a.len();
+    let len = a.len().min(b.len()).min(c.len());
     let chunks = len / SIMD_WIDTH;
     let remainder = len % SIMD_WIDTH;
 
@@ -149,11 +242,15 @@ pub fn vec_mul(a: &[f32], b: &[f32], c: &mut [f32]) {
 }
 
 /// Optimized element-wise fused multiply-add: c = a * b + c
+///
+/// Inputs are truncated to their common length (matching [`dot_product`]'s
+/// documented behaviour), so mismatched slice lengths yield the well-defined
+/// prefix result instead of an out-of-bounds index panic.
 #[inline]
 pub fn vec_fma(a: &[f32], b: &[f32], c: &mut [f32]) {
     debug_assert_eq!(a.len(), b.len());
     debug_assert_eq!(a.len(), c.len());
-    let len = a.len();
+    let len = a.len().min(b.len()).min(c.len());
     let chunks = len / SIMD_WIDTH;
     let remainder = len % SIMD_WIDTH;
 
@@ -175,11 +272,35 @@ pub fn vec_fma(a: &[f32], b: &[f32], c: &mut [f32]) {
     }
 }
 
-/// Optimized scalar multiply: c = alpha * a
+/// Scalar multiply `c = alpha * a`, dispatched to the target's vector kernel.
 #[inline]
 pub fn vec_scale(a: &[f32], alpha: f32, c: &mut [f32]) {
     debug_assert_eq!(a.len(), c.len());
-    let len = a.len();
+    let len = a.len().min(c.len());
+    vec_scale_dispatch(&a[..len], alpha, &mut c[..len]);
+}
+
+/// aarch64: NEON scalar multiply.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn vec_scale_dispatch(a: &[f32], alpha: f32, c: &mut [f32]) {
+    crate::simd_aarch64::scale_f32(a, alpha, c);
+}
+
+/// Portable fallback (x86-64 has no dedicated scale kernel in `simd_avx512`).
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn vec_scale_dispatch(a: &[f32], alpha: f32, c: &mut [f32]) {
+    vec_scale_scalar(a, alpha, c);
+}
+
+/// Portable scalar multiply with loop unrolling.
+///
+/// Reference implementation the vector backends must agree with.
+#[inline]
+pub fn vec_scale_scalar(a: &[f32], alpha: f32, c: &mut [f32]) {
+    debug_assert_eq!(a.len(), c.len());
+    let len = a.len().min(c.len());
     let chunks = len / SIMD_WIDTH;
     let remainder = len % SIMD_WIDTH;
 
@@ -202,10 +323,14 @@ pub fn vec_scale(a: &[f32], alpha: f32, c: &mut [f32]) {
 }
 
 /// Optimized exp for arrays
+///
+/// Inputs are truncated to their common length (matching [`dot_product`]'s
+/// documented behaviour), so a length mismatch yields the well-defined
+/// prefix result instead of an out-of-bounds index panic.
 #[inline]
 pub fn vec_exp(a: &[f32], c: &mut [f32]) {
     debug_assert_eq!(a.len(), c.len());
-    let len = a.len();
+    let len = a.len().min(c.len());
     let chunks = len / SIMD_WIDTH;
     let remainder = len % SIMD_WIDTH;
 
@@ -261,35 +386,59 @@ pub fn fast_exp(x: f32) -> f32 {
 /// Optimized SSM state update: h' = A_bar ⊙ h + B_bar ⊙ x
 ///
 /// Uses fused operations to reduce memory bandwidth requirements.
+///
+/// `x` broadcasts cyclically against `h`/`a_bar`/`b_bar`: pass a
+/// single-element slice to broadcast one scalar input across every state
+/// dimension (the common case of a scalar per-timestep SSM input), or a
+/// slice the same length as `h` for a plain element-wise (non-broadcast)
+/// update. `a_bar`/`b_bar` are expected to match `h`'s length exactly (that
+/// invariant holds structurally at every real call site, since they are
+/// discretized per-state-dimension companions of `h`) and are truncated to
+/// `h`'s length defensively, matching this module's other kernels.
+///
+/// A previous version of this function asserted `b_bar.len() == x.len()`
+/// while its body unconditionally indexed `x[i % x.len()]` -- a broadcast
+/// idiom that contradicted the assert, and which panicked outright (integer
+/// division by zero, even in release builds) if `x` was empty. `x` must now
+/// simply be non-empty; an empty `x` leaves `h` unchanged instead of
+/// panicking.
 #[inline]
 pub fn ssm_state_update(a_bar: &[f32], h: &mut [f32], b_bar: &[f32], x: &[f32]) {
     debug_assert_eq!(a_bar.len(), h.len());
-    debug_assert_eq!(b_bar.len(), x.len());
-    debug_assert_eq!(a_bar.len(), b_bar.len());
+    debug_assert_eq!(b_bar.len(), h.len());
+    // NOT a debug_assert!(!x.is_empty()): unlike the length checks above
+    // (which only affect *which* prefix gets computed if violated), an
+    // empty `x` must never panic -- not even in debug builds -- since the
+    // whole point of the `xlen == 0` branch below is to make that case a
+    // documented, graceful no-op instead of the integer-division-by-zero
+    // panic this function used to have.
 
-    let len = h.len();
-    // TRACE-level span: this kernel runs once per recurrence step in the
-    // inference loop and would generate huge volumes at DEBUG. Use TRACE
-    // so it's compiled out by default.
-    let _span = tracing::trace_span!("simd::ssm_state_update", len = len).entered();
-    let chunks = len / SIMD_WIDTH;
-    let remainder = len % SIMD_WIDTH;
-
-    let mut i = 0;
-    for _ in 0..chunks {
-        h[i] = a_bar[i].mul_add(h[i], b_bar[i] * x[i % x.len()]);
-        h[i + 1] = a_bar[i + 1].mul_add(h[i + 1], b_bar[i + 1] * x[(i + 1) % x.len()]);
-        h[i + 2] = a_bar[i + 2].mul_add(h[i + 2], b_bar[i + 2] * x[(i + 2) % x.len()]);
-        h[i + 3] = a_bar[i + 3].mul_add(h[i + 3], b_bar[i + 3] * x[(i + 3) % x.len()]);
-        h[i + 4] = a_bar[i + 4].mul_add(h[i + 4], b_bar[i + 4] * x[(i + 4) % x.len()]);
-        h[i + 5] = a_bar[i + 5].mul_add(h[i + 5], b_bar[i + 5] * x[(i + 5) % x.len()]);
-        h[i + 6] = a_bar[i + 6].mul_add(h[i + 6], b_bar[i + 6] * x[(i + 6) % x.len()]);
-        h[i + 7] = a_bar[i + 7].mul_add(h[i + 7], b_bar[i + 7] * x[(i + 7) % x.len()]);
-        i += SIMD_WIDTH;
+    let len = h.len().min(a_bar.len()).min(b_bar.len());
+    let xlen = x.len();
+    if xlen == 0 {
+        // Nothing to broadcast; leave `h` untouched instead of panicking on
+        // `% 0` for a caller that skipped the (debug-only) precondition.
+        return;
     }
 
-    for j in 0..remainder {
-        h[i + j] = a_bar[i + j].mul_add(h[i + j], b_bar[i + j] * x[(i + j) % x.len()]);
+    // TRACE-level span: this kernel runs once per recurrence step in the
+    // inference loop and would generate huge volumes at DEBUG. TRACE keeps
+    // it out of the way under the default DEBUG/INFO subscriber filter, and
+    // the workspace's `tracing/release_max_level_info` feature (root
+    // Cargo.toml) removes it from release builds at compile time. Only debug
+    // builds pay the small subscriber-filtered cost.
+    let _span = tracing::trace_span!("simd::ssm_state_update", len = len).entered();
+
+    if xlen == len {
+        // Fast, no-broadcast path: no modulo needed at all.
+        for i in 0..len {
+            h[i] = a_bar[i].mul_add(h[i], b_bar[i] * x[i]);
+        }
+        return;
+    }
+
+    for i in 0..len {
+        h[i] = a_bar[i].mul_add(h[i], b_bar[i] * x[i % xlen]);
     }
 }
 
@@ -474,6 +623,192 @@ mod tests {
         let b = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
         let result = dot_product(&a, &b);
         assert!((result - 55.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_dot_product_matches_scalar_reference() {
+        // The dispatched kernel must agree with the portable reference for
+        // every length class, including partial vector tails.
+        for len in [0usize, 1, 3, 7, 8, 15, 16, 17, 63, 64, 65, 129, 257] {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32) * 0.5 - 3.0).collect();
+            let b: Vec<f32> = (0..len).map(|i| 1.0 - (i as f32) * 0.25).collect();
+
+            let dispatched = dot_product(&a, &b);
+            let reference = dot_product_scalar(&a, &b);
+            let tol = 1e-3 * reference.abs().max(1.0);
+            assert!(
+                (dispatched - reference).abs() <= tol,
+                "len {len}: dispatched {dispatched} != reference {reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vec_add_matches_scalar_reference() {
+        for len in [0usize, 1, 5, 8, 17, 64, 65] {
+            let a: Vec<f32> = (0..len).map(|i| i as f32 * 0.3).collect();
+            let b: Vec<f32> = (0..len).map(|i| 10.0 - i as f32).collect();
+
+            let mut dispatched = vec![0.0f32; len];
+            let mut reference = vec![0.0f32; len];
+            vec_add(&a, &b, &mut dispatched);
+            vec_add_scalar(&a, &b, &mut reference);
+
+            for i in 0..len {
+                assert!(
+                    (dispatched[i] - reference[i]).abs() < 1e-5,
+                    "len {len} idx {i}: {} != {}",
+                    dispatched[i],
+                    reference[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_vec_scale_matches_scalar_reference() {
+        for len in [0usize, 1, 5, 8, 17, 64, 65] {
+            let a: Vec<f32> = (0..len).map(|i| i as f32 - 4.0).collect();
+
+            let mut dispatched = vec![0.0f32; len];
+            let mut reference = vec![0.0f32; len];
+            vec_scale(&a, 1.75, &mut dispatched);
+            vec_scale_scalar(&a, 1.75, &mut reference);
+
+            for i in 0..len {
+                assert!(
+                    (dispatched[i] - reference[i]).abs() < 1e-5,
+                    "len {len} idx {i}: {} != {}",
+                    dispatched[i],
+                    reference[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dot_view_handles_non_contiguous_views() {
+        // Regression: a strided view used to be turned into an empty slice by
+        // `unwrap_or_default()`, silently yielding 0.0.
+        let a = Array1::from_vec((0..16).map(|i| i as f32).collect::<Vec<_>>());
+        let b = Array1::from_vec((0..16).map(|i| 2.0 * i as f32).collect::<Vec<_>>());
+
+        let a_strided = a.slice(scirs2_core::ndarray::s![..;2]);
+        let b_strided = b.slice(scirs2_core::ndarray::s![..;2]);
+        assert!(
+            a_strided.as_slice().is_none(),
+            "test precondition: the view must be non-contiguous"
+        );
+
+        let expected: f32 = a_strided
+            .iter()
+            .zip(b_strided.iter())
+            .map(|(x, y)| x * y)
+            .sum();
+        let got = dot_view(a_strided, b_strided);
+
+        assert!(expected > 0.0, "test precondition: non-zero expected value");
+        assert!(
+            (got - expected).abs() < 1e-4,
+            "strided dot_view returned {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_matvec_handles_reversed_axes_matrix() {
+        // Regression companion to `test_dot_view_handles_non_contiguous_views`:
+        // `matvec` calls `dot_view` on each `m.row(i)`. For an owned matrix
+        // produced by `reversed_axes()` (a transpose that swaps shape and
+        // strides without copying data), every row view is non-contiguous.
+        // Before `dot_view` was fixed, this silently produced an all-zeros
+        // output vector instead of erroring or computing the real result.
+        let m = Array2::from_shape_vec(
+            (3, 4),
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
+        )
+        .unwrap();
+        // Transpose to a (4, 3) view sharing the same buffer: row i of
+        // `m_t` is column i of `m`, and (unlike `m`'s own rows) is strided.
+        let m_t = m.reversed_axes();
+        assert!(
+            m_t.row(0).as_slice().is_none(),
+            "test precondition: rows of a reversed-axes matrix must be non-contiguous"
+        );
+
+        let x = Array1::from_vec(vec![1.0, 1.0, 1.0]);
+        let mut y = Array1::zeros(4);
+        matvec(&m_t, &x, &mut y);
+
+        // Column sums of the original matrix: [1+5+9, 2+6+10, 3+7+11, 4+8+12]
+        let expected = [15.0, 18.0, 21.0, 24.0];
+        for i in 0..4 {
+            assert!(
+                (y[i] - expected[i]).abs() < 1e-5,
+                "y[{i}] = {}, expected {} (matvec must not silently zero non-contiguous rows)",
+                y[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssm_state_update_broadcast_scalar_x() {
+        let mut h = vec![1.0f32, 2.0, 3.0, 4.0];
+        let a_bar = vec![0.5f32, 0.5, 0.5, 0.5];
+        let b_bar = vec![1.0f32, 1.0, 1.0, 1.0];
+        let x = vec![2.0f32]; // Single-element broadcast input.
+
+        ssm_state_update(&a_bar, &mut h, &b_bar, &x);
+
+        // h'[i] = 0.5 * h[i] + 1.0 * 2.0
+        assert_eq!(
+            h,
+            vec![
+                0.5 * 1.0 + 2.0,
+                0.5 * 2.0 + 2.0,
+                0.5 * 3.0 + 2.0,
+                0.5 * 4.0 + 2.0
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ssm_state_update_no_broadcast_matches_manual() {
+        let mut h = vec![1.0f32, 2.0, 3.0];
+        let a_bar = vec![0.9f32, 0.8, 0.7];
+        let b_bar = vec![0.1f32, 0.2, 0.3];
+        let x = vec![1.0f32, 2.0, 3.0]; // Same length as h: no broadcast.
+
+        let expected: Vec<f32> = (0..3).map(|i| a_bar[i] * h[i] + b_bar[i] * x[i]).collect();
+        ssm_state_update(&a_bar, &mut h, &b_bar, &x);
+
+        for i in 0..3 {
+            assert!(
+                (h[i] - expected[i]).abs() < 1e-6,
+                "index {i}: {} != {}",
+                h[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssm_state_update_empty_x_does_not_panic() {
+        // Regression: `x[i % x.len()]` with `x.len() == 0` used to panic
+        // (integer division by zero) even in release builds.
+        let mut h = vec![1.0f32, 2.0, 3.0];
+        let h_before = h.clone();
+        let a_bar = vec![0.5f32, 0.5, 0.5];
+        let b_bar = vec![1.0f32, 1.0, 1.0];
+        let x: Vec<f32> = vec![];
+
+        ssm_state_update(&a_bar, &mut h, &b_bar, &x);
+
+        // No panic, and `h` is left untouched since there was nothing to
+        // broadcast.
+        assert_eq!(h, h_before);
     }
 
     #[test]

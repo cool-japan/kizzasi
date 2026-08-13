@@ -4,7 +4,7 @@
 //! and methods for integrating constraints into neural network training.
 
 use crate::constraint::{PenaltyFunction, ViolationComputable};
-use crate::error::LogicResult;
+use crate::error::{LogicError, LogicResult};
 
 // ============================================================================
 // Differentiable Projection
@@ -21,12 +21,21 @@ pub struct DifferentiableProjection {
 
 impl DifferentiableProjection {
     /// Create a new differentiable projection
-    pub fn new(temperature: f32) -> Self {
-        assert!(temperature > 0.0, "Temperature must be positive");
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidInput`] when `temperature` is not strictly
+    /// positive — the soft projection divides by it.
+    pub fn new(temperature: f32) -> LogicResult<Self> {
+        if temperature.is_nan() || temperature <= 0.0 {
+            return Err(LogicError::InvalidInput(format!(
+                "differentiable projection temperature must be positive, got {temperature}"
+            )));
+        }
+        Ok(Self {
             temperature,
             max_iterations: 10,
-        }
+        })
     }
 
     /// Set maximum iterations for iterative soft projection
@@ -471,7 +480,9 @@ mod tests {
 
     #[test]
     fn test_differentiable_projection() {
-        let proj = DifferentiableProjection::new(0.1);
+        let proj = DifferentiableProjection::new(0.1).expect("valid temperature");
+        assert!(DifferentiableProjection::new(0.0).is_err());
+        assert!(DifferentiableProjection::new(f32::NAN).is_err());
 
         // Soft clamp to [0, 1]
         let result = proj.soft_project_box(-0.5, 0.0, 1.0);

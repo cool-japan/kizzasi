@@ -152,7 +152,7 @@ impl PoolConfig {
 
 /// A pooled connection with metadata.
 struct PooledConnection<T> {
-    connection: Option<T>,
+    connection: T,
     created_at: Instant,
     last_used: Instant,
 }
@@ -161,7 +161,7 @@ impl<T> PooledConnection<T> {
     fn new(connection: T) -> Self {
         let now = Instant::now();
         Self {
-            connection: Some(connection),
+            connection,
             created_at: now,
             last_used: now,
         }
@@ -175,8 +175,12 @@ impl<T> PooledConnection<T> {
         self.last_used = Instant::now();
     }
 
-    fn take(mut self) -> T {
-        self.connection.take().expect("Connection already taken")
+    /// Consume the wrapper and hand back the connection.
+    ///
+    /// Infallible by construction: the connection is a plain `T`, not an
+    /// `Option<T>` that could already have been taken.
+    fn take(self) -> T {
+        self.connection
     }
 
     #[allow(dead_code)]
@@ -289,51 +293,72 @@ impl<T: Send + 'static> ConnectionPool<T> {
 
         permit.forget(); // We'll manually release later
 
-        // Try to get an idle connection
-        let mut conn = self.try_acquire_idle().await;
+        // A pooled connection that fails validation is discarded and the next
+        // candidate is tried, rather than failing the caller's acquire: a
+        // stale idle connection is the pool's problem to fix, not the
+        // caller's. The attempt count is bounded so a factory that always
+        // produces invalid connections still terminates.
+        const MAX_VALIDATION_ATTEMPTS: usize = 4;
 
-        // If no idle connection, create a new one
-        if conn.is_none() {
-            match self.factory.create().await {
-                Ok(c) => {
+        for attempt in 0..MAX_VALIDATION_ATTEMPTS {
+            // Prefer an idle connection; fall back to creating a fresh one.
+            let candidate = match self.try_acquire_idle().await {
+                Some(conn) => conn,
+                None => match self.factory.create().await {
+                    Ok(conn) => {
+                        let mut state = self.state.lock().await;
+                        state.stats.total_created += 1;
+                        conn
+                    }
+                    Err(e) => {
+                        self.semaphore.add_permits(1); // Return permit
+                        let mut state = self.state.lock().await;
+                        state.stats.total_acquire_failures += 1;
+                        return Err(KizzasiError::invalid_state(format!(
+                            "Failed to create connection: {}",
+                            e
+                        )));
+                    }
+                },
+            };
+
+            // Validate if configured
+            if self.config.validate_on_acquire && !self.factory.validate(&candidate).await {
+                self.factory.destroy(candidate).await;
+                {
                     let mut state = self.state.lock().await;
-                    state.stats.total_created += 1;
-                    conn = Some(c);
+                    state.stats.total_destroyed += 1;
                 }
-                Err(e) => {
-                    self.semaphore.add_permits(1); // Return permit
+
+                if attempt + 1 == MAX_VALIDATION_ATTEMPTS {
+                    self.semaphore.add_permits(1);
                     let mut state = self.state.lock().await;
                     state.stats.total_acquire_failures += 1;
                     return Err(KizzasiError::invalid_state(format!(
-                        "Failed to create connection: {}",
-                        e
+                        "Connection validation failed after {MAX_VALIDATION_ATTEMPTS} attempts"
                     )));
                 }
+                continue;
             }
+
+            // Update stats
+            {
+                let mut state = self.state.lock().await;
+                state.stats.total_acquires += 1;
+                state.stats.active_connections += 1;
+            }
+
+            tracing::debug!("Acquired connection in {:?}", acquire_start.elapsed());
+            return Ok(candidate);
         }
 
-        let conn = conn.expect("invariant: conn is Some after create or early return on error");
-
-        // Validate if configured
-        if self.config.validate_on_acquire && !self.factory.validate(&conn).await {
-            self.factory.destroy(conn).await;
-            self.semaphore.add_permits(1);
-            let mut state = self.state.lock().await;
-            state.stats.total_destroyed += 1;
-            state.stats.total_acquire_failures += 1;
-            return Err(KizzasiError::invalid_state("Connection validation failed"));
-        }
-
-        // Update stats
-        {
-            let mut state = self.state.lock().await;
-            state.stats.total_acquires += 1;
-            state.stats.active_connections += 1;
-        }
-
-        tracing::debug!("Acquired connection in {:?}", acquire_start.elapsed());
-
-        Ok(conn)
+        // Unreachable in practice: the loop either returns a connection or
+        // returns an error on its final attempt. Expressed as an error rather
+        // than a panic so no code path can abort the caller's process.
+        self.semaphore.add_permits(1);
+        Err(KizzasiError::invalid_state(
+            "connection acquisition exhausted all validation attempts",
+        ))
     }
 
     /// Release a connection back to the pool.
@@ -442,11 +467,21 @@ impl<T: Send + 'static> ConnectionPool<T> {
 
                 drop(state);
                 self.factory.destroy(conn).await;
-                self.semaphore.add_permits(1);
+                // No `add_permits` here: an idle connection has *already*
+                // returned its permit in `release`, so adding another would
+                // mint a permit from nothing and let the pool hand out more
+                // than `max_connections` concurrent connections.
                 state = self.state.lock().await;
             } else {
                 break;
             }
+        }
+
+        drop(state);
+
+        // Shrinking may have taken the pool below its documented floor.
+        if let Err(e) = self.ensure_min_connections().await {
+            tracing::warn!("failed to restore min_connections after shrink: {}", e);
         }
     }
 }
@@ -573,12 +608,66 @@ mod tests {
         let pool = ConnectionPool::new(factory, config).await.unwrap();
 
         let conn = pool.acquire().await.unwrap();
+        let stale_id = conn.id;
         *conn.valid.lock().await = false; // Invalidate
         pool.release(conn).await;
 
-        // Next acquire should fail validation and create new connection
-        let result = pool.acquire().await;
-        assert!(result.is_err()); // Validation failed
+        // A stale pooled connection is the pool's problem: it must be
+        // discarded and replaced, not surfaced to the caller as an error.
+        // (This assertion used to be `result.is_err()`, with a comment saying
+        // the opposite of what the code did.)
+        let replacement = pool
+            .acquire()
+            .await
+            .expect("a stale idle connection must be replaced, not reported as a failure");
+        assert_ne!(replacement.id, stale_id, "the stale connection was reused");
+        assert!(*replacement.valid.lock().await);
+
+        pool.release(replacement).await;
+    }
+
+    #[tokio::test]
+    async fn test_shrink_does_not_mint_permits() {
+        // Regression: `shrink` added a semaphore permit per destroyed idle
+        // connection, but idle connections had already returned theirs in
+        // `release`. The pool could then hand out max_connections + N.
+        let factory = Arc::new(TestFactory {
+            counter: Arc::new(AtomicUsize::new(0)),
+            create_delay: Duration::from_millis(1),
+        });
+
+        let config = PoolConfig::default()
+            .with_min_connections(1)
+            .with_max_connections(3)
+            .with_acquire_timeout(Duration::from_millis(50));
+
+        let pool = Arc::new(ConnectionPool::new(factory, config).await.unwrap());
+
+        let mut conns = Vec::new();
+        for _ in 0..3 {
+            conns.push(pool.acquire().await.unwrap());
+        }
+        for conn in conns.drain(..) {
+            pool.release(conn).await;
+        }
+
+        pool.shrink().await;
+
+        // Exactly max_connections may be held at once, no more.
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(pool.acquire().await.expect("within max_connections"));
+        }
+
+        let extra = pool.acquire().await;
+        assert!(
+            extra.is_err(),
+            "shrink must not raise the effective connection limit"
+        );
+
+        for conn in held {
+            pool.release(conn).await;
+        }
     }
 
     #[tokio::test]

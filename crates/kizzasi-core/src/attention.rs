@@ -6,7 +6,7 @@
 use crate::error::{CoreError, CoreResult};
 use crate::numerics::{safe_exp, softmax_stable};
 use crate::simd;
-use scirs2_core::ndarray::{Array1, Array2, Array3, Axis};
+use scirs2_core::ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
 use scirs2_core::random::thread_rng;
 
 /// Multi-head SSM Attention configuration
@@ -145,7 +145,7 @@ impl MultiHeadSSMAttention {
         let q = self.project_qkv(&self.w_q, &self.b_q, query);
 
         // Reshape to multi-head: (hidden_dim,) -> (num_heads, head_dim)
-        let q_heads = self.reshape_to_heads(&q)?;
+        let q_heads = self.reshape_to_heads(q.view())?;
 
         // Compute attention scores for each head
         let mut attn_output = Array1::zeros(self.config.hidden_dim);
@@ -215,28 +215,21 @@ impl MultiHeadSSMAttention {
         for b in 0..batch_size {
             let input_batch = input.index_axis(Axis(0), b);
 
-            // Project Q, K, V for all positions
-            let mut q_all = Array2::zeros((seq_len, self.config.hidden_dim));
-            let mut k_all = Array2::zeros((seq_len, self.config.hidden_dim));
-            let mut v_all = Array2::zeros((seq_len, self.config.hidden_dim));
-
-            for t in 0..seq_len {
-                let x_t = input_batch.index_axis(Axis(0), t).to_owned();
-                q_all
-                    .index_axis_mut(Axis(0), t)
-                    .assign(&self.project_qkv(&self.w_q, &self.b_q, &x_t));
-                k_all
-                    .index_axis_mut(Axis(0), t)
-                    .assign(&self.project_qkv(&self.w_k, &self.b_k, &x_t));
-                v_all
-                    .index_axis_mut(Axis(0), t)
-                    .assign(&self.project_qkv(&self.w_v, &self.b_v, &x_t));
-            }
+            // Project Q, K, V for ALL positions via a single GEMM each --
+            // (seq_len, hidden_dim) x (hidden_dim, hidden_dim) -- instead of
+            // `seq_len` independent matrix-vector products. The previous
+            // per-timestep loop also copied every input row into a fresh
+            // owned `Array1` on each iteration purely to satisfy
+            // `project_qkv`'s by-reference signature; `project_qkv_batch`
+            // takes the whole batch view directly, so that copy is gone too.
+            let q_all = self.project_qkv_batch(&self.w_q, &self.b_q, input_batch);
+            let k_all = self.project_qkv_batch(&self.w_k, &self.b_k, input_batch);
+            let v_all = self.project_qkv_batch(&self.w_v, &self.b_v, input_batch);
 
             // Compute attention for each position
             for t in 0..seq_len {
-                let q_t = q_all.index_axis(Axis(0), t).to_owned();
-                let q_heads = self.reshape_to_heads(&q_t)?;
+                // No `.to_owned()` needed: `reshape_to_heads` takes a view.
+                let q_heads = self.reshape_to_heads(q_all.index_axis(Axis(0), t))?;
 
                 let mut attn_output = Array1::zeros(self.config.hidden_dim);
                 let scale = 1.0 / (head_dim as f32).sqrt();
@@ -312,9 +305,30 @@ impl MultiHeadSSMAttention {
         }
     }
 
+    /// Project a full `(seq_len, hidden_dim)` batch item through a QKV
+    /// weight matrix in a single GEMM (`input_batch.dot(weight)`, which
+    /// `ndarray` dispatches to `matrixmultiply` with proper blocking)
+    /// instead of `seq_len` independent matrix-vector products. Bias, if
+    /// present, is added to every row via an in-place per-row `AddAssign`
+    /// rather than an extra whole-matrix broadcast allocation.
+    fn project_qkv_batch(
+        &self,
+        weight: &Array2<f32>,
+        bias: &Option<Array1<f32>>,
+        input_batch: ArrayView2<f32>,
+    ) -> Array2<f32> {
+        let mut projected = input_batch.dot(weight);
+        if let Some(ref b) = bias {
+            for mut row in projected.axis_iter_mut(Axis(0)) {
+                row += b;
+            }
+        }
+        projected
+    }
+
     /// Reshape flat vector to multi-head format
     /// Input: (hidden_dim,) -> Output: (num_heads, head_dim)
-    fn reshape_to_heads(&self, x: &Array1<f32>) -> CoreResult<Array2<f32>> {
+    fn reshape_to_heads(&self, x: ArrayView1<f32>) -> CoreResult<Array2<f32>> {
         if x.len() != self.config.hidden_dim {
             return Err(CoreError::DimensionMismatch {
                 expected: self.config.hidden_dim,
@@ -493,5 +507,106 @@ mod tests {
 
         let output = attn.forward_batch(&input, None).unwrap();
         assert_eq!(output.dim(), (batch_size, seq_len, 64));
+    }
+
+    #[test]
+    fn test_forward_batch_matches_naive_per_timestep_reference() {
+        // Regression: `forward_batch` used to project Q/K/V one timestep at
+        // a time via `seq_len` independent matrix-vector products, each
+        // requiring an owned `.to_owned()` copy of the input row. It now
+        // issues one GEMM per projection instead. Build a fully independent,
+        // deliberately naive per-row reference (mirroring the
+        // pre-optimization algorithm exactly, via a completely separate
+        // code path) and check the optimized `forward_batch` is
+        // numerically identical.
+        let config = MultiHeadSSMConfig::new(24, 3, 6).unwrap();
+        let attn = MultiHeadSSMAttention::new(config, true).unwrap();
+
+        let seq_len = 5;
+        let hidden_dim = 24;
+        let num_heads = attn.config().num_heads;
+        let head_dim = attn.config().head_dim;
+        let causal = attn.config().causal;
+
+        let input = Array3::from_shape_fn((1, seq_len, hidden_dim), |(_, t, d)| {
+            ((t * 5 + d * 2) % 13) as f32 * 0.03 - 0.15
+        });
+
+        let batch_out = attn.forward_batch(&input, None).unwrap();
+
+        // Naive per-row reference for the Q/K/V projections.
+        let input_batch = input.index_axis(Axis(0), 0);
+        let mut q_ref = Array2::<f32>::zeros((seq_len, hidden_dim));
+        let mut k_ref = Array2::<f32>::zeros((seq_len, hidden_dim));
+        let mut v_ref = Array2::<f32>::zeros((seq_len, hidden_dim));
+        for t in 0..seq_len {
+            let x_t = input_batch.index_axis(Axis(0), t).to_owned();
+            q_ref
+                .row_mut(t)
+                .assign(&(x_t.dot(&attn.w_q) + attn.b_q.as_ref().unwrap()));
+            k_ref
+                .row_mut(t)
+                .assign(&(x_t.dot(&attn.w_k) + attn.b_k.as_ref().unwrap()));
+            v_ref
+                .row_mut(t)
+                .assign(&(x_t.dot(&attn.w_v) + attn.b_v.as_ref().unwrap()));
+        }
+
+        // Naive per-timestep, per-head attention reference (mirrors the
+        // pre-optimization `forward_batch` body exactly).
+        let mut ref_out = Array3::<f32>::zeros((1, seq_len, hidden_dim));
+        for t in 0..seq_len {
+            let q_t = q_ref.row(t).to_owned();
+            let mut q_heads = Array2::<f32>::zeros((num_heads, head_dim));
+            for h in 0..num_heads {
+                let start = h * head_dim;
+                let end = start + head_dim;
+                q_heads.row_mut(h).assign(&q_t.slice(s![start..end]));
+            }
+
+            let mut attn_output = Array1::<f32>::zeros(hidden_dim);
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let attend_len = if causal { t + 1 } else { seq_len };
+
+            for h in 0..num_heads {
+                let q_h = q_heads.row(h);
+                let mut scores = Array1::<f32>::zeros(attend_len);
+                for i in 0..attend_len {
+                    let k_i = k_ref.slice(s![i, h * head_dim..(h + 1) * head_dim]);
+                    scores[i] = q_h.dot(&k_i) * scale;
+                }
+                let attn_weights = softmax_stable(&scores);
+
+                let mut context = Array1::<f32>::zeros(head_dim);
+                for i in 0..attend_len {
+                    let v_i = v_ref.slice(s![i, h * head_dim..(h + 1) * head_dim]);
+                    let weight = attn_weights[i];
+                    for j in 0..head_dim {
+                        context[j] += weight * v_i[j];
+                    }
+                }
+
+                let start = h * head_dim;
+                let end = start + head_dim;
+                attn_output.slice_mut(s![start..end]).assign(&context);
+            }
+
+            let out_t = attn_output.dot(&attn.w_o) + attn.b_o.as_ref().unwrap();
+            ref_out
+                .index_axis_mut(Axis(0), 0)
+                .index_axis_mut(Axis(0), t)
+                .assign(&out_t);
+        }
+
+        for t in 0..seq_len {
+            for d in 0..hidden_dim {
+                let a = batch_out[[0, t, d]];
+                let b = ref_out[[0, t, d]];
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "mismatch at t={t} d={d}: batch(GEMM)={a} naive-reference={b}"
+                );
+            }
+        }
     }
 }

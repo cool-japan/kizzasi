@@ -87,6 +87,19 @@
 //! # }
 //! ```
 //!
+//! ## Model architectures
+//!
+//! `KizzasiConfig::model_type` selects the architecture that actually runs —
+//! `ModelType::Mamba2` uses `kizzasi-core`'s `SelectiveSSM`, while `Mamba`,
+//! `S4` and `Rwkv` dispatch to the corresponding `kizzasi-model`
+//! implementations. See the [`backend`] module for the full mapping, the
+//! per-backend capability differences (`fork` and full-state checkpoints are
+//! `Mamba2`-only) and the architectures `ModelType` cannot name.
+//!
+//! This crate depends on `kizzasi-core` and `kizzasi-model` unconditionally.
+//! `kizzasi-tokenizer` and `kizzasi-inference` are **not** re-exported; add
+//! them as separate dependencies if you need them.
+//!
 //! ## Features
 //!
 //! - `std` (default): Standard library support
@@ -110,7 +123,8 @@
 //! ## Thread Safety
 //!
 //! `Kizzasi` predictors are `Send` but not `Sync`. For concurrent predictions:
-//! - Use `fork()` to create independent predictors per thread
+//! - Use `fork()` to create independent predictors that share the same trained
+//!   weights (available for the `ModelType::Mamba2` engine; see `Kizzasi::fork`)
 //! - Or wrap in `Arc<Mutex<Kizzasi>>` for shared access
 //! - Async APIs are available with the `async` feature
 //!
@@ -162,6 +176,7 @@
 //! - `metrics_monitoring` - Comprehensive metrics and monitoring
 
 pub mod autotuning;
+pub mod backend;
 mod checkpoint;
 pub mod ensemble;
 mod error;
@@ -169,6 +184,7 @@ mod lazy;
 pub mod optimization;
 pub mod plugin;
 mod predictor;
+pub mod ssm_backend;
 pub mod telemetry;
 pub mod versioning;
 
@@ -189,6 +205,7 @@ pub mod prelude;
 pub use autotuning::{
     AdaptiveTuner, AutoTuner, TuningConfig, TuningRecommendation, WorkloadProfile,
 };
+pub use backend::Backend;
 pub use checkpoint::{CheckpointMetadata, FullStateCheckpoint, PredictorCheckpoint};
 pub use ensemble::{EnsemblePredictor, EnsembleStats, ModelStats, VotingStrategy};
 pub use error::{ErrorCategory, KizzasiError, KizzasiResult};
@@ -196,6 +213,9 @@ pub use lazy::LazyKizzasi;
 pub use optimization::{CacheStats, OptimizationConfig, OptimizationStats, OptimizedPredictor};
 pub use plugin::{LoggingPlugin, Plugin, PluginContext, PluginManager, PluginPhase, StatsPlugin};
 pub use predictor::{Kizzasi, KizzasiBuilder, SignalInput};
+pub use ssm_backend::{
+    cpu_ssm_backend, select_ssm_backend, webgpu_compiled_in, CpuSsmBackend, SsmBackend,
+};
 pub use telemetry::{
     Instrumented, MetricEvent, MetricValue, MetricsCollector, MetricsConfig, MetricsSnapshot,
 };

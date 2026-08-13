@@ -47,7 +47,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Recording format
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -232,20 +232,35 @@ impl StreamRecorder {
         samples: &[f32],
         timestamp: Option<f64>,
     ) -> IoResult<()> {
+        // The binary frame layout has no per-frame flag marking timestamp
+        // presence: `write_frame` writes 8 timestamp bytes iff
+        // `frame.timestamp.is_some()`, and the reader decides whether to
+        // consume those bytes purely from the recording header's
+        // `record_timestamps` flag. So `frame.timestamp` MUST agree with
+        // `self.config.record_timestamps` on every frame, regardless of
+        // what the caller passed in, or the two ends desync: a caller
+        // passing `Some(ts)` while `record_timestamps == false` used to
+        // write 8 extra bytes per frame that the reader would then
+        // misinterpret as the next frame's sample count and length.
+        if timestamp.is_some() && !self.config.record_timestamps {
+            warn!(
+                "record_samples: explicit timestamp ignored because record_timestamps is false \
+                 for this recording"
+            );
+        }
+
         let frame = RecordedFrame {
             samples: samples.to_vec(),
-            timestamp: timestamp.or_else(|| {
-                if self.config.record_timestamps {
-                    Some(
-                        self.start_time
-                            .elapsed()
-                            .unwrap_or(Duration::ZERO)
-                            .as_secs_f64(),
-                    )
-                } else {
-                    None
-                }
-            }),
+            timestamp: if self.config.record_timestamps {
+                Some(timestamp.unwrap_or_else(|| {
+                    self.start_time
+                        .elapsed()
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs_f64()
+                }))
+            } else {
+                None
+            },
             frame_number: self.frame_count,
         };
 
@@ -1072,6 +1087,198 @@ mod tests {
         assert_eq!(frame2.frame_number, 1);
 
         assert!(player.next_frame().await.unwrap().is_none());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    // === Regression tests: binary format desync when an explicit timestamp
+    // is passed with record_timestamps = false (high) ===
+    //
+    // The binary frame layout carries no per-frame "has timestamp" flag;
+    // the reader decides whether to consume 8 timestamp bytes purely from
+    // the header's `record_timestamps` config. `record_samples` must
+    // therefore never write a timestamp for a recording configured with
+    // `record_timestamps = false`, even when the caller passes one
+    // explicitly -- otherwise the extra 8 bytes get interpreted as the next
+    // frame's sample count, corrupting every subsequent frame.
+
+    #[tokio::test]
+    async fn test_explicit_timestamp_ignored_when_record_timestamps_false() {
+        let temp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(4);
+        let path = temp_dir.join(format!(
+            "kizzasi_ts_desync_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+
+        let config = RecorderConfig {
+            path: path.to_string_lossy().to_string(),
+            format: RecorderFormat::Binary,
+            sample_rate: 44100.0,
+            channels: 1,
+            buffer_size: 1024,
+            record_timestamps: false,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mut recorder = StreamRecorder::new(config).await.unwrap();
+        // Explicit timestamps despite record_timestamps = false: before the
+        // fix, write_frame would still emit 8 timestamp bytes per frame
+        // that the reader never expected to skip.
+        recorder
+            .record_samples(&[1.0, 2.0, 3.0], Some(0.111))
+            .await
+            .unwrap();
+        recorder
+            .record_samples(&[4.0, 5.0, 6.0], Some(0.222))
+            .await
+            .unwrap();
+        recorder
+            .record_samples(&[7.0, 8.0, 9.0], Some(0.333))
+            .await
+            .unwrap();
+        recorder.finalize().await.unwrap();
+
+        let mut player = StreamPlayer::new(&path).await.unwrap();
+
+        let frame1 = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame1.samples, vec![1.0, 2.0, 3.0]);
+        assert_eq!(frame1.timestamp, None);
+
+        let frame2 = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(
+            frame2.samples,
+            vec![4.0, 5.0, 6.0],
+            "frame 2 must not be corrupted by misread timestamp bytes from frame 1"
+        );
+        assert_eq!(frame2.timestamp, None);
+
+        let frame3 = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame3.samples, vec![7.0, 8.0, 9.0]);
+        assert_eq!(frame3.timestamp, None);
+
+        assert!(player.next_frame().await.unwrap().is_none());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_explicit_timestamp_preserved_when_record_timestamps_true() {
+        let temp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(5);
+        let path = temp_dir.join(format!(
+            "kizzasi_ts_explicit_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+
+        let config = RecorderConfig {
+            path: path.to_string_lossy().to_string(),
+            format: RecorderFormat::Binary,
+            sample_rate: 44100.0,
+            channels: 1,
+            buffer_size: 1024,
+            record_timestamps: true,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mut recorder = StreamRecorder::new(config).await.unwrap();
+        recorder
+            .record_samples(&[1.0, 2.0], Some(12.5))
+            .await
+            .unwrap();
+        recorder.finalize().await.unwrap();
+
+        let mut player = StreamPlayer::new(&path).await.unwrap();
+        let frame = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame.samples, vec![1.0, 2.0]);
+        assert_eq!(frame.timestamp, Some(12.5));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_default_timestamp_computed_when_record_timestamps_true_and_none_passed() {
+        let temp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(6);
+        let path = temp_dir.join(format!(
+            "kizzasi_ts_default_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+
+        let config = RecorderConfig {
+            path: path.to_string_lossy().to_string(),
+            format: RecorderFormat::Binary,
+            sample_rate: 44100.0,
+            channels: 1,
+            buffer_size: 1024,
+            record_timestamps: true,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mut recorder = StreamRecorder::new(config).await.unwrap();
+        recorder.record_samples(&[1.0], None).await.unwrap();
+        recorder.finalize().await.unwrap();
+
+        let mut player = StreamPlayer::new(&path).await.unwrap();
+        let frame = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame.samples, vec![1.0]);
+        assert!(
+            frame.timestamp.is_some(),
+            "record_timestamps = true must always yield a timestamp, even without an explicit one"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_seek_stays_in_sync_with_explicit_timestamps_and_no_record_timestamps() {
+        let temp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(7);
+        let path = temp_dir.join(format!("kizzasi_ts_seek_{}_{}.bin", std::process::id(), id));
+
+        let config = RecorderConfig {
+            path: path.to_string_lossy().to_string(),
+            format: RecorderFormat::Binary,
+            sample_rate: 44100.0,
+            channels: 1,
+            buffer_size: 1024,
+            record_timestamps: false,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let mut recorder = StreamRecorder::new(config).await.unwrap();
+        for i in 0usize..5 {
+            let v = i as f32;
+            // Every call passes an explicit timestamp even though the
+            // recording is configured with record_timestamps = false.
+            recorder
+                .record_samples(&[v, v + 1.0], Some(v as f64))
+                .await
+                .unwrap();
+        }
+        recorder.finalize().await.unwrap();
+
+        let mut player = StreamPlayer::new(&path).await.unwrap();
+        player.seek_to_frame(3).await.unwrap();
+        let frame = player.next_frame().await.unwrap().unwrap();
+        assert_eq!(frame.frame_number, 3);
+        assert_eq!(frame.samples, vec![3.0, 4.0]);
+        assert_eq!(frame.timestamp, None);
 
         let _ = tokio::fs::remove_file(&path).await;
     }

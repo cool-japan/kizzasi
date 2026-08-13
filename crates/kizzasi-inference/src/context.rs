@@ -129,15 +129,60 @@ impl InferenceContext {
         self.step_count = 0;
     }
 
-    /// Add an input to the history
+    /// Add an owned input to the history
+    ///
+    /// When `store_history` is disabled the array is dropped immediately and only
+    /// the step counter advances. Callers holding a borrow should use
+    /// [`InferenceContext::push_ref`] so that no copy is made on the default
+    /// configuration (`store_history == false`).
     pub fn push(&mut self, input: Array1<f32>) {
         if self.config.store_history {
-            if self.history.len() >= self.config.max_context {
-                self.history.pop_front();
-            }
+            self.evict_oldest_if_full();
             self.history.push_back(input);
         }
         self.step_count += 1;
+    }
+
+    /// Add a borrowed input to the history
+    ///
+    /// The input is cloned only when `store_history` is enabled, so on the default
+    /// configuration this costs a single counter increment instead of a full copy
+    /// of the input vector. When a [`TensorPool`] is attached (see
+    /// [`InferenceContext::with_pool`]/[`InferenceContext::enable_pooling`]),
+    /// the clone's backing storage is served from the pool instead of a
+    /// fresh allocation whenever a same-sized buffer is available — the pool
+    /// is kept supplied by `InferenceContext::evict_oldest_if_full`
+    /// returning evicted entries to it.
+    pub fn push_ref(&mut self, input: &Array1<f32>) {
+        if self.config.store_history {
+            self.evict_oldest_if_full();
+            let stored = match &self.pool {
+                Some(pool) => match pool.acquire_array1_f32(input.len()) {
+                    Ok(mut buf) => {
+                        buf.assign(input);
+                        buf
+                    }
+                    Err(_) => input.clone(),
+                },
+                None => input.clone(),
+            };
+            self.history.push_back(stored);
+        }
+        self.step_count += 1;
+    }
+
+    /// Evict the oldest history entry if the buffer is at `max_context`
+    /// capacity, returning its backing storage to the pool when one is
+    /// attached.
+    fn evict_oldest_if_full(&mut self) {
+        if self.history.len() < self.config.max_context {
+            return;
+        }
+        if let Some(old) = self.history.pop_front() {
+            if let Some(pool) = &self.pool {
+                let _ = pool.release_array1_f32(old);
+            }
+        }
     }
 
     /// Get the current step count
@@ -163,6 +208,23 @@ impl InferenceContext {
     /// Get mutable hidden states
     pub fn states_mut(&mut self) -> &mut [HiddenState] {
         &mut self.states
+    }
+
+    /// Move the hidden states out of the context, leaving it empty
+    ///
+    /// This avoids the deep copy that `states().to_vec()` performs when the states
+    /// are handed to a model. The caller **must** put a state vector back with
+    /// [`InferenceContext::restore_states`] before the context is used again,
+    /// including on error paths.
+    pub fn take_states(&mut self) -> Vec<HiddenState> {
+        std::mem::take(&mut self.states)
+    }
+
+    /// Put hidden states back into the context
+    ///
+    /// Counterpart of [`InferenceContext::take_states`].
+    pub fn restore_states(&mut self, states: Vec<HiddenState>) {
+        self.states = states;
     }
 
     /// Update hidden state for a layer
@@ -193,9 +255,16 @@ impl InferenceContext {
     }
 
     /// Trim history to specified length (for memory efficiency)
+    ///
+    /// Entries evicted this way are returned to the attached [`TensorPool`],
+    /// same as capacity-triggered eviction in [`InferenceContext::push_ref`].
     pub fn trim_history(&mut self, max_len: usize) {
         while self.history.len() > max_len {
-            self.history.pop_front();
+            if let Some(old) = self.history.pop_front() {
+                if let Some(pool) = &self.pool {
+                    let _ = pool.release_array1_f32(old);
+                }
+            }
         }
     }
 }
@@ -224,6 +293,53 @@ mod tests {
 
         assert_eq!(ctx.step_count(), 10);
         assert_eq!(ctx.history_len(), 5); // Max context
+    }
+
+    /// Regression: `InferenceContext::pool` was written and read back by the
+    /// getter, but no allocation ever went through it — a configured
+    /// `TensorPool` had zero measurable effect. History churn under
+    /// `store_history` (the per-step clone `push_ref` performs) must now
+    /// actually reuse buffers from the pool once eviction starts, and
+    /// correctness (the stored values) must be unaffected by the reuse.
+    #[test]
+    fn test_pooled_history_reuses_buffers() {
+        let config = ContextConfig::new().store_history(true).max_context(2);
+        let pool = crate::pool::TensorPool::new();
+        let mut ctx = InferenceContext::with_pool(config, pool.clone());
+
+        for i in 0..5 {
+            ctx.push_ref(&Array1::from_vec(vec![i as f32, i as f32]));
+        }
+
+        let stats = pool.stats().expect("stats must be readable");
+        assert!(
+            stats.total_reuses > 0,
+            "history churn past max_context should reuse buffers from the pool, got stats: {:?}",
+            stats
+        );
+        assert_eq!(ctx.history_len(), 2);
+
+        // Correctness survives buffer reuse: the two most recent pushes are
+        // still exactly [3,3] then [4,4].
+        let recent = ctx.recent_history(2);
+        assert_eq!(recent[0].as_slice().unwrap(), &[4.0, 4.0]);
+        assert_eq!(recent[1].as_slice().unwrap(), &[3.0, 3.0]);
+    }
+
+    /// Without a pool attached (the default), `push_ref` must behave exactly
+    /// as before: a plain clone, no pool interaction.
+    #[test]
+    fn test_push_ref_without_pool_is_unaffected() {
+        let config = ContextConfig::new().store_history(true).max_context(2);
+        let mut ctx = InferenceContext::new(config);
+
+        for i in 0..3 {
+            ctx.push_ref(&Array1::from_vec(vec![i as f32]));
+        }
+
+        assert_eq!(ctx.history_len(), 2);
+        let recent = ctx.recent_history(1);
+        assert_eq!(recent[0].as_slice().unwrap(), &[2.0]);
     }
 
     #[test]

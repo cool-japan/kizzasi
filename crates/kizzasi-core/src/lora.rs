@@ -9,6 +9,10 @@
 //! - **Merging**: Merge LoRA weights into base model weights
 //! - **Multi-Adapter**: Support for multiple adapters simultaneously
 //! - **Selective Application**: Apply LoRA to specific layers/modules
+//! - **Dropout**: Inverted dropout on the LoRA input path, active only in
+//!   training mode (see [`LoRALayer::train`]); layers start in evaluation
+//!   mode, where `dropout` is always a no-op regardless of its configured
+//!   value
 //!
 //! ## References
 //!
@@ -29,7 +33,12 @@ pub struct LoRAConfig {
     pub rank: usize,
     /// Scaling factor (alpha / rank)
     pub alpha: f32,
-    /// Dropout rate for LoRA layers
+    /// Dropout probability applied to the LoRA input path, in `[0, 1)`.
+    ///
+    /// Inert unless the owning [`LoRALayer`] is in training mode (see
+    /// [`LoRALayer::train`]): freshly constructed layers start in
+    /// evaluation mode, where `forward` ignores this value entirely and
+    /// stays fully deterministic regardless of what it is set to.
     pub dropout: f32,
     /// Target modules to apply LoRA
     pub target_modules: Vec<String>,
@@ -71,7 +80,9 @@ impl LoRAConfig {
         self
     }
 
-    /// Set dropout
+    /// Set the dropout probability (see the [`Self::dropout`] field docs for
+    /// when it actually takes effect: only on a [`LoRALayer`] that has been
+    /// switched into training mode via [`LoRALayer::train`]).
     pub fn with_dropout(mut self, dropout: f32) -> Self {
         self.dropout = dropout;
         self
@@ -109,6 +120,30 @@ impl LoRAConfig {
 ///
 /// Implements W' = W + (B @ A) * scaling
 /// where A is (rank, in_features) and B is (out_features, rank)
+///
+/// # Dropout and training mode
+///
+/// When `config.dropout > 0.0` *and* the layer is in training mode (see
+/// [`Self::train`]), `forward` applies inverted dropout to the LoRA input
+/// path before it reaches `A`: `y = W x + scaling * B(A(dropout(x)))`.
+/// Layers start in evaluation mode (see [`Self::eval`]), where `forward` is
+/// `y = W x + scaling * B(A x)` — fully deterministic, ignoring `dropout`
+/// regardless of its configured value. Note that a freshly constructed
+/// layer's `B` matrix is all zeros (see [`Self::new`]), so the LoRA
+/// contribution — and therefore any dropout applied to its input — has no
+/// observable effect on `forward`'s output until `B` has been trained or
+/// set to something else via [`Self::set_lora_b`].
+///
+/// [`Self::merge`] (and [`Self::get_effective_weight`]) fold the *weights*
+/// `B @ A * scaling` into the base matrix; this is a static transform of
+/// the trained parameters, not a forward pass, so it is never subject to
+/// dropout regardless of training mode. Once merged, `forward` takes the
+/// `is_merged` branch and applies no LoRA correction (and therefore no
+/// dropout) at all -- calling `train()` and then `merge_all()`/`forward()`
+/// deterministically reproduces the merged weight's output, which is
+/// correct (dropout is a stochastic property of the *unmerged* forward
+/// pass, not of the weights themselves) but easy to mistake for dropout
+/// silently not working.
 #[derive(Debug, Clone)]
 pub struct LoRALayer {
     /// Configuration
@@ -121,6 +156,9 @@ pub struct LoRALayer {
     lora_b: Array2<f32>,
     /// Whether weights are merged
     is_merged: bool,
+    /// Training mode (see [`Self::train`] / [`Self::eval`]). Starts `false`:
+    /// a freshly constructed layer is in evaluation mode.
+    training: bool,
 }
 
 impl LoRALayer {
@@ -147,6 +185,56 @@ impl LoRALayer {
             lora_a,
             lora_b,
             is_merged: false,
+            training: false,
+        })
+    }
+
+    /// Switch into training mode: `forward` will stochastically apply
+    /// dropout to the LoRA input path wherever `config.dropout > 0.0`. New
+    /// layers start in evaluation mode (see [`Self::eval`]).
+    pub fn train(&mut self) {
+        self.training = true;
+    }
+
+    /// Switch into evaluation mode: `forward` becomes fully deterministic
+    /// and ignores `config.dropout` entirely. This is the default for a
+    /// freshly constructed layer.
+    ///
+    /// (This is the standard ML train/eval mode toggle -- mirroring e.g.
+    /// PyTorch's `Module.eval()` -- not the `eval`/code-execution builtin
+    /// found in dynamic languages; it flips one `bool` field and runs no
+    /// code of any kind.)
+    pub fn eval(&mut self) {
+        self.training = false;
+    }
+
+    /// Whether the layer is currently in training mode.
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
+    /// Apply inverted dropout to `x` for the LoRA input path: each element
+    /// is independently zeroed with probability `config.dropout`, and
+    /// surviving elements are rescaled by `1 / (1 - config.dropout)` so the
+    /// expected magnitude of `B(A(x))` is unchanged between training and
+    /// evaluation. Only called from `forward` while `self.training` is true
+    /// and `config.dropout > 0.0`.
+    fn apply_dropout(&self, x: &Array1<f32>) -> Array1<f32> {
+        use scirs2_core::random::thread_rng;
+
+        let keep_prob = 1.0 - self.config.dropout as f64;
+        // `LoRAConfig::validate` rejects `dropout >= 1.0` and this is the
+        // only constructor path (`new` calls `validate` up front), so
+        // `keep_prob` is always in `(0.0, 1.0]` here and `scale` is always
+        // finite.
+        let scale = (1.0 / keep_prob) as f32;
+        let mut rng = thread_rng();
+        x.mapv(|v| {
+            if rng.random_bool(keep_prob) {
+                v * scale
+            } else {
+                0.0
+            }
         })
     }
 
@@ -164,8 +252,16 @@ impl LoRALayer {
 
         // If not merged, add LoRA contribution: (B @ A) @ x * scaling
         if !self.is_merged {
-            // A @ x -> intermediate (rank,)
-            let intermediate = self.lora_a.dot(x);
+            // A @ dropout(x) -> intermediate (rank,). Dropout on the LoRA
+            // input path is only stochastic in training mode; evaluation
+            // mode (the default -- see `Self::eval`) ignores it entirely so
+            // `forward` stays fully deterministic regardless of the
+            // configured dropout probability.
+            let intermediate = if self.training && self.config.dropout > 0.0 {
+                self.lora_a.dot(&self.apply_dropout(x))
+            } else {
+                self.lora_a.dot(x)
+            };
 
             // B @ intermediate -> delta (out_features,)
             let delta = self.lora_b.dot(&intermediate);
@@ -272,21 +368,63 @@ pub struct LoRAAdapter {
     pub config: LoRAConfig,
     /// LoRA layers by module name
     pub layers: HashMap<String, LoRALayer>,
+    /// Training mode applied to every layer added via [`Self::add_layer`];
+    /// kept in sync with each layer's own flag by [`Self::train`] /
+    /// [`Self::eval`]. See [`LoRALayer::train`]. Starts `false`.
+    training: bool,
 }
 
 impl LoRAAdapter {
-    /// Create a new LoRA adapter
+    /// Create a new LoRA adapter. Starts in evaluation mode (see [`Self::train`]).
     pub fn new(name: String, config: LoRAConfig) -> Self {
         Self {
             name,
             config,
             layers: HashMap::new(),
+            training: false,
         }
     }
 
-    /// Add a LoRA layer for a specific module
-    pub fn add_layer(&mut self, module_name: String, layer: LoRALayer) {
+    /// Add a LoRA layer for a specific module.
+    ///
+    /// The layer's training mode is reset to match the adapter's current
+    /// mode (see [`Self::train`] / [`Self::eval`]), so a layer added after
+    /// [`Self::train`] starts training too, rather than silently staying in
+    /// the [`LoRALayer::new`] default of evaluation mode.
+    pub fn add_layer(&mut self, module_name: String, mut layer: LoRALayer) {
+        if self.training {
+            layer.train();
+        } else {
+            layer.eval();
+        }
         self.layers.insert(module_name, layer);
+    }
+
+    /// Switch every registered layer -- and any layer added afterwards --
+    /// into training mode: `forward` stochastically applies dropout
+    /// wherever a layer's `config.dropout > 0.0`. Adapters start in
+    /// evaluation mode.
+    pub fn train(&mut self) {
+        self.training = true;
+        for layer in self.layers.values_mut() {
+            layer.train();
+        }
+    }
+
+    /// Switch every registered layer back into evaluation mode: `forward`
+    /// becomes fully deterministic and ignores each layer's configured
+    /// dropout probability. This is the default mode.
+    pub fn eval(&mut self) {
+        self.training = false;
+        for layer in self.layers.values_mut() {
+            layer.eval();
+        }
+    }
+
+    /// Whether the adapter -- and therefore every layer added through
+    /// [`Self::add_layer`] -- is currently in training mode.
+    pub fn is_training(&self) -> bool {
+        self.training
     }
 
     /// Load LoRA adapter from safetensors file
@@ -492,6 +630,126 @@ mod tests {
         assert!(effective.iter().all(|&x| x >= 1.0));
     }
 
+    /// A freshly constructed layer must start in evaluation mode.
+    #[test]
+    fn test_lora_layer_starts_in_eval_mode() {
+        let config = LoRAConfig::new(4, 8.0).with_dropout(0.5);
+        let base_weight = Array2::from_elem((16, 8), 0.1);
+        let layer = LoRALayer::new(config, base_weight).expect("layer");
+        assert!(!layer.is_training());
+    }
+
+    #[test]
+    fn test_lora_train_eval_toggle() {
+        let config = LoRAConfig::new(4, 8.0).with_dropout(0.5);
+        let base_weight = Array2::from_elem((8, 4), 0.2);
+        let mut layer = LoRALayer::new(config, base_weight).expect("layer");
+        assert!(!layer.is_training());
+        layer.train();
+        assert!(layer.is_training());
+        layer.eval();
+        assert!(!layer.is_training());
+    }
+
+    // Regression for the medium bug where `dropout` was accepted, validated,
+    // and exposed as a property but `forward` never consulted it at all:
+    // `dropout=0.3` and `dropout=0.0` produced byte-identical output. Note
+    // `lora_b` starts at all zeros (see `LoRALayer::new`), which would make
+    // the LoRA path -- and therefore any dropout applied to its input --
+    // invisible in `forward`'s output regardless of whether dropout is
+    // wired up correctly; these tests set `lora_b` away from zero first (as
+    // `test_effective_weight` above already does) so they actually exercise
+    // the dropout-masked path instead of passing vacuously.
+    //
+    // Both tests deliberately leave `lora_a` at its natural random
+    // initialisation (rather than a hand-picked matrix) and use a 64-wide
+    // input at `dropout=0.5`: `dropout=0.5` minimises the chance that two
+    // independent Bernoulli masks coincide per element (that probability is
+    // `keep_prob^2 + (1-keep_prob)^2`, minimised at `keep_prob=0.5`, unlike
+    // e.g. `dropout=0.9` where masks mostly agree on "everything dropped").
+    // At 64 independent elements the chance two draws' masks coincide
+    // exactly is `0.5^64`; a random (not hand-symmetric) `lora_a` makes any
+    // *other* mask collision astronomically unlikely too, so a fresh
+    // Bernoulli mask each call is expected to change the output on
+    // essentially every draw.
+    fn lora_dropout_test_layer(dropout: f32, in_features: usize) -> LoRALayer {
+        let out_features = 6;
+        let rank = 8;
+        let config = LoRAConfig::new(rank, 8.0).with_dropout(dropout);
+        let base_weight = Array2::from_shape_fn((out_features, in_features), |(i, j)| {
+            (i as f32 + j as f32) * 0.001
+        });
+        let mut layer = LoRALayer::new(config, base_weight).expect("layer");
+        // `lora_a` is left at its natural random init. Only `lora_b` needs
+        // overriding away from its zero default, using a non-uniform
+        // pattern so it does not collapse the rank-dimensional
+        // `intermediate` vector down to a single scalar functional.
+        layer
+            .set_lora_b(Array2::from_shape_fn((out_features, rank), |(i, j)| {
+                0.1 + 0.03 * (i as f32) - 0.017 * (j as f32)
+            }))
+            .expect("set_lora_b");
+        layer
+    }
+
+    #[test]
+    fn test_lora_dropout_inactive_in_eval_mode() {
+        // Evaluation-mode forward is deterministic and matches the
+        // no-dropout formula exactly, regardless of the configured dropout
+        // probability.
+        let layer = lora_dropout_test_layer(0.5, 64);
+        assert!(!layer.is_training());
+
+        let input = Array1::from_shape_fn(64, |i| (i as f32) * 0.01 + 0.1);
+        let first = layer.forward(&input).expect("forward");
+        for _ in 0..20 {
+            let repeat = layer.forward(&input).expect("forward");
+            assert_eq!(first, repeat, "eval-mode forward must be deterministic");
+        }
+    }
+
+    #[test]
+    fn test_lora_dropout_active_in_training_mode() {
+        // In training mode, repeated forward calls on the same input must
+        // differ (the LoRA path applies a fresh Bernoulli mask each call).
+        // See `lora_dropout_test_layer`'s doc comment for why the failure
+        // probability here is astronomically small.
+        let mut layer = lora_dropout_test_layer(0.5, 64);
+        layer.train();
+        assert!(layer.is_training());
+
+        let input = Array1::from_elem(64, 1.0_f32);
+        let first = layer.forward(&input).expect("forward");
+        let mut saw_difference = false;
+        for _ in 0..20 {
+            let repeat = layer.forward(&input).expect("forward");
+            if repeat != first {
+                saw_difference = true;
+                break;
+            }
+        }
+        assert!(
+            saw_difference,
+            "training-mode dropout should make forward stochastic once B is nonzero"
+        );
+    }
+
+    #[test]
+    fn test_lora_dropout_zero_is_deterministic_even_in_training_mode() {
+        // dropout=0.0 (the default) must remain a deterministic no-op even
+        // in training mode.
+        let config = LoRAConfig::new(4, 8.0); // dropout defaults to 0.0
+        let base_weight = Array2::from_elem((8, 4), 0.2);
+        let mut layer = LoRALayer::new(config, base_weight).expect("layer");
+        layer.lora_b = Array2::from_elem((8, 4), 0.3);
+        layer.train();
+
+        let input = Array1::from_elem(4, 0.5);
+        let first = layer.forward(&input).expect("forward");
+        let repeat = layer.forward(&input).expect("forward");
+        assert_eq!(first, repeat);
+    }
+
     #[test]
     fn test_lora_adapter_creation() {
         let config = LoRAConfig::new(4, 8.0);
@@ -524,5 +782,32 @@ mod tests {
         let input = Array1::from_elem(16, 0.5);
         let result = layer.forward(&input);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lora_adapter_train_eval_propagates_to_layers() {
+        let config = LoRAConfig::new(4, 8.0).with_dropout(0.5);
+        let mut adapter = LoRAAdapter::new("adapter".to_string(), config.clone());
+        let base_weight = Array2::from_elem((8, 4), 0.2);
+        let layer = LoRALayer::new(config.clone(), base_weight.clone()).expect("layer");
+        adapter.add_layer("l1".to_string(), layer);
+
+        assert!(!adapter.is_training());
+        assert!(!adapter.layers["l1"].is_training());
+
+        adapter.train();
+        assert!(adapter.is_training());
+        assert!(adapter.layers["l1"].is_training());
+
+        // A layer added after `train()` must also start in training mode,
+        // not silently fall back to `LoRALayer::new`'s eval-mode default.
+        let layer2 = LoRALayer::new(config, base_weight).expect("layer");
+        adapter.add_layer("l2".to_string(), layer2);
+        assert!(adapter.layers["l2"].is_training());
+
+        adapter.eval();
+        assert!(!adapter.is_training());
+        assert!(!adapter.layers["l1"].is_training());
+        assert!(!adapter.layers["l2"].is_training());
     }
 }

@@ -601,6 +601,8 @@ impl NeuralOdeModel {
 impl SignalPredictor for NeuralOdeModel {
     #[instrument(skip(self, input))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.input_proj.shape()[0])?;
+
         // 1. Project input to hidden space
         let h = input.dot(&self.input_proj);
 

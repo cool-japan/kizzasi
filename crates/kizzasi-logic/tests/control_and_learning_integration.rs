@@ -17,6 +17,14 @@ use scirs2_core::ndarray::{Array1, Array2};
 // MPC Tests
 // ============================================================================
 
+/// Helper: the first control of a solution (the sequence is never empty for a
+/// validated configuration).
+fn first_control_of(solution: &MPCSolution) -> &Array1<f32> {
+    solution
+        .first_control()
+        .expect("MPC solution must contain at least one control")
+}
+
 /// Helper: build a 1-D integrator controller (x_{t+1} = x_t + u_t).
 fn make_1d_integrator(
     horizon: usize,
@@ -64,15 +72,15 @@ fn test_mpc_basic_1d_solve() {
         "controls vector must have length == control_horizon"
     );
     assert!(
-        solution.first_control().iter().all(|v| v.is_finite()),
+        first_control_of(&solution).iter().all(|v| v.is_finite()),
         "first control must be finite, got {:?}",
-        solution.first_control()
+        first_control_of(&solution)
     );
     assert!(
         solution.is_feasible(),
         "solution must be feasible (total_cost < infinity)"
     );
-    println!("basic solve: first_u={:.4}", solution.first_control()[0]);
+    println!("basic solve: first_u={:.4}", first_control_of(&solution)[0]);
 }
 
 /// Receding-horizon loop: applying the MPC output to the 1-D integrator for 10
@@ -91,7 +99,7 @@ fn test_mpc_receding_horizon_converges() {
 
     for step in 0..10 {
         let sol = controller.solve(&state).expect("solve at each step");
-        let u = sol.first_control()[0];
+        let u = first_control_of(&sol)[0];
         assert!(u.is_finite(), "control at step {step} must be finite");
         state[0] += u; // integrator: x_{t+1} = x_t + u_t
         assert!(state[0].is_finite(), "state at step {step} must be finite");
@@ -119,7 +127,7 @@ fn test_mpc_warm_start_consistency() {
         "cold-start solution must be feasible"
     );
     assert!(
-        sol_cold.first_control().iter().all(|v| v.is_finite()),
+        first_control_of(&sol_cold).iter().all(|v| v.is_finite()),
         "cold-start first control must be finite"
     );
 
@@ -132,14 +140,14 @@ fn test_mpc_warm_start_consistency() {
         "warm-start solution must be feasible"
     );
     assert!(
-        sol_warm.first_control().iter().all(|v| v.is_finite()),
+        first_control_of(&sol_warm).iter().all(|v| v.is_finite()),
         "warm-start first control must be finite"
     );
 
     println!(
         "cold u0={:.4}, warm u0={:.4}",
-        sol_cold.first_control()[0],
-        sol_warm.first_control()[0]
+        first_control_of(&sol_cold)[0],
+        first_control_of(&sol_warm)[0]
     );
 }
 
@@ -154,7 +162,7 @@ fn test_mpc_reset_clears_state() {
         .expect("solve before reset must succeed");
     assert!(sol_before.is_feasible(), "pre-reset solution feasible");
     assert!(
-        sol_before.first_control().iter().all(|v| v.is_finite()),
+        first_control_of(&sol_before).iter().all(|v| v.is_finite()),
         "pre-reset first control finite"
     );
 
@@ -165,14 +173,14 @@ fn test_mpc_reset_clears_state() {
         .expect("solve after reset must succeed");
     assert!(sol_after.is_feasible(), "post-reset solution feasible");
     assert!(
-        sol_after.first_control().iter().all(|v| v.is_finite()),
+        first_control_of(&sol_after).iter().all(|v| v.is_finite()),
         "post-reset first control finite"
     );
 
     println!(
         "before reset u0={:.4}, after reset u0={:.4}",
-        sol_before.first_control()[0],
-        sol_after.first_control()[0]
+        first_control_of(&sol_before)[0],
+        first_control_of(&sol_after)[0]
     );
 }
 
@@ -223,7 +231,7 @@ fn test_mpc_control_constraint() {
         .solve(&state)
         .expect("solve with control constraint");
 
-    let u0 = solution.first_control()[0];
+    let u0 = first_control_of(&solution)[0];
     println!("constrained u0={u0:.4}");
 
     assert!(

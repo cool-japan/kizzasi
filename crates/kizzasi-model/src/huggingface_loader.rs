@@ -517,11 +517,10 @@ impl HuggingFaceModelLoader {
     }
 }
 
-impl Default for HuggingFaceModelLoader {
-    fn default() -> Self {
-        Self::new().expect("Failed to create default HuggingFaceModelLoader")
-    }
-}
+// Intentionally no `Default` impl: `HuggingFaceModelLoader::new()` is
+// fallible (it constructs a `HuggingFaceHub`, which builds a `reqwest::Client`
+// and can fail on TLS/root-certificate initialization), and `Default` has no
+// channel to propagate that. Callers must use the fallible `new()` directly.
 
 #[cfg(test)]
 mod tests {

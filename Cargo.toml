@@ -9,13 +9,14 @@ members = [
     "crates/kizzasi-logic",
     "crates/kizzasi-io",
     "crates/kizzasi-macros",
+    "crates/kizzasi-metal",
     "crates/kizzasi-python",
     "crates/kizzasi-embedded",
     "crates/kizzasi-webgpu",
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/kizzasi"
@@ -24,15 +25,16 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 # Internal crates
-kizzasi = { path = "crates/kizzasi", version = "0.2.2" }
-kizzasi-core = { path = "crates/kizzasi-core", version = "0.2.2" }
-kizzasi-model = { path = "crates/kizzasi-model", version = "0.2.2" }
-kizzasi-tokenizer = { path = "crates/kizzasi-tokenizer", version = "0.2.2" }
-kizzasi-inference = { path = "crates/kizzasi-inference", version = "0.2.2" }
-kizzasi-logic = { path = "crates/kizzasi-logic", version = "0.2.2" }
-kizzasi-io = { path = "crates/kizzasi-io", version = "0.2.2" }
-kizzasi-macros = { path = "crates/kizzasi-macros", version = "0.2.2" }
-kizzasi-webgpu = { path = "crates/kizzasi-webgpu", version = "0.2.2" }
+kizzasi = { path = "crates/kizzasi", version = "0.2.3" }
+kizzasi-core = { path = "crates/kizzasi-core", version = "0.2.3" }
+kizzasi-model = { path = "crates/kizzasi-model", version = "0.2.3" }
+kizzasi-tokenizer = { path = "crates/kizzasi-tokenizer", version = "0.2.3" }
+kizzasi-inference = { path = "crates/kizzasi-inference", version = "0.2.3" }
+kizzasi-logic = { path = "crates/kizzasi-logic", version = "0.2.3" }
+kizzasi-io = { path = "crates/kizzasi-io", version = "0.2.3" }
+kizzasi-macros = { path = "crates/kizzasi-macros", version = "0.2.3" }
+kizzasi-metal = { path = "crates/kizzasi-metal", version = "0.2.3" }
+kizzasi-webgpu = { path = "crates/kizzasi-webgpu", version = "0.2.3" }
 wgpu = { version = "30" }
 
 # ============================================
@@ -49,7 +51,12 @@ tensorlogic-ir = { version = "0.1.1" }
 # Core dependencies
 thiserror = "2"
 anyhow = "1"
-tracing = "0.1"
+# `release_max_level_info` compiles `trace!`/`debug!` (and `trace_span!`/
+# `debug_span!`) out of release builds entirely, so the hot-path
+# instrumentation in kizzasi-core (simd.rs, scan.rs) costs nothing in a
+# release binary. Only a workspace-level entry can carry this, because the
+# feature must be set on the `tracing` facade for the whole dependency graph.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = "0.3"
 
 # Async runtime
@@ -70,29 +77,102 @@ chrono = { version = "0.4", features = ["serde"] }
 # Parallelism
 rayon = "1"
 
-# ML Backend (Candle) - each crate will specify target-specific candle dependencies
-# to avoid pulling cudarc on macOS (CUDA not supported on macOS)
+# ML Backend -- oxicandle, the COOLJAPAN fork of candle 0.11.0
+#
+# WHY A FORK. Upstream candle-core 0.11.0 selects the `tokenizers` crate's
+# `onig` feature, which builds Oniguruma (a C regex library) through `onig_sys`.
+# This was previously handled with a `[patch.crates-io]` entry pointing at a
+# local candle checkout. That fixed the build *here* and nowhere else: `[patch]`
+# never propagates to crates.io, so anyone depending on a published kizzasi
+# crate still compiled onig -- which is exactly the Pure Rust guarantee kizzasi
+# claims. A renamed fork published to crates.io is what actually reaches
+# consumers. oxicandle-core selects `fancy-regex` instead (upstream candle PR
+# #3790); if that lands upstream, these entries go back to plain `candle-*`.
+#
+# WHY THE KEYS ARE STILL `candle-core` / `candle-nn`. The dependency key, not
+# the package name, decides the `extern` name, so keeping the keys means every
+# `use candle_core::...` in the tree compiles unchanged, and no crate ever names
+# one package under two different keys -- which Cargo rejects outright (see the
+# `--filter-platform` note in kizzasi-core's `[features]` block).
+#
+# `candle-metal-kernels` needs no entry of its own any more. The old patch had
+# to cover it because a path-sourced and a registry-sourced crate of the same
+# version are distinct crates to Cargo, so `--features metal` resolved two
+# incompatible instances. Both oxicandle-core and oxicandle-nn depend on the
+# upstream registry `candle-metal-kernels 0.11.0`, so there is a single shared
+# instance again. Re-check with:
+#   cargo tree -p kizzasi-io --all-features -e normal | grep candle-
+#
+# These are plain registry dependencies -- no `path`, no `[patch]`. Building
+# this workspace needs no sibling checkout, and the local build resolves exactly
+# what a consumer of the published kizzasi crates resolves. (Same reasoning as
+# commit 3038df8, which dropped oximedia's local path sourcing.) The fork's own
+# source lives in the private cool-japan/oxicandle repository; the published
+# crates carry the full source and the Apache-2.0 statement of changes.
+#
+# `default-features = false` keeps the CPU backend only: candle's own `cuda`
+# feature pulls `cudarc` + `candle-kernels`, whose build scripts require an
+# installed NVIDIA toolkit and abort the build without one, so kizzasi never
+# enables it (see kizzasi-core's `[features]` for the full rationale). The
+# `metal` backend is opt-in through `kizzasi-core/metal`, which forwards
+# `candle-core/metal` + `candle-nn/metal` on Apple platforms.
+candle-core = { package = "oxicandle-core", version = "0.11.0", default-features = false }
+candle-nn = { package = "oxicandle-nn", version = "0.11.0", default-features = false }
 safetensors = "0.8"
 half = "2"
 
-# HTTP client for HuggingFace Hub integration
+# HTTP client for HuggingFace Hub integration.
+#
+# NOTE: FFI. reqwest's `rustls` feature selects the aws-lc-rs crypto provider,
+# which builds the AWS-LC C/assembly library (`aws-lc-sys`). A pure-Rust
+# provider does exist (`oxitls-rustcrypto-provider`, injected by kizzasi-io's
+# `mqtt-tls`), but reqwest offers no hook to swap it in the way rumqttc does,
+# so this dependency stays optional and only reachable through kizzasi-model's
+# non-default `hf-hub` feature; the default build never links it.
 reqwest = { version = "0.13", features = ["json", "rustls", "blocking"], default-features = false }
 sha2 = "0.11"
 
 # IO connectors
-rumqttc = { package = "rumqttc-v4-next", version = "0.30" }
+#
+# `default-features = false` drops rumqttc's default `use-rustls` (the
+# aws-lc-rs-backed TLS stack, i.e. `aws-lc-sys`, a C library) so the base
+# `mqtt` feature stays plaintext-only and pure Rust. TLS is re-enabled by
+# kizzasi-io's opt-in `mqtt-tls` feature, which selects rumqttc's
+# `use-rustls-no-provider` variant instead and supplies its own pure-Rust
+# `CryptoProvider` (below) rather than ever touching rumqttc's default
+# aws-lc-rs-backed path.
+rumqttc = { package = "rumqttc-v4-next", version = "0.30", default-features = false }
+# Pure-Rust rustls CryptoProvider -- COOLJAPAN fork of rustls-rustcrypto
+# carrying the RUSTSEC-2026-0104 fix. Injected explicitly by kizzasi-io's
+# `mqtt-tls` feature so TLS never resolves rustls' default aws-lc-rs provider
+# (see kizzasi-io's `mqtt.rs`).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+rustls-pki-types = "1"
+oxitls-rustcrypto-provider = "0.3"
+# NOTE: FFI. `cpal` binds the platform audio API -- libasound (`alsa-sys`) on
+# Linux, CoreAudio on Apple, WASAPI on Windows -- so kizzasi-io's `audio`
+# feature is opt-in and out of the default feature set.
 cpal = "0.18"
 oxifft = "0.4.2"
 tokio-tungstenite = "0.29"
 tokio-serial = "5.5"
 hound = "3.5"
 csv = "1.4"
-hdf5 = "0.8"
+# COOLJAPAN pure-Rust HDF5 (replaces the libhdf5-binding `hdf5` crate;
+# interop-verified against h5py/libhdf5 by its own test suite).
+oxih5 = "0.2.3"
 crossbeam-queue = "0.3"
 bytes = "1"
 rosc = "0.11"
-tmq = "0.5"
-r2r = "0.9"
+# Pure-Rust ZMTP (zmq.rs) and ROS2-on-RustDDS clients. They replace `tmq`
+# (binds the libzmq C library) and `r2r` (needs a full ROS2 C/C++ install),
+# both of which violated the Pure Rust policy and have been dropped.
+zeromq = "0.6.0"
+ros2-client = "0.10.0"
+# NOTE: FFI. `ffmpeg-next` binds the FFmpeg C libraries; optional, off by
+# default, and documented as impure in kizzasi-io's `[features]` table.
+# (HDF5 support used to sit in this section too; it is pure Rust via `oxih5`
+# since the libhdf5 migration.)
 ffmpeg-next = "8"
 tonic = "0.14"
 prost = "0.14"
@@ -117,13 +197,49 @@ async-stream = "0.3"
 syn = { version = "2.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"
+proc-macro-crate = "3.5.0"
 num_cpus = "1.17"
 toml = "1.1"
 serde_yaml = "0.9"
+# `no_std` float math shims for kizzasi-embedded (pure Rust port of musl libm).
+libm = "0.2.16"
+# NOTE: FFI. `osqp` builds the OSQP C solver; optional, off by default, and
+# documented as impure in kizzasi-logic's `[features]` table.
+osqp = "1.0.1"
+# WebAssembly bindings for kizzasi-tokenizer's `wasm` feature.
+wasm-bindgen = "0.2.127"
+js-sys = "0.3.104"
+getrandom = { version = "0.4", features = ["wasm_js"] }
+uuid = { version = "1", features = ["v4", "serde", "js"] }
 
 # OxiRS dependencies (from crates.io)
 oxirs-core = "0.4.1"
 oxirs-gql = "0.4.1"
+
+# OxiMedia -- pure-Rust media stack (video-pure backend)
+#
+# `oximedia-container` supplies the Y4M demuxer, `oximedia-core` the
+# YUV<->RGB/Gray pixel conversions and `oximedia-cv` the bilinear resampler
+# that kizzasi-io's `video-pure` backend is built on. No C/C++/Fortran is
+# compiled by any of them.
+oximedia-core = "0.2.1"
+oximedia-container = "0.2.1"
+oximedia-cv = "0.2.1"
+# Camera capture for the same backend: `oximedia-capture` opens the device
+# and delivers frames, `oximedia-codec` (feature `mjpeg`, selected by
+# kizzasi-io's `video-pure`) decodes the compressed ones, and `oximedia-simd`
+# supplies the packed 4:2:2 (YUYV/UYVY) row converters.
+#
+# `oximedia-codec` is pulled with `default-features = false` deliberately: its
+# defaults are `av1 + image-io + ffv1 + jpegxl`, none of which kizzasi decodes.
+# Only `mjpeg` is switched back on, so the build compiles one JPEG decoder
+# rather than five video codecs. `oximedia-simd`'s own default
+# (`runtime-dispatch`) is pure Rust -- its `cc` build-dependency is reached
+# only through the non-default `native-asm` feature, and its `build.rs` is a
+# no-op without it.
+oximedia-codec = { version = "0.2.1", default-features = false }
+oximedia-simd = "0.2.1"
+oximedia-capture = "0.2.1"
 
 [profile.release]
 lto = true

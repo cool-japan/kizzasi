@@ -14,7 +14,7 @@ Kizzasi inference cost is determined by:
 3. **SIMD paths** — ARM64 NEON or x86-64 AVX2/AVX-512, selected at compile time
 4. **State management** — reset vs stateful streaming, context warming
 5. **Quantisation** — INT8 / FP16 for smaller models and lower memory bandwidth
-6. **Hardware** — CPU (default), CUDA (candle), Metal (macOS)
+6. **Hardware** — CPU (default), Metal (macOS, `metal`), WebGPU (portable, `webgpu`)
 
 The `examples/performance_tuning_demo.rs` file in this repository contains
 runnable benchmarks for each of these areas.
@@ -267,7 +267,7 @@ let config = QuantizationConfig::int8();
 
 ### FP16 / BF16
 
-Enabled automatically when `candle` targets a CUDA or Metal device.  On CPU:
+Enabled automatically when `candle` targets a Metal device (`--features metal`).  On CPU:
 
 ```rust
 use kizzasi_model::mixed_precision::MixedPrecisionConfig;
@@ -289,38 +289,60 @@ precision of BF16 is not needed.
 - Use Rayon parallel iterators for batch processing on multi-core machines.
 - `kizzasi-core` uses `rayon` internally for `predict_batch`.
 
-### CUDA (via candle)
+### CUDA
 
-```toml
-[dependencies]
-kizzasi = { version = "0.1", features = ["cuda"] }
-```
-
-```rust
-use kizzasi_core::gpu::{DeviceConfig, DeviceType};
-
-let device = DeviceConfig::new(DeviceType::Cuda { device_id: 0 });
-let predictor = KizzasiBuilder::new()
-    .device(device)
-    .build()?;
-```
-
-Requires a working CUDA toolkit and compatible GPU.  Performance scales with
-`hidden_dim` — the break-even point vs CPU is roughly `hidden_dim ≥ 256`.
+Not available. kizzasi ships no `cuda` feature: candle's CUDA backend needs an
+NVIDIA toolkit at *build* time (its build scripts abort without one) and Cargo
+cannot make a feature conditional on the host toolchain, so the flag would
+break every build on a machine without CUDA. Use `webgpu` below for portable
+GPU acceleration, or depend on candle directly if you need its CUDA kernels.
 
 ### Metal (macOS / Apple Silicon)
 
 ```toml
 [dependencies]
-kizzasi = { version = "0.1", features = ["metal"] }
+kizzasi = { version = "0.2", features = ["metal"] }
 ```
 
 ```rust
-let device = DeviceConfig::new(DeviceType::Metal);
+use kizzasi_core::device::{DeviceConfig, DeviceType};
+
+let device = DeviceConfig::new()
+    .with_device_type(DeviceType::Metal)
+    .create_device()?;
 ```
 
-Metal inference leverages the unified memory architecture of Apple Silicon,
-eliminating CPU↔GPU data transfer latency for most operations.
+`DeviceType::Metal` only exists with the `metal` feature, which forwards
+candle's own Metal backend — a build without it cannot name a GPU device, let
+alone silently fall back to one. Metal inference leverages the unified memory
+architecture of Apple Silicon, eliminating CPU↔GPU data transfer latency for
+most operations.
+
+The backend itself is Apple-only, but the feature resolves on every platform:
+it goes through the `kizzasi-metal` crate, which target-scopes the candle
+dependency so `--all-features` still builds on Linux and Windows. On those
+targets the feature is inert and says so — `is_metal_available()` returns
+`false`, `get_best_device()` stays on CPU, and `create_device()` for
+`DeviceType::Metal` returns a `DeviceError` naming the target.
+
+### WebGPU (portable: Metal / Vulkan / DX12)
+
+```toml
+[dependencies]
+kizzasi = { version = "0.2", features = ["webgpu"] }
+```
+
+```rust
+// Returns the GPU-backed scan backend when an adapter is reachable, and the
+// CPU backend (with a logged reason) when it is not — it never fails.
+let backend = kizzasi::ssm_backend::select_ssm_backend().await;
+let states = backend.ssm_scan(&elements)?;
+tracing::info!(backend = backend.backend_name(), "scan backend");
+```
+
+The GPU path pays off on long sequences; `WebGpuSsmBackend` runs sequences
+shorter than its threshold on the CPU rather than paying dispatch and readback
+costs.
 
 ---
 
@@ -333,4 +355,4 @@ eliminating CPU↔GPU data transfer latency for most operations.
 - [ ] Use `fork()` instead of re-constructing predictors for branching.
 - [ ] Profile with `ProfilingRegistry` before optimising further.
 - [ ] Consider INT8 quantisation for memory-bound workloads.
-- [ ] Enable `cuda` or `metal` features for GPU-backed inference.
+- [ ] Enable the `webgpu` feature (any GPU) or `metal` (Apple) for GPU-backed work.

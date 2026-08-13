@@ -91,9 +91,11 @@ impl LRScheduler for LinearScheduler {
             // Linear warmup
             self.initial_lr * (step as f64 / self.warmup_steps as f64)
         } else {
-            // Linear decay
-            let progress =
-                (step - self.warmup_steps) as f64 / (self.total_steps - self.warmup_steps) as f64;
+            // Linear decay. `total_steps` may be smaller than `warmup_steps`
+            // when the horizon is derived from a short dataset, so the decay
+            // window is saturating and floored at one step.
+            let decay_steps = self.total_steps.saturating_sub(self.warmup_steps).max(1) as f64;
+            let progress = ((step - self.warmup_steps) as f64 / decay_steps).clamp(0.0, 1.0);
             self.initial_lr + (self.final_lr - self.initial_lr) * progress
         }
     }
@@ -141,9 +143,11 @@ impl LRScheduler for CosineScheduler {
             // Linear warmup
             self.max_lr * (step as f64 / self.warmup_steps as f64)
         } else {
-            // Cosine annealing
-            let progress =
-                (step - self.warmup_steps) as f64 / (self.total_steps - self.warmup_steps) as f64;
+            // Cosine annealing. Guard against a horizon shorter than the
+            // warmup (possible once `total_steps` is derived from the real
+            // batch count) which would underflow `usize` and divide by zero.
+            let decay_steps = self.total_steps.saturating_sub(self.warmup_steps).max(1) as f64;
+            let progress = ((step - self.warmup_steps) as f64 / decay_steps).clamp(0.0, 1.0);
             let cosine = (1.0 + (std::f64::consts::PI * progress).cos()) / 2.0;
             self.min_lr + (self.max_lr - self.min_lr) * cosine
         }
@@ -215,7 +219,9 @@ impl ExponentialScheduler {
 
 impl LRScheduler for ExponentialScheduler {
     fn get_lr(&self, step: usize) -> f64 {
-        let num_decays = step / self.decay_steps;
+        // A zero decay period would divide by zero; treat it as "decay every
+        // step" rather than panicking.
+        let num_decays = step / self.decay_steps.max(1);
         self.initial_lr * self.decay_rate.powi(num_decays as i32)
     }
 
@@ -281,8 +287,10 @@ impl LRScheduler for OneCycleScheduler {
             let progress = step as f64 / warmup_steps as f64;
             self.initial_lr + (self.max_lr - self.initial_lr) * progress
         } else {
-            // Decrease from max to final
-            let progress = (step - warmup_steps) as f64 / (self.total_steps - warmup_steps) as f64;
+            // Decrease from max to final. `warmup_pct == 1.0` makes the decay
+            // window empty, so floor it at one step to avoid a 0/0 NaN.
+            let decay_steps = self.total_steps.saturating_sub(warmup_steps).max(1) as f64;
+            let progress = ((step - warmup_steps) as f64 / decay_steps).clamp(0.0, 1.0);
             let cosine = (1.0 + (std::f64::consts::PI * progress).cos()) / 2.0;
             self.final_lr + (self.max_lr - self.final_lr) * cosine
         }

@@ -1,5 +1,8 @@
 //! GPU buffer types and usage flags.
 
+#[cfg(feature = "webgpu")]
+use crate::error::WebGpuError;
+
 /// Usage classification for GPU buffers.
 ///
 /// This is a thin abstraction over `wgpu::BufferUsages` that remains
@@ -20,12 +23,15 @@ pub enum GpuBufferUsage {
 
 /// An owned handle to a GPU buffer, plus associated metadata.
 ///
-/// The inner `wgpu::Buffer` is only present when compiled with `--features webgpu`.
 /// The metadata fields (`size_bytes`, `usage`, `label`) are always accessible.
+/// A buffer created by [`crate::WebGpuBackend::upload_f32`] or returned by one
+/// of the `*_gpu_buf` kernels owns a live `wgpu::Buffer`; one created by
+/// [`GpuBuffer::metadata_only`] does not, and passing it to a GPU operation
+/// returns [`WebGpuError::NoGpuAllocation`].
 pub struct GpuBuffer {
-    /// The underlying wgpu buffer handle.
+    /// The underlying wgpu buffer handle, when the buffer is GPU-resident.
     #[cfg(feature = "webgpu")]
-    pub(crate) inner: wgpu::Buffer,
+    pub(crate) inner: Option<wgpu::Buffer>,
 
     /// Size of the buffer in bytes.
     pub size_bytes: u64,
@@ -40,21 +46,45 @@ pub struct GpuBuffer {
 impl GpuBuffer {
     /// Constructs a metadata-only `GpuBuffer` (no GPU allocation).
     ///
-    /// This constructor is primarily useful in tests that run without a GPU.
-    /// When the `webgpu` feature is enabled, use [`super::WebGpuBackend::upload_f32`]
-    /// instead to create a GPU-backed buffer.
-    #[cfg(not(feature = "webgpu"))]
+    /// Available in every feature configuration — enabling `webgpu` never
+    /// removes this constructor, so Cargo's graph-wide feature unification
+    /// cannot break a downstream build that uses it.
+    ///
+    /// The result is *not* GPU-resident: GPU operations reject it with
+    /// [`WebGpuError::NoGpuAllocation`].
+    /// To obtain a usable buffer call
+    /// [`WebGpuBackend::upload_f32`](crate::WebGpuBackend::upload_f32).
     pub fn metadata_only(size_bytes: u64, usage: GpuBufferUsage, label: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "webgpu")]
+            inner: None,
             size_bytes,
             usage,
             label: label.into(),
         }
     }
 
+    /// Returns `true` when this buffer owns a live GPU allocation.
+    pub fn is_gpu_resident(&self) -> bool {
+        #[cfg(feature = "webgpu")]
+        {
+            self.inner.is_some()
+        }
+
+        #[cfg(not(feature = "webgpu"))]
+        {
+            false
+        }
+    }
+
+    /// Number of `f32` values the buffer can hold.
+    pub fn len_f32(&self) -> u64 {
+        self.size_bytes / std::mem::size_of::<f32>() as u64
+    }
+
     /// Constructs a `GpuBuffer` directly from a `wgpu::Buffer`.
     ///
-    /// Intended for internal use inside `WebGpuBackend`.
+    /// Intended for internal use inside `WebGpuBackend` and the kernels.
     #[cfg(feature = "webgpu")]
     pub(crate) fn from_wgpu(
         inner: wgpu::Buffer,
@@ -63,11 +93,19 @@ impl GpuBuffer {
         label: impl Into<String>,
     ) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             size_bytes,
             usage,
             label: label.into(),
         }
+    }
+
+    /// Borrow the underlying wgpu buffer, or fail if this is metadata-only.
+    #[cfg(feature = "webgpu")]
+    pub(crate) fn wgpu_buffer(&self) -> Result<&wgpu::Buffer, WebGpuError> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| WebGpuError::NoGpuAllocation(self.label.clone()))
     }
 }
 
@@ -77,6 +115,7 @@ impl std::fmt::Debug for GpuBuffer {
             .field("size_bytes", &self.size_bytes)
             .field("usage", &self.usage)
             .field("label", &self.label)
+            .field("gpu_resident", &self.is_gpu_resident())
             .finish_non_exhaustive()
     }
 }

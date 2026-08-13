@@ -136,7 +136,13 @@ proptest! {
         }
     }
 
-    /// Property: μ-law should be symmetric around zero
+    /// Property: μ-law should be symmetric around zero.
+    ///
+    /// `encode` returns discrete levels in `0..vocab_size()` (see
+    /// `MuLawCodec`'s `SignalTokenizer` impl), so a value and its negation
+    /// quantize to levels that are reflections of each other around the
+    /// midpoint `vocab_size() / 2`, i.e. `e_pos + e_neg` sits within one
+    /// rounding step of `vocab_size()` — not of `0`.
     #[test]
     fn mulaw_symmetry(value in -1.0f32..1.0) {
         let codec = MuLawCodec::new(8);
@@ -146,11 +152,13 @@ proptest! {
         let e_pos = codec.encode(&pos).unwrap()[[0]];
         let e_neg = codec.encode(&neg).unwrap()[[0]];
 
-        // Encoded values should be symmetric (within quantization error)
-        prop_assert!((e_pos as i32 + e_neg as i32).abs() <= 1);
+        let levels = codec.vocab_size() as i32;
+        prop_assert!((e_pos as i32 + e_neg as i32 - levels).abs() <= 1);
     }
 
-    /// Property: Zero input should encode to a consistent value
+    /// Property: Zero input should encode to a consistent value — the
+    /// midpoint level (`vocab_size() / 2`), matching
+    /// `regression_mulaw_zero_maps_to_midpoint` in `regression_tests.rs`.
     #[test]
     fn mulaw_zero_encoding(_dummy in 0..1) {
         let codec = MuLawCodec::new(8);
@@ -158,9 +166,8 @@ proptest! {
 
         let encoded = codec.encode(&zero_signal).unwrap();
 
-        // Zero should always encode to the same value
         prop_assert!(encoded[[0]].is_finite());
-        prop_assert_eq!(encoded[[0]], 0.0);
+        prop_assert_eq!(encoded[[0]], (codec.vocab_size() / 2) as f32);
     }
 }
 
@@ -454,8 +461,9 @@ proptest! {
 
         let encoded = tokenizer.encode(&signal).unwrap();
 
-        // Encoded should have 2 * num_bins elements (magnitude and phase for each bin)
-        prop_assert_eq!(encoded.len(), 2 * num_bins);
+        // token[0] is the original-length header; the rest is magnitude and
+        // phase for each bin (2 * num_bins).
+        prop_assert_eq!(encoded.len(), 1 + 2 * num_bins);
     }
 }
 

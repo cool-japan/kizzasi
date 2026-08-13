@@ -81,7 +81,7 @@ use safetensors::tensor::{Dtype, TensorView};
 use scirs2_core::ndarray::{Array1, Array2};
 use scirs2_core::random::{rng, RngExt};
 #[allow(unused_imports)]
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 /// Configuration for S4D
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -94,12 +94,22 @@ pub struct S4Config {
     pub state_dim: usize,
     /// Number of layers
     pub num_layers: usize,
-    /// Dropout rate
+    /// Dropout rate applied to each layer output while training mode is
+    /// enabled via `set_training(true)` (inverted dropout; inert at inference)
     pub dropout: f32,
     /// Discretization step size (Δ)
     pub dt_min: f32,
     pub dt_max: f32,
-    /// Use diagonal state matrix (S4D)
+    /// Use diagonal state matrix (S4D).
+    ///
+    /// Only `true` is actually implemented: the internal `S4DKernel`
+    /// unconditionally stores and applies `A` as a diagonal parameter (`log_a`, applied
+    /// element-wise) regardless of this flag — there is no dense/NPLR
+    /// kernel path for `false` to select. Setting `false` does not panic or
+    /// error (kept non-breaking for existing configs, and
+    /// `kizzasi-inference::registry` reads this field for a different
+    /// crate's `ModelType::S4` vs `S4D` distinction), but [`S4Config::validate`]
+    /// logs a warning so the gap is discoverable instead of silent.
     pub use_diagonal: bool,
     /// Use RMSNorm instead of LayerNorm
     pub use_rms_norm: bool,
@@ -151,7 +161,10 @@ impl S4Config {
         self
     }
 
-    /// Use diagonal state matrix (S4D)
+    /// Use diagonal state matrix (S4D).
+    ///
+    /// See the [`S4Config::use_diagonal`] field doc: `false` is accepted but
+    /// has no effect on the kernel actually built (it is always diagonal).
     pub fn diagonal(mut self, use_diagonal: bool) -> Self {
         self.use_diagonal = use_diagonal;
         self
@@ -173,6 +186,13 @@ impl S4Config {
         }
         if self.dt_min > self.dt_max {
             return Err(ModelError::invalid_config("dt_min must be <= dt_max"));
+        }
+        if !self.use_diagonal {
+            warn!(
+                "S4Config::use_diagonal is false, but S4DKernel has no \
+                 dense/NPLR path -- the kernel this config builds will be \
+                 diagonal regardless. See S4Config::use_diagonal's docs."
+            );
         }
         Ok(())
     }
@@ -394,6 +414,8 @@ pub struct S4D {
     ln_out: LayerNorm,
     input_proj: Array2<f32>,
     output_proj: Array2<f32>,
+    /// Whether `S4Config::dropout` is active (see [`S4D::set_training`]).
+    training: bool,
 }
 
 impl S4D {
@@ -433,6 +455,7 @@ impl S4D {
             ln_out,
             input_proj,
             output_proj,
+            training: false,
         })
     }
 
@@ -597,6 +620,22 @@ impl S4D {
         Ok(())
     }
 
+    /// Enable or disable training mode.
+    ///
+    /// Models are created in inference mode, where `S4Config::dropout` is inert
+    /// and [`step`](crate::SignalPredictor::step) is deterministic. Set this to
+    /// `true` during training so the configured dropout rate is applied to each
+    /// layer output (inverted dropout — no rescale is needed when switching
+    /// back to inference).
+    pub fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
+    /// Whether the model is currently in training mode (dropout active).
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
     /// Load weights from a JSON file previously written by `save_weights_json`.
     pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
         let file = std::fs::File::open(path.as_ref()).map_err(|e| {
@@ -609,7 +648,23 @@ impl S4D {
                     format!("JSON deserialization failed: {e}"),
                 )
             })?;
+        self.load_weights_map(&weights).map(|_| ())
+    }
 
+    /// Load weights from an in-memory `name → flat f32 values` map.
+    ///
+    /// This is the in-process counterpart of [`Self::load_weights_json`]: it
+    /// applies exactly the same shape checks and partial-loading semantics
+    /// without routing the parameters through a serialized file.
+    pub fn load_weights_map(
+        &mut self,
+        weights: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> ModelResult<usize> {
+        // Number of tensors actually applied. The caller needs this to tell a
+        // genuine partial load from a weight map whose names match nothing at
+        // all — the latter would otherwise leave the model randomly
+        // initialised while reporting success.
+        let applied = std::cell::Cell::new(0usize);
         let load_array2 = |map: &std::collections::HashMap<String, Vec<f32>>,
                            key: &str,
                            rows: usize,
@@ -635,6 +690,7 @@ impl S4D {
                         format!("failed to reshape '{}': {e}", key),
                     )
                 })?;
+                applied.set(applied.get() + 1);
                 Ok(Some(arr))
             } else {
                 Ok(None)
@@ -657,6 +713,7 @@ impl S4D {
                         ),
                     ));
                 }
+                applied.set(applied.get() + 1);
                 Ok(Some(Array1::from_vec(data.clone())))
             } else {
                 Ok(None)
@@ -666,10 +723,10 @@ impl S4D {
         let hidden = self.config.hidden_dim;
         let state = self.config.state_dim;
 
-        if let Some(arr) = load_array2(&weights, "input_proj", self.config.input_dim, hidden)? {
+        if let Some(arr) = load_array2(weights, "input_proj", self.config.input_dim, hidden)? {
             self.input_proj = arr;
         }
-        if let Some(arr) = load_array2(&weights, "output_proj", hidden, self.config.input_dim)? {
+        if let Some(arr) = load_array2(weights, "output_proj", hidden, self.config.input_dim)? {
             self.output_proj = arr;
         }
 
@@ -678,28 +735,28 @@ impl S4D {
             let kp = format!("{}.s4_kernel", prefix);
 
             if let Some(arr) =
-                load_array2(&weights, &format!("{}.output_proj", prefix), hidden, hidden)?
+                load_array2(weights, &format!("{}.output_proj", prefix), hidden, hidden)?
             {
                 layer.output_proj = arr;
             }
-            if let Some(arr) = load_array1(&weights, &format!("{}.log_a", kp), state)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.log_a", kp), state)? {
                 layer.s4_kernel.log_a = arr;
             }
-            if let Some(arr) = load_array2(&weights, &format!("{}.b_matrix", kp), state, hidden)? {
+            if let Some(arr) = load_array2(weights, &format!("{}.b_matrix", kp), state, hidden)? {
                 layer.s4_kernel.b_matrix = arr;
             }
-            if let Some(arr) = load_array2(&weights, &format!("{}.c_matrix", kp), hidden, state)? {
+            if let Some(arr) = load_array2(weights, &format!("{}.c_matrix", kp), hidden, state)? {
                 layer.s4_kernel.c_matrix = arr;
             }
-            if let Some(arr) = load_array1(&weights, &format!("{}.d_skip", kp), hidden)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.d_skip", kp), hidden)? {
                 layer.s4_kernel.d_skip = arr;
             }
-            if let Some(arr) = load_array1(&weights, &format!("{}.log_dt", kp), hidden)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.log_dt", kp), hidden)? {
                 layer.s4_kernel.log_dt = arr;
             }
         }
 
-        Ok(())
+        Ok(applied.get())
     }
 
     /// Save weights to a SafeTensors model file.
@@ -784,12 +841,17 @@ impl S4D {
 impl SignalPredictor for S4D {
     #[instrument(skip(self, input))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.input_proj.shape()[0])?;
+
         // Project input to hidden dimension
         let mut hidden = input.dot(&self.input_proj);
 
         // Pass through each layer
+        let dropout_rate = self.config.dropout;
+        let training = self.training;
         for layer in &mut self.layers {
             hidden = layer.forward(&hidden)?;
+            crate::dropout::apply_dropout(&mut hidden, dropout_rate, training);
         }
 
         // Final layer normalization
@@ -877,6 +939,28 @@ mod tests {
         assert_eq!(config.hidden_dim, 256);
         assert_eq!(config.state_dim, 64);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_s4_config_non_diagonal_still_validates_and_builds() {
+        // `use_diagonal = false` is honestly documented as inert (S4DKernel
+        // has no dense/NPLR path) rather than rejected outright: rejecting
+        // it would break `kizzasi-inference::registry`, which sets
+        // `use_diagonal: config.model_type == ModelType::S4D` and therefore
+        // legitimately passes `false` for `ModelType::S4` configs. This just
+        // checks the honest-but-non-breaking contract: validation still
+        // succeeds and a model still builds (with a diagonal kernel
+        // regardless, logged via `tracing::warn!`).
+        let config = S4Config::new()
+            .hidden_dim(32)
+            .state_dim(8)
+            .num_layers(1)
+            .diagonal(false);
+        assert!(config.validate().is_ok());
+        assert!(!config.use_diagonal);
+
+        let model = S4D::new(config);
+        assert!(model.is_ok());
     }
 
     #[test]

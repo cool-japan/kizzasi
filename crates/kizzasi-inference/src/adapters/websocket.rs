@@ -9,7 +9,7 @@ use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
@@ -21,8 +21,10 @@ pub struct WebSocketAdapter {
     /// Streaming engine
     engine: Arc<RwLock<StreamingEngine>>,
 
-    /// Running state
-    running: Arc<RwLock<bool>>,
+    /// Running state, and the signal `stop()` uses to interrupt an in-flight
+    /// `serve()` call blocked on `listener.accept()`. See
+    /// `GrpcAdapter`/`MqttAdapter` for the same pattern.
+    running: watch::Sender<bool>,
 }
 
 impl WebSocketAdapter {
@@ -33,14 +35,15 @@ impl WebSocketAdapter {
     /// * `addr` - Socket address to bind to (e.g., "127.0.0.1:8080")
     /// * `engine` - Streaming inference engine
     pub fn new(addr: impl Into<SocketAddr>, engine: StreamingEngine) -> Self {
+        let (running, _) = watch::channel(false);
         Self {
             addr: addr.into(),
             engine: Arc::new(RwLock::new(engine)),
-            running: Arc::new(RwLock::new(false)),
+            running,
         }
     }
 
-    /// Serve WebSocket connections
+    /// Serve WebSocket connections until [`NetworkAdapter::stop`] is called.
     ///
     /// # Example
     ///
@@ -54,46 +57,61 @@ impl WebSocketAdapter {
             .map_err(|e| InferenceError::NetworkError(e.to_string()))?;
 
         info!("WebSocket server listening on {}", self.addr);
-        *self.running.write().await = true;
+        // `send_replace` (not `send`): `Sender::send` silently no-ops
+        // (returns `Err`, value left unchanged) when there are currently
+        // zero live receivers, which is exactly the case here — the
+        // constructor's initial receiver was dropped and `subscribe()`
+        // below hasn't run yet.
+        let _ = self.running.send_replace(true);
+        let mut shutdown_rx = self.running.subscribe();
 
-        while *self.running.read().await {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    info!("New WebSocket connection from {}", addr);
-                    let engine = Arc::clone(&self.engine);
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, engine).await {
-                            error!("Connection error from {}: {}", addr, e);
-                        }
-                    });
+        loop {
+            tokio::select! {
+                // Bias towards observing shutdown promptly even under a busy
+                // accept loop.
+                biased;
+
+                _ = shutdown_rx.wait_for(|running| !*running) => {
+                    break;
                 }
-                Err(e) => {
-                    error!("Failed to accept connection: {}", e);
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, addr)) => {
+                            info!("New WebSocket connection from {}", addr);
+                            let engine = Arc::clone(&self.engine);
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_connection(stream, engine).await {
+                                    error!("Connection error from {}: {}", addr, e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to accept connection: {}", e);
+                        }
+                    }
                 }
             }
         }
 
+        let _ = self.running.send_replace(false);
+        info!("WebSocket server stopped");
         Ok(())
     }
 }
 
 impl NetworkAdapter for WebSocketAdapter {
-    async fn start(&mut self) -> InferenceResult<()> {
+    async fn start(&self) -> InferenceResult<()> {
         self.serve().await
     }
 
-    async fn stop(&mut self) -> InferenceResult<()> {
-        *self.running.write().await = false;
-        info!("WebSocket server stopped");
+    async fn stop(&self) -> InferenceResult<()> {
+        let _ = self.running.send_replace(false);
+        info!("WebSocket server stop requested");
         Ok(())
     }
 
     fn is_running(&self) -> bool {
-        // Need to block on the async read - this is a limitation of the trait design
-        // In production, you might want to use a different approach
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async { *self.running.read().await })
-        })
+        *self.running.borrow()
     }
 }
 
@@ -122,20 +140,18 @@ async fn handle_connection(
                 let input = request.to_array();
 
                 let engine_guard = engine.write().await;
-                let output = engine_guard
-                    .step_async(input)
+                let outputs = engine_guard
+                    .step_async_with(input, &(&request.config).into())
                     .await
                     .map_err(|e| InferenceError::NetworkError(e.to_string()))?;
+                drop(engine_guard);
 
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                 // Create response
-                let response = InferenceResponse::new(
-                    request.request_id,
-                    output.to_vec(),
-                    latency_ms,
-                    output.len(),
-                );
+                let (output, num_tokens) = super::flatten_outputs(&outputs);
+                let response =
+                    InferenceResponse::new(request.request_id, output, latency_ms, num_tokens);
 
                 // Send response
                 let response_text = serde_json::to_string(&response)
@@ -159,19 +175,17 @@ async fn handle_connection(
                     let input = request.to_array();
 
                     let engine_guard = engine.write().await;
-                    let output = engine_guard
-                        .step_async(input)
+                    let outputs = engine_guard
+                        .step_async_with(input, &(&request.config).into())
                         .await
                         .map_err(|e| InferenceError::NetworkError(e.to_string()))?;
+                    drop(engine_guard);
 
                     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-                    let response = InferenceResponse::new(
-                        request.request_id,
-                        output.to_vec(),
-                        latency_ms,
-                        output.len(),
-                    );
+                    let (output, num_tokens) = super::flatten_outputs(&outputs);
+                    let response =
+                        InferenceResponse::new(request.request_id, output, latency_ms, num_tokens);
 
                     let response_data = rmp_serde::to_vec(&response)
                         .map_err(|e| InferenceError::SerializationError(e.to_string()))?;
@@ -227,6 +241,66 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let adapter = WebSocketAdapter::new(addr, engine);
 
+        assert!(!adapter.is_running());
+    }
+
+    /// `is_running()` must be a plain, panic-free read even on a
+    /// current-thread runtime (the old `block_in_place` implementation
+    /// panicked outside a multi-threaded Tokio context).
+    #[tokio::test]
+    async fn test_is_running_does_not_panic_on_current_thread_runtime() {
+        use crate::streaming::StreamConfig;
+
+        let engine = StreamingEngine::new(StreamConfig::default()).unwrap();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let adapter = WebSocketAdapter::new(addr, engine);
+        assert!(!adapter.is_running());
+    }
+
+    /// Regression: `NetworkAdapter::stop()` used to flip a flag the
+    /// `serve()` accept loop never read (and the loop only re-checked it
+    /// *after* the next `listener.accept()` resolved), so a running server
+    /// kept accepting connections after `stop()` returned `Ok(())`. `start()`
+    /// must now actually resolve promptly after `stop()` is called from a
+    /// different `Arc`-shared handle, with no incoming connection required.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_network_adapter_stop_unblocks_start() {
+        use crate::streaming::StreamConfig;
+        use std::net::TcpListener as StdTcpListener;
+
+        let ephemeral_addr = {
+            let listener =
+                StdTcpListener::bind("127.0.0.1:0").expect("OS should assign a free port");
+            listener.local_addr().expect("local_addr must be set")
+        };
+
+        let engine = StreamingEngine::new(StreamConfig::default()).unwrap();
+        let adapter = Arc::new(WebSocketAdapter::new(ephemeral_addr, engine));
+        let adapter_for_task = adapter.clone();
+        let handle = tokio::spawn(async move { adapter_for_task.start().await });
+
+        // Poll rather than a single fixed sleep: robust against scheduling
+        // jitter when many tests run concurrently.
+        let mut became_running = false;
+        for _ in 0..100 {
+            if adapter.is_running() {
+                became_running = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            became_running,
+            "adapter should report running after start()"
+        );
+
+        adapter.stop().await.expect("stop must succeed");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "start() must resolve promptly after stop(), with no incoming connection needed"
+        );
         assert!(!adapter.is_running());
     }
 

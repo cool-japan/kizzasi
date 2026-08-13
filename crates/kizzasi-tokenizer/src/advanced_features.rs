@@ -406,15 +406,32 @@ impl HierarchicalConfig {
 /// - Fine levels: More bits, capture details
 ///
 /// Allows variable bitrate by using different numbers of levels.
+///
+/// # Training
+///
+/// [`HierarchicalTokenizer::new`] initializes every level's codebook with
+/// Gaussian noise — a real codebook only exists after calling
+/// [`HierarchicalTokenizer::fit`] (or [`HierarchicalTokenizer::set_codebooks`]
+/// with externally-trained codebooks). [`HierarchicalTokenizer::encode_with_levels`]
+/// and [`HierarchicalTokenizer::decode_hierarchical`] both return
+/// [`TokenizerError::InvalidConfig`] until the tokenizer is trained,
+/// mirroring [`crate::KMeansTokenizer`]'s "model not trained" check.
 #[derive(Debug, Clone)]
 pub struct HierarchicalTokenizer {
     config: HierarchicalConfig,
     /// Codebooks for each level (simplified - just centers)
     codebooks: Vec<Array2<f32>>,
+    /// Whether `codebooks` holds trained centers (via `fit`/`set_codebooks`)
+    /// rather than the random initialization `new` seeds them with.
+    trained: bool,
 }
 
 impl HierarchicalTokenizer {
-    /// Create a new hierarchical tokenizer
+    /// Create a new hierarchical tokenizer.
+    ///
+    /// The returned tokenizer is **untrained**: codebooks are random
+    /// Gaussian noise, a placeholder that only fixes each level's shape.
+    /// Call [`HierarchicalTokenizer::fit`] before encoding/decoding.
     pub fn new(embed_dim: usize, config: HierarchicalConfig) -> TokenizerResult<Self> {
         if config.num_levels == 0 {
             return Err(TokenizerError::InvalidConfig(
@@ -428,7 +445,8 @@ impl HierarchicalTokenizer {
             ));
         }
 
-        // Initialize random codebooks for each level
+        // Initialize random codebooks for each level (placeholder shape
+        // only — see `fit`).
         let mut rng = thread_rng();
         let mut codebooks = Vec::with_capacity(config.num_levels);
 
@@ -448,15 +466,257 @@ impl HierarchicalTokenizer {
             codebooks.push(codebook);
         }
 
-        Ok(Self { config, codebooks })
+        Ok(Self {
+            config,
+            codebooks,
+            trained: false,
+        })
+    }
+
+    /// Train every level's codebook via residual k-means.
+    ///
+    /// Level 0's codebook is fit on `data` directly (k-means++ init followed
+    /// by Lloyd iterations); if `config.use_residual` is set, each
+    /// subsequent level is fit on the residual left after subtracting the
+    /// nearest level-0..level-1 codeword from every point — the same
+    /// residual-coding scheme [`HierarchicalTokenizer::encode_with_levels`]
+    /// applies at inference time, so a signal encoded then decoded with the
+    /// resulting codebooks reconstructs the training-set structure it was
+    /// fit on.
+    ///
+    /// # Errors
+    /// Returns an error if `data` is empty, if any point's length doesn't
+    /// match the tokenizer's `embed_dim`, or if any level has fewer data
+    /// points than its configured codebook size.
+    pub fn fit(
+        &mut self,
+        data: &[Array1<f32>],
+        max_iterations: usize,
+        tolerance: f32,
+    ) -> TokenizerResult<()> {
+        if data.is_empty() {
+            return Err(TokenizerError::InvalidConfig(
+                "No training data".to_string(),
+            ));
+        }
+
+        let embed_dim = self.codebooks[0].shape()[1];
+        for (i, point) in data.iter().enumerate() {
+            if point.len() != embed_dim {
+                return Err(TokenizerError::dim_mismatch(
+                    embed_dim,
+                    point.len(),
+                    format!("HierarchicalTokenizer::fit: data[{i}]"),
+                ));
+            }
+        }
+
+        let mut residuals: Vec<Array1<f32>> = data.to_vec();
+        let mut trained_codebooks = Vec::with_capacity(self.config.num_levels);
+
+        for level in 0..self.config.num_levels {
+            let codebook_size = self.config.codebook_sizes[level];
+            if residuals.len() < codebook_size {
+                return Err(TokenizerError::InvalidConfig(format!(
+                    "level {level}: only {} data points for {codebook_size} codes",
+                    residuals.len()
+                )));
+            }
+
+            let codebook = Self::kmeans(&residuals, codebook_size, max_iterations, tolerance);
+
+            if self.config.use_residual && level + 1 < self.config.num_levels {
+                for point in residuals.iter_mut() {
+                    let best = Self::nearest_row(&codebook, point);
+                    let code = codebook.row(best);
+                    for (r, &c) in point.iter_mut().zip(code.iter()) {
+                        *r -= c;
+                    }
+                }
+            }
+
+            trained_codebooks.push(codebook);
+        }
+
+        self.codebooks = trained_codebooks;
+        self.trained = true;
+        Ok(())
+    }
+
+    /// Run k-means (k-means++ initialization + Lloyd iterations) on `data`,
+    /// returning a `[k, dim]` codebook.
+    fn kmeans(
+        data: &[Array1<f32>],
+        k: usize,
+        max_iterations: usize,
+        tolerance: f32,
+    ) -> Array2<f32> {
+        let dim = data[0].len();
+        let n = data.len();
+        let mut rng = thread_rng();
+
+        // k-means++ initialization.
+        let mut centroids = Array2::<f32>::zeros((k, dim));
+        centroids
+            .row_mut(0)
+            .assign(&data[rng.random_range(0..n)].view());
+
+        let mut min_dist = vec![f32::INFINITY; n];
+        for c in 1..k {
+            let prev = centroids.row(c - 1).to_owned();
+            for (i, point) in data.iter().enumerate() {
+                let d: f32 = point
+                    .iter()
+                    .zip(prev.iter())
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum();
+                if d < min_dist[i] {
+                    min_dist[i] = d;
+                }
+            }
+
+            let total: f32 = min_dist.iter().sum();
+            let chosen = if total <= 0.0 {
+                c % n
+            } else {
+                let mut threshold = rng.random::<f32>() * total;
+                let mut picked = n - 1;
+                for (i, &d) in min_dist.iter().enumerate() {
+                    threshold -= d;
+                    if threshold <= 0.0 {
+                        picked = i;
+                        break;
+                    }
+                }
+                picked
+            };
+            centroids.row_mut(c).assign(&data[chosen].view());
+        }
+
+        // Lloyd iterations.
+        for _ in 0..max_iterations {
+            let assignments: Vec<usize> = data
+                .iter()
+                .map(|p| Self::nearest_row(&centroids, p))
+                .collect();
+
+            let mut new_centroids = Array2::<f32>::zeros((k, dim));
+            let mut counts = vec![0usize; k];
+            for (point, &a) in data.iter().zip(assignments.iter()) {
+                for (j, &v) in point.iter().enumerate() {
+                    new_centroids[[a, j]] += v;
+                }
+                counts[a] += 1;
+            }
+            for c in 0..k {
+                if counts[c] > 0 {
+                    for j in 0..dim {
+                        new_centroids[[c, j]] /= counts[c] as f32;
+                    }
+                } else {
+                    // Keep empty clusters at their previous position rather
+                    // than collapsing them to the origin.
+                    for j in 0..dim {
+                        new_centroids[[c, j]] = centroids[[c, j]];
+                    }
+                }
+            }
+
+            let change: f32 = new_centroids
+                .iter()
+                .zip(centroids.iter())
+                .map(|(a, b)| (a - b).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            centroids = new_centroids;
+            if change < tolerance {
+                break;
+            }
+        }
+
+        centroids
+    }
+
+    /// Index of `codebook`'s row nearest to `point` in squared Euclidean distance.
+    fn nearest_row(codebook: &Array2<f32>, point: &Array1<f32>) -> usize {
+        let mut best = 0;
+        let mut best_dist = f32::INFINITY;
+        for (idx, row) in codebook.outer_iter().enumerate() {
+            let dist: f32 = point
+                .iter()
+                .zip(row.iter())
+                .map(|(a, b)| (a - b).powi(2))
+                .sum();
+            if dist < best_dist {
+                best_dist = dist;
+                best = idx;
+            }
+        }
+        best
+    }
+
+    /// Whether the tokenizer has been trained via [`HierarchicalTokenizer::fit`]
+    /// or [`HierarchicalTokenizer::set_codebooks`].
+    pub fn is_trained(&self) -> bool {
+        self.trained
+    }
+
+    /// Read-only access to the per-level codebooks.
+    pub fn codebooks(&self) -> &[Array2<f32>] {
+        &self.codebooks
+    }
+
+    /// Replace the per-level codebooks with externally-trained ones (e.g.
+    /// loaded from disk), marking the tokenizer as trained.
+    ///
+    /// # Errors
+    /// Returns an error unless `codebooks.len() == config.num_levels` and
+    /// every level's shape is `[codebook_sizes[level], embed_dim]` (matching
+    /// the embedding dimension the tokenizer was constructed with).
+    pub fn set_codebooks(&mut self, codebooks: Vec<Array2<f32>>) -> TokenizerResult<()> {
+        if codebooks.len() != self.config.num_levels {
+            return Err(TokenizerError::dim_mismatch(
+                self.config.num_levels,
+                codebooks.len(),
+                "HierarchicalTokenizer::set_codebooks: number of levels",
+            ));
+        }
+
+        let embed_dim = self.codebooks[0].shape()[1];
+        for (level, codebook) in codebooks.iter().enumerate() {
+            let expected = (self.config.codebook_sizes[level], embed_dim);
+            if codebook.shape() != [expected.0, expected.1] {
+                return Err(TokenizerError::InvalidConfig(format!(
+                    "level {level}: expected codebook shape {:?}, got {:?}",
+                    expected,
+                    codebook.shape()
+                )));
+            }
+        }
+
+        self.codebooks = codebooks;
+        self.trained = true;
+        Ok(())
     }
 
     /// Encode using specified number of levels (for variable bitrate)
+    ///
+    /// # Errors
+    /// Returns [`TokenizerError::InvalidConfig`] if the tokenizer has not
+    /// been trained yet (see [`HierarchicalTokenizer::fit`]): encoding
+    /// against the random Gaussian codebooks `new` seeds would be a
+    /// nearest-neighbour match against noise, not a meaningful code.
     pub fn encode_with_levels(
         &self,
         signal: &Array1<f32>,
         num_levels: usize,
     ) -> TokenizerResult<Vec<usize>> {
+        if !self.trained {
+            return Err(TokenizerError::InvalidConfig(
+                "HierarchicalTokenizer not trained: call fit() or set_codebooks() first".into(),
+            ));
+        }
+
         if num_levels > self.config.num_levels {
             return Err(TokenizerError::InvalidConfig(format!(
                 "num_levels {} exceeds configured {}",
@@ -501,7 +761,17 @@ impl HierarchicalTokenizer {
     }
 
     /// Decode from hierarchical indices
+    ///
+    /// # Errors
+    /// Returns [`TokenizerError::InvalidConfig`] if the tokenizer has not
+    /// been trained yet (see [`HierarchicalTokenizer::fit`]).
     pub fn decode_hierarchical(&self, indices: &[usize]) -> TokenizerResult<Array1<f32>> {
+        if !self.trained {
+            return Err(TokenizerError::InvalidConfig(
+                "HierarchicalTokenizer not trained: call fit() or set_codebooks() first".into(),
+            ));
+        }
+
         if indices.is_empty() {
             return Err(TokenizerError::decoding("deserialization", "Empty indices"));
         }
@@ -517,7 +787,16 @@ impl HierarchicalTokenizer {
             ));
         }
 
-        // Get first level codebook entry
+        // Get first level codebook entry. `ndarray::Array2::row` panics on
+        // an out-of-range row, and `indices[0]` can come from a model's
+        // argmax or from deserialized data — bounds-check it the same way
+        // every subsequent level already is below.
+        if indices[0] >= self.codebooks[0].shape()[0] {
+            return Err(TokenizerError::decoding(
+                "decoding",
+                format!("Invalid index {} at level 0", indices[0]),
+            ));
+        }
         let first_code = self.codebooks[0].row(indices[0]);
         let mut result = first_code.to_owned();
 
@@ -609,7 +888,15 @@ mod tests {
     #[test]
     fn test_hierarchical_tokenizer() {
         let config = HierarchicalConfig::exponential(256, 3, 0.5);
-        let tokenizer = HierarchicalTokenizer::new(8, config).unwrap();
+        let mut tokenizer = HierarchicalTokenizer::new(8, config).unwrap();
+
+        // Level 0 needs a codebook of size 256, so training needs at least
+        // that many 8-dimensional points.
+        let training_data: Vec<Array1<f32>> = (0..300)
+            .map(|i| Array1::from_vec((0..8).map(|j| ((i * 8 + j) as f32 * 0.013).sin()).collect()))
+            .collect();
+        tokenizer.fit(&training_data, 10, 1e-3).unwrap();
+        assert!(tokenizer.is_trained());
 
         let signal = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
 
@@ -625,6 +912,66 @@ mod tests {
         // Decode and check dimension preservation
         let decoded = tokenizer.decode_hierarchical(&indices3).unwrap();
         assert_eq!(decoded.len(), signal.len());
+    }
+
+    /// Regression: `HierarchicalTokenizer::new` seeds every codebook with
+    /// random Gaussian noise, not a trained model. `encode_with_levels`/
+    /// `decode_hierarchical` must reject use before `fit`/`set_codebooks`,
+    /// mirroring `KMeansTokenizer::encode`'s "model not trained" check,
+    /// rather than silently nearest-neighbour-matching against noise.
+    #[test]
+    fn test_hierarchical_tokenizer_untrained_error() {
+        let config = HierarchicalConfig::exponential(16, 2, 0.5);
+        let tokenizer = HierarchicalTokenizer::new(4, config).unwrap();
+        assert!(!tokenizer.is_trained());
+
+        let signal = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(tokenizer.encode_with_levels(&signal, 1).is_err());
+        assert!(tokenizer.decode_hierarchical(&[0]).is_err());
+    }
+
+    /// Regression: `fit` must actually move the codebooks away from their
+    /// random Gaussian initialization towards the training data, and
+    /// `set_codebooks` must validate shapes before accepting externally
+    /// supplied codebooks.
+    #[test]
+    fn test_hierarchical_tokenizer_fit_changes_codebooks_and_set_codebooks_validates() {
+        let config = HierarchicalConfig {
+            num_levels: 1,
+            codebook_sizes: vec![4],
+            use_residual: false,
+        };
+        let mut tokenizer = HierarchicalTokenizer::new(2, config).unwrap();
+        let codebook_before = tokenizer.codebooks()[0].clone();
+
+        // Tightly clustered training data far from the ~N(0,1) random init.
+        let training_data: Vec<Array1<f32>> = (0..40)
+            .map(|i| Array1::from_vec(vec![100.0 + (i % 4) as f32, 100.0 + (i % 4) as f32]))
+            .collect();
+        tokenizer.fit(&training_data, 20, 1e-4).unwrap();
+        assert!(tokenizer.is_trained());
+
+        let codebook_after = &tokenizer.codebooks()[0];
+        for (before, after) in codebook_before.iter().zip(codebook_after.iter()) {
+            assert!(
+                (after - before).abs() > 10.0,
+                "fit should move codebook entries towards the training data (100+), \
+                 before={before}, after={after}"
+            );
+            assert!(
+                *after > 50.0,
+                "codebook entry {after} should track training data near 100"
+            );
+        }
+
+        // set_codebooks: wrong number of levels.
+        assert!(tokenizer.set_codebooks(vec![]).is_err());
+        // set_codebooks: wrong shape (codebook_size 3 != configured 4).
+        assert!(tokenizer
+            .set_codebooks(vec![Array2::zeros((3, 2))])
+            .is_err());
+        // set_codebooks: correct shape.
+        assert!(tokenizer.set_codebooks(vec![Array2::zeros((4, 2))]).is_ok());
     }
 
     #[test]

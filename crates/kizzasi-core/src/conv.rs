@@ -64,29 +64,95 @@ impl CausalConv1d {
         }
     }
 
-    /// Set weights from external source
+    /// Set weights from external source.
+    ///
+    /// # Panics
+    /// Panics if `weights` does not match `[out_channels, in_channels,
+    /// kernel_size]`. `set_weights` is the crate's established (and
+    /// externally-used) infallible API; use [`Self::set_weights_checked`]
+    /// for a non-panicking variant that returns
+    /// [`CoreError::DimensionMismatch`] instead.
     pub fn set_weights(&mut self, weights: Vec<Vec<Vec<f32>>>) {
-        assert_eq!(weights.len(), self.out_channels);
+        self.set_weights_checked(weights)
+            .unwrap_or_else(|e| panic!("CausalConv1d::set_weights: {e}"));
+    }
+
+    /// Set weights from external source, returning
+    /// [`CoreError::DimensionMismatch`] on a shape mismatch instead of
+    /// panicking.
+    pub fn set_weights_checked(&mut self, weights: Vec<Vec<Vec<f32>>>) -> CoreResult<()> {
+        if weights.len() != self.out_channels {
+            return Err(CoreError::DimensionMismatch {
+                expected: self.out_channels,
+                got: weights.len(),
+            });
+        }
         for oc in &weights {
-            assert_eq!(oc.len(), self.in_channels);
+            if oc.len() != self.in_channels {
+                return Err(CoreError::DimensionMismatch {
+                    expected: self.in_channels,
+                    got: oc.len(),
+                });
+            }
             for ic in oc {
-                assert_eq!(ic.len(), self.kernel_size);
+                if ic.len() != self.kernel_size {
+                    return Err(CoreError::DimensionMismatch {
+                        expected: self.kernel_size,
+                        got: ic.len(),
+                    });
+                }
             }
         }
         self.weights = weights;
+        Ok(())
     }
 
-    /// Set bias from external source
-    pub fn set_bias(&mut self, bias: Vec<f32>) {
-        assert_eq!(bias.len(), self.out_channels);
-        self.bias = bias;
-    }
-
-    /// Forward pass for a single time step (streaming/causal)
+    /// Set bias from external source.
     ///
-    /// Takes input of shape `[in_channels]` and returns output of shape `[out_channels]`
+    /// # Panics
+    /// Panics if `bias.len() != out_channels`. Use [`Self::set_bias_checked`]
+    /// for a non-panicking variant.
+    pub fn set_bias(&mut self, bias: Vec<f32>) {
+        self.set_bias_checked(bias)
+            .unwrap_or_else(|e| panic!("CausalConv1d::set_bias: {e}"));
+    }
+
+    /// Set bias from external source, returning
+    /// [`CoreError::DimensionMismatch`] on a length mismatch instead of
+    /// panicking.
+    pub fn set_bias_checked(&mut self, bias: Vec<f32>) -> CoreResult<()> {
+        if bias.len() != self.out_channels {
+            return Err(CoreError::DimensionMismatch {
+                expected: self.out_channels,
+                got: bias.len(),
+            });
+        }
+        self.bias = bias;
+        Ok(())
+    }
+
+    /// Forward pass for a single time step (streaming/causal).
+    ///
+    /// Takes input of shape `[in_channels]` and returns output of shape `[out_channels]`.
+    ///
+    /// # Panics
+    /// Panics if `input.len() != in_channels`. Use
+    /// [`Self::forward_step_checked`] for a non-panicking variant.
     pub fn forward_step(&mut self, input: &[f32]) -> Vec<f32> {
-        assert_eq!(input.len(), self.in_channels);
+        self.forward_step_checked(input)
+            .unwrap_or_else(|e| panic!("CausalConv1d::forward_step: {e}"))
+    }
+
+    /// Forward pass for a single time step, returning
+    /// [`CoreError::DimensionMismatch`] if `input.len() != in_channels`
+    /// instead of panicking.
+    pub fn forward_step_checked(&mut self, input: &[f32]) -> CoreResult<Vec<f32>> {
+        if input.len() != self.in_channels {
+            return Err(CoreError::DimensionMismatch {
+                expected: self.in_channels,
+                got: input.len(),
+            });
+        }
 
         // Add current input to history
         self.history.push(input.to_vec());
@@ -112,7 +178,7 @@ impl CausalConv1d {
             }
         }
 
-        output
+        Ok(output)
     }
 
     /// Forward pass for a batch of time steps
@@ -229,24 +295,80 @@ impl DepthwiseCausalConv1d {
         }
     }
 
-    /// Set weights
+    /// Set weights.
+    ///
+    /// # Panics
+    /// Panics if `weights` does not match `[channels, kernel_size]`. Use
+    /// [`Self::set_weights_checked`] for a non-panicking variant.
     pub fn set_weights(&mut self, weights: Vec<Vec<f32>>) {
-        assert_eq!(weights.len(), self.channels);
+        self.set_weights_checked(weights)
+            .unwrap_or_else(|e| panic!("DepthwiseCausalConv1d::set_weights: {e}"));
+    }
+
+    /// Set weights, returning [`CoreError::DimensionMismatch`] on a shape
+    /// mismatch instead of panicking.
+    pub fn set_weights_checked(&mut self, weights: Vec<Vec<f32>>) -> CoreResult<()> {
+        if weights.len() != self.channels {
+            return Err(CoreError::DimensionMismatch {
+                expected: self.channels,
+                got: weights.len(),
+            });
+        }
         for w in &weights {
-            assert_eq!(w.len(), self.kernel_size);
+            if w.len() != self.kernel_size {
+                return Err(CoreError::DimensionMismatch {
+                    expected: self.kernel_size,
+                    got: w.len(),
+                });
+            }
         }
         self.weights = weights;
+        Ok(())
     }
 
-    /// Set bias
+    /// Set bias.
+    ///
+    /// # Panics
+    /// Panics if `bias.len() != channels`. Use [`Self::set_bias_checked`]
+    /// for a non-panicking variant.
     pub fn set_bias(&mut self, bias: Vec<f32>) {
-        assert_eq!(bias.len(), self.channels);
-        self.bias = bias;
+        self.set_bias_checked(bias)
+            .unwrap_or_else(|e| panic!("DepthwiseCausalConv1d::set_bias: {e}"));
     }
 
-    /// Forward pass for single time step
+    /// Set bias, returning [`CoreError::DimensionMismatch`] on a length
+    /// mismatch instead of panicking.
+    pub fn set_bias_checked(&mut self, bias: Vec<f32>) -> CoreResult<()> {
+        if bias.len() != self.channels {
+            return Err(CoreError::DimensionMismatch {
+                expected: self.channels,
+                got: bias.len(),
+            });
+        }
+        self.bias = bias;
+        Ok(())
+    }
+
+    /// Forward pass for single time step.
+    ///
+    /// # Panics
+    /// Panics if `input.len() != channels`. Use
+    /// [`Self::forward_step_checked`] for a non-panicking variant.
     pub fn forward_step(&mut self, input: &[f32]) -> Vec<f32> {
-        assert_eq!(input.len(), self.channels);
+        self.forward_step_checked(input)
+            .unwrap_or_else(|e| panic!("DepthwiseCausalConv1d::forward_step: {e}"))
+    }
+
+    /// Forward pass for single time step, returning
+    /// [`CoreError::DimensionMismatch`] if `input.len() != channels` instead
+    /// of panicking.
+    pub fn forward_step_checked(&mut self, input: &[f32]) -> CoreResult<Vec<f32>> {
+        if input.len() != self.channels {
+            return Err(CoreError::DimensionMismatch {
+                expected: self.channels,
+                got: input.len(),
+            });
+        }
 
         self.history.push(input.to_vec());
         while self.history.len() > self.kernel_size {
@@ -264,14 +386,24 @@ impl DepthwiseCausalConv1d {
             }
         }
 
-        output
+        Ok(output)
     }
 
-    /// Forward for Array1
+    /// Forward for Array1.
+    ///
+    /// # Panics
+    /// Panics if `input.len() != channels`. Handles non-contiguous `input`
+    /// views correctly (via `ArrayBase::as_standard_layout`) rather than
+    /// assuming contiguity.
     pub fn forward(&mut self, input: &Array1<f32>) -> Array1<f32> {
-        Array1::from_vec(
-            self.forward_step(input.as_slice().expect("invariant: Array1 is contiguous")),
-        )
+        // Copy through `as_standard_layout()` -> `.iter()` instead of the
+        // previous `input.as_slice().expect("invariant: Array1 is
+        // contiguous")`: that "invariant" does not actually hold for a
+        // caller, since a non-contiguous owned `Array1` (e.g. produced by
+        // `slice_move(s![..;2])`) makes `as_slice()` return `None` and
+        // panic. Iterating handles any layout without assuming contiguity.
+        let contiguous: Vec<f32> = input.as_standard_layout().iter().copied().collect();
+        Array1::from_vec(self.forward_step(&contiguous))
     }
 
     /// Forward pass for batch
@@ -364,9 +496,19 @@ impl ShortConv {
         self.conv.reset();
     }
 
-    /// Set weights
+    /// Set weights.
+    ///
+    /// # Panics
+    /// Panics if `weights` does not match `[channels, kernel_size]`. Use
+    /// [`Self::set_weights_checked`] for a non-panicking variant.
     pub fn set_weights(&mut self, weights: Vec<Vec<f32>>) {
         self.conv.set_weights(weights);
+    }
+
+    /// Set weights, returning [`CoreError::DimensionMismatch`] on a shape
+    /// mismatch instead of panicking.
+    pub fn set_weights_checked(&mut self, weights: Vec<Vec<f32>>) -> CoreResult<()> {
+        self.conv.set_weights_checked(weights)
     }
 
     /// Get channels
@@ -423,9 +565,26 @@ impl DilatedCausalConv1d {
         }
     }
 
-    /// Forward pass for single time step
+    /// Forward pass for single time step.
+    ///
+    /// # Panics
+    /// Panics if `input.len() != channels`. Use
+    /// [`Self::forward_step_checked`] for a non-panicking variant.
     pub fn forward_step(&mut self, input: &[f32]) -> Vec<f32> {
-        assert_eq!(input.len(), self.channels);
+        self.forward_step_checked(input)
+            .unwrap_or_else(|e| panic!("DilatedCausalConv1d::forward_step: {e}"))
+    }
+
+    /// Forward pass for single time step, returning
+    /// [`CoreError::DimensionMismatch`] if `input.len() != channels` instead
+    /// of panicking.
+    pub fn forward_step_checked(&mut self, input: &[f32]) -> CoreResult<Vec<f32>> {
+        if input.len() != self.channels {
+            return Err(CoreError::DimensionMismatch {
+                expected: self.channels,
+                got: input.len(),
+            });
+        }
 
         self.history.push(input.to_vec());
         let effective_size = (self.kernel_size - 1) * self.dilation;
@@ -446,14 +605,20 @@ impl DilatedCausalConv1d {
             }
         }
 
-        output
+        Ok(output)
     }
 
-    /// Forward for Array1
+    /// Forward for Array1.
+    ///
+    /// # Panics
+    /// Panics if `input.len() != channels`. Handles non-contiguous `input`
+    /// views correctly (via `ArrayBase::as_standard_layout`) rather than
+    /// assuming contiguity.
     pub fn forward(&mut self, input: &Array1<f32>) -> Array1<f32> {
-        Array1::from_vec(
-            self.forward_step(input.as_slice().expect("invariant: Array1 is contiguous")),
-        )
+        // See `DepthwiseCausalConv1d::forward` for why this does not use
+        // `input.as_slice().expect(...)`.
+        let contiguous: Vec<f32> = input.as_standard_layout().iter().copied().collect();
+        Array1::from_vec(self.forward_step(&contiguous))
     }
 
     /// Reset history
@@ -762,5 +927,114 @@ mod tests {
 
         let wrong_width = vec![vec![0.0; 9]; 2];
         assert!(conv.set_history(wrong_width).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests: checked (non-panicking) variants and non-contiguous
+    // `forward()` input.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_causal_conv1d_checked_methods_reject_bad_dimensions() {
+        let mut conv = CausalConv1d::new(2, 3, 3); // in=2, out=3, kernel=3
+
+        // set_weights_checked: wrong out_channels count.
+        assert!(conv
+            .set_weights_checked(vec![vec![vec![0.0; 3]; 2]; 5])
+            .is_err());
+        // set_weights_checked: wrong in_channels count (inner Vec length).
+        assert!(conv
+            .set_weights_checked(vec![vec![vec![0.0; 3]; 7]; 3])
+            .is_err());
+        // set_weights_checked: wrong kernel_size (innermost Vec length).
+        assert!(conv
+            .set_weights_checked(vec![vec![vec![0.0; 9]; 2]; 3])
+            .is_err());
+        // Valid shape must succeed.
+        assert!(conv
+            .set_weights_checked(vec![vec![vec![0.1; 3]; 2]; 3])
+            .is_ok());
+
+        // set_bias_checked: wrong length.
+        assert!(conv.set_bias_checked(vec![0.0; 7]).is_err());
+        assert!(conv.set_bias_checked(vec![0.0; 3]).is_ok());
+
+        // forward_step_checked: wrong input length.
+        assert!(conv.forward_step_checked(&[1.0, 2.0, 3.0]).is_err());
+        assert!(conv.forward_step_checked(&[1.0, 2.0]).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "Dimension mismatch")]
+    fn test_causal_conv1d_set_weights_still_panics_on_bad_shape() {
+        // The infallible `set_weights` API is kept (external crates already
+        // call it), but must still reject bad input loudly rather than
+        // silently accepting a malformed shape.
+        let mut conv = CausalConv1d::new(2, 3, 3);
+        conv.set_weights(vec![vec![vec![0.0; 3]; 2]; 999]);
+    }
+
+    #[test]
+    fn test_depthwise_conv1d_checked_methods_reject_bad_dimensions() {
+        let mut conv = DepthwiseCausalConv1d::new(4, 3);
+
+        assert!(conv.set_weights_checked(vec![vec![0.0; 3]; 9]).is_err());
+        assert!(conv.set_weights_checked(vec![vec![0.0; 9]; 4]).is_err());
+        assert!(conv.set_weights_checked(vec![vec![0.1; 3]; 4]).is_ok());
+
+        assert!(conv.set_bias_checked(vec![0.0; 9]).is_err());
+        assert!(conv.set_bias_checked(vec![0.0; 4]).is_ok());
+
+        assert!(conv.forward_step_checked(&[1.0, 2.0]).is_err());
+        assert!(conv.forward_step_checked(&[1.0, 2.0, 3.0, 4.0]).is_ok());
+    }
+
+    #[test]
+    fn test_depthwise_forward_handles_non_contiguous_array1() {
+        // Regression: `forward()` used to do
+        // `input.as_slice().expect("invariant: Array1 is contiguous")`,
+        // which panics for a non-contiguous owned `Array1` -- an invariant
+        // that does NOT actually hold for arbitrary callers.
+        let mut conv = DepthwiseCausalConv1d::new(3, 2);
+
+        // Build a genuinely non-contiguous owned Array1 by slicing with a
+        // stride and then materialising it back as an owned array via
+        // `to_owned()` on the strided view -- `slice` on an Array1 keeps the
+        // stride, so `.to_owned()` here still yields distinct data but we
+        // instead construct non-contiguity directly via `slice_move`.
+        let source = Array1::from_vec(vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0]);
+        let strided = source.slice_move(scirs2_core::ndarray::s![..;2]); // [1.0, 2.0, 3.0], stride 2
+        assert!(
+            strided.as_slice().is_none(),
+            "test precondition: input must be non-contiguous"
+        );
+        assert_eq!(strided.len(), 3);
+
+        // Must not panic, and must process the actual (strided) values.
+        let out = conv.forward(&strided);
+        assert_eq!(out.len(), 3);
+
+        // Cross-check against the equivalent contiguous input.
+        let mut conv_ref = DepthwiseCausalConv1d::new(3, 2);
+        conv_ref.set_weights(conv.weights.clone());
+        conv_ref.set_bias(conv.bias.clone());
+        let contiguous = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+        let out_ref = conv_ref.forward(&contiguous);
+
+        for i in 0..3 {
+            assert!(
+                (out[i] - out_ref[i]).abs() < 1e-6,
+                "index {i}: strided-input forward {} != contiguous-input forward {}",
+                out[i],
+                out_ref[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_dilated_conv1d_checked_forward_step_rejects_bad_length() {
+        let mut conv = DilatedCausalConv1d::new(4, 3, 2);
+        assert!(conv.forward_step_checked(&[1.0, 2.0]).is_err());
+        assert!(conv.forward_step_checked(&[1.0, 2.0, 3.0, 4.0]).is_ok());
     }
 }

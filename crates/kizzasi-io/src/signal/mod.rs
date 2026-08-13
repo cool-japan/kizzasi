@@ -8,7 +8,9 @@
 //! - Blind source separation (FastICA, NMF, PCA, Temporal decorrelation)
 //! - Multi-channel beamforming (Delay-and-Sum, MVDR, adaptive)
 //! - Hilbert-Huang Transform (EMD, EEMD, instantaneous frequency)
-//! - Signal quality metrics (PESQ, STOI, POLQA, MOS prediction)
+//! - Signal quality metrics (SNR, STOI, MOS prediction, plus PESQ- and
+//!   POLQA-*inspired* scores that are explicitly not ITU-T conformant --
+//!   see [`quality`] for the conformance status of each type)
 //! - Wavelet transforms
 //! - Resampling and sample rate conversion
 //! - Spectral analysis (FFT, spectrograms, MFCCs)

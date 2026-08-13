@@ -17,8 +17,10 @@
 //! The implementation is split across:
 //! - [`training_core`](super::training_core): SchedulerType, MixedPrecision,
 //!   TrainingConfig, TrainableSSM
-//! - [`training_loop`](super::training_loop): ConstraintLoss, Loss, Trainer,
-//!   CheckpointMetadata
+//! - [`training_loop`](super::training_loop): ConstraintLoss, Loss, Trainer
+//! - [`training_checkpoint`](super::training_checkpoint): CheckpointMetadata and
+//!   the `Trainer` checkpoint save/load methods
 
+pub use crate::training_checkpoint::CheckpointMetadata;
 pub use crate::training_core::{MixedPrecision, SchedulerType, TrainableSSM, TrainingConfig};
-pub use crate::training_loop::{CheckpointMetadata, ConstraintLoss, Loss, Trainer};
+pub use crate::training_loop::{ConstraintLoss, Loss, Trainer};

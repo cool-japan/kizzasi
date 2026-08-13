@@ -2,12 +2,35 @@
 //!
 //! Weight provenance: when BS.1387-1 Annex 2 Tables B.11/B.12 are obtained
 //! from the ITU standards document (paid), set `WEIGHTS_VERIFIED = true` and
-//! replace the placeholder constants. Until then, a seeded-Gaussian placeholder
-//! is used. ODG/DI values produced with `WEIGHTS_VERIFIED = false` should be
-//! treated as qualitative trend indicators, not certified PEAQ scores.
+//! replace the placeholder constants. Until then, a seeded-LCG placeholder
+//! is used.
+//!
+//! With placeholder weights the mapping from MOVs to DI is arbitrary: it is
+//! **not** a weakened or uncalibrated version of the real one, and DI/ODG are
+//! not usable even as qualitative trend indicators — the placeholder output
+//! weights can, and in practice do, carry the wrong sign for a given MOV, so
+//! ODG can *rise* as a signal gets more degraded. Callers must compare
+//! [`crate::peaq::PeaqResult::movs`], which are fully implemented, rather
+//! than DI or ODG, until real weights are installed.
+//!
+//! The output neuron is linear (not sigmoid): [`di_to_odg`] already applies
+//! its own sigmoid to map DI onto `[-3.98, 0.22]`, so a sigmoid here too
+//! would compose two saturating functions and confine DI — and therefore
+//! ODG — to a narrow band regardless of the weights, making
+//! [`crate::peaq::OdgGrade::Imperceptible`] and
+//! [`crate::peaq::OdgGrade::VeryAnnoying`] structurally unreachable no
+//! matter what the weights are (see `test_full_odg_range_is_reachable`
+//! below). This is a distinct issue from the wrong-sign placeholder weights
+//! above: removing the composed sigmoid restores the *range* DI/ODG can
+//! reach, but does not fix the *ordering* (which needs real weights) — a
+//! sigmoid is monotonic, so it cannot flip which direction ODG moves.
 
 /// `true` once the BS.1387-1 Annex 2 Table B.11/B.12 weights are sourced
 /// and verified against the paid ITU standards document.
+///
+/// While this is `false`, [`PeaqNeuralNet::infer`] runs on placeholder weights
+/// and its output does not rank signals by quality — see the module
+/// documentation.
 pub const WEIGHTS_VERIFIED: bool = false;
 
 // [amin, amax] per MOV — normalize to [0,1] via (x - amin) / (amax - amin)
@@ -91,15 +114,17 @@ impl PeaqNeuralNet {
             sigmoid(z)
         });
 
-        // Output neuron (sigmoid activation → DI)
-        let z_out: f32 = self
-            .w_out
+        // Output neuron: linear, *not* sigmoid. `di_to_odg` below applies
+        // its own sigmoid to map DI onto the [-3.98, 0.22] ODG range; a
+        // sigmoid here as well would compose two saturating functions,
+        // confining DI (and therefore ODG) to a narrow band regardless of
+        // the weights — see the module documentation.
+        self.w_out
             .iter()
             .zip(hidden.iter())
             .map(|(w, h)| w * h)
             .sum::<f32>()
-            + self.b_out;
-        sigmoid(z_out)
+            + self.b_out
     }
 }
 
@@ -129,6 +154,7 @@ pub fn di_to_odg(di: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peaq::OdgGrade;
 
     #[test]
     fn test_di_to_odg_monotonically_increasing() {
@@ -190,9 +216,60 @@ mod tests {
             "DI should be finite for max inputs, got {di_max}"
         );
 
-        // Sigmoid output is always in (0, 1)
-        assert!(di_min > 0.0 && di_min < 1.0);
-        assert!(di_max > 0.0 && di_max < 1.0);
+        // Regression: DI is no longer sigmoid-bounded to (0, 1) — the output
+        // neuron is linear (see the module documentation). This test used to
+        // assert `di_min > 0.0 && di_min < 1.0`, which was really asserting
+        // the composed-sigmoid range-restriction bug, not a real invariant:
+        // DI is a hidden-to-output linear combination and can legitimately
+        // be negative or exceed 1.0 for other MOV inputs / other weights
+        // (see `test_full_odg_range_is_reachable` below).
+    }
+
+    /// Regression: with the old composed-sigmoid output, `Imperceptible`
+    /// (ODG near 0) and `VeryAnnoying` (ODG near -4) were structurally
+    /// unreachable — sigmoid(sigmoid(x)) confines DI to a narrow band around
+    /// 0.5 for *any* weights, not just the current placeholder ones. With a
+    /// linear output neuron, suitable weights can reach the full range.
+    ///
+    /// This constructs `PeaqNeuralNet` directly with hand-picked `w_out`/
+    /// `b_out` (this submodule can see private fields) specifically to
+    /// isolate the *structural* fix from the *placeholder-weight-quality*
+    /// issue documented at the top of this module: the seeded-LCG weights
+    /// stay small and wrong-signed regardless, so this cannot be
+    /// demonstrated with `PeaqNeuralNet::new()`.
+    #[test]
+    fn test_full_odg_range_is_reachable() {
+        let movs: [f32; 11] = [
+            8000.0, 7500.0, 10.0, 5.0, 5.0, 0.2, 10.0, 10.0, 0.5, 0.3, 0.1,
+        ];
+
+        let high_quality = PeaqNeuralNet {
+            w_hidden: [[0.0; 11]; 3],
+            b_hidden: [0.0; 3],
+            w_out: [10.0, 10.0, 10.0],
+            b_out: 0.0,
+        };
+        let di_high = high_quality.infer(&movs);
+        let odg_high = di_to_odg(di_high);
+        assert_eq!(
+            OdgGrade::from_odg(odg_high),
+            OdgGrade::Imperceptible,
+            "a large positive DI must reach Imperceptible (got di={di_high}, odg={odg_high})"
+        );
+
+        let low_quality = PeaqNeuralNet {
+            w_hidden: [[0.0; 11]; 3],
+            b_hidden: [0.0; 3],
+            w_out: [-10.0, -10.0, -10.0],
+            b_out: 0.0,
+        };
+        let di_low = low_quality.infer(&movs);
+        let odg_low = di_to_odg(di_low);
+        assert_eq!(
+            OdgGrade::from_odg(odg_low),
+            OdgGrade::VeryAnnoying,
+            "a large negative DI must reach VeryAnnoying (got di={di_low}, odg={odg_low})"
+        );
     }
 
     #[test]

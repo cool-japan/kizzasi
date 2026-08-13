@@ -48,6 +48,9 @@ mod sampling;
 mod speculative;
 pub mod temporal;
 
+#[cfg(test)]
+mod testutil;
+
 #[cfg(feature = "async")]
 mod hotswap;
 
@@ -65,7 +68,8 @@ pub mod adapters;
 pub mod versioning;
 
 pub use batch::{
-    BatchConfig, BatchRequest, BatchResponse, BatchScheduler, Priority, SchedulerStats,
+    BatchConfig, BatchRequest, BatchResponse, BatchScheduler, CompletedRequest, Priority,
+    SchedulerStats,
 };
 pub use checkpoint::{Checkpoint, CheckpointManager, CheckpointMetadata};
 pub use compression::{CompressedState, CompressionMethod, StateCompressor};

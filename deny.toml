@@ -183,16 +183,63 @@ deny = [
     { name = "z3-sys" },
     { name = "rusqlite" },
     { name = "libsqlite3-sys" },
-    # zip is banned everywhere else, but candle-core (kizzasi's neural tensor
+    # Pure-Rust TLS via the RustCrypto rustls provider
+    # (`oxitls-rustcrypto-provider`, injected explicitly by kizzasi-io's
+    # `mqtt-tls` feature -- see `mqtt.rs`). These are the crypto backends
+    # that would otherwise compile C/assembly: aws-lc-rs/aws-lc-sys build
+    # the AWS-LC C/assembly library, and `ring` builds its own C/assembly
+    # core. Scope note: `cargo deny check bans` inspects the default-feature
+    # graph (`[graph] all-features = false` above), which is what this ban
+    # actually covers. kizzasi-model's opt-in `hf-hub` feature still pulls
+    # aws-lc-rs/aws-lc-sys transitively through reqwest's `rustls` feature
+    # when explicitly enabled -- that is a separate, already-documented
+    # trade-off (see kizzasi-model's Cargo.toml and the root README's
+    # impure-features table), not something this ban reaches into a
+    # non-default graph to police.
+    { name = "aws-lc-sys" },
+    { name = "aws-lc-rs" },
+    { name = "ring" },
+    # zip is banned everywhere else, but oxicandle-core (kizzasi's neural tensor
     # backend since v0.1.0) has a mandatory, non-optional `[dependencies.zip]`
     # entry used for .npy/pickle checkpoint I/O (candle-core/src/npy.rs,
-    # pickle.rs). candle-core itself builds with default-features = false,
-    # features = [] in this workspace, so there is no configuration lever
-    # within kizzasi's control to remove this transitive dependency.
+    # pickle.rs). It builds with default-features = false, features = [] in this
+    # workspace, so there is no configuration lever within kizzasi's control to
+    # remove this transitive dependency.
     # `cargo tree -e normal -i zip` (with and without --all-features) shows
-    # candle-core as the sole direct parent of zip in this workspace, so
+    # oxicandle-core as the sole direct parent of zip in this workspace, so
     # scoping the exemption to that one wrapper does not widen the ban.
-    { name = "zip", wrappers = ["candle-core"] },
+    #
+    # NOTE: the wrapper name is the RENAMED package. cargo-deny matches on
+    # package name, so leaving this as "candle-core" after the switch to the
+    # oxicandle fork would silently stop matching and fail the gate on zip.
+    { name = "zip", wrappers = ["oxicandle-core"] },
+    # The onig story (Oniguruma, a C library pulled in via tokenizers's `onig`
+    # feature) is resolved at the source rather than exempted: kizzasi depends
+    # on `oxicandle-core` / `oxicandle-nn`, the COOLJAPAN fork of candle 0.11.0
+    # (~/work/oxicandle, published to crates.io under those names), which selects
+    # tokenizers's `fancy-regex` feature instead of `onig` -- upstream candle PR
+    # #3790. Neither `onig` nor `onig_sys` appears anywhere in this workspace's
+    # dependency graph any more.
+    #
+    # These are plain bans rather than wrapper-scoped exemptions like `zip`
+    # above: either one reappearing (an oxicandle rebase that loses the change,
+    # a revert to upstream candle-*, or a new dependency pulling Oniguruma
+    # directly) fails the build immediately instead of being silently allowed
+    # through a stale wrapper entry.
+    #
+    # This replaces an earlier `[patch.crates-io]` arrangement whose fix applied
+    # only inside this workspace: `[patch]` does not propagate to crates.io, so
+    # consumers of a published kizzasi crate still compiled onig. A renamed fork
+    # is what actually reaches them. Verify against the PUBLISHED crate, outside
+    # this workspace -- `cargo deny` here cannot prove the downstream property:
+    #   cargo new /tmp/kz-consumer && cd /tmp/kz-consumer
+    #   cargo add kizzasi-core && cargo tree -i onig   # must find no packages
+    { name = "onig" },
+    { name = "onig_sys" },
+    # HDF5 moved to the pure-Rust `oxih5`; the libhdf5-binding crates must not
+    # come back.
+    { name = "hdf5" },
+    { name = "hdf5-sys" },
     { name = "flate2" },
     { name = "zstd" },
     { name = "zstd-sys" },

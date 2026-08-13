@@ -198,7 +198,7 @@ fn test_dct_zero_signal_stable() {
 #[test]
 fn test_fourier_round_trip_non_unit_scale() {
     // FourierTokenizer stores raw FFT coefficients (no quantization), so
-    // scale is inherently preserved.  Verify the basic round-trip is correct.
+    // scale is inherently preserved. Verify the basic round-trip is correct.
     let config = FourierConfig {
         bits: 8,
         num_bins: 8,
@@ -211,11 +211,14 @@ fn test_fourier_round_trip_non_unit_scale() {
     let encoded = tokenizer.encode(&signal).expect("encode failed");
     let decoded = tokenizer.decode(&encoded).expect("decode failed");
 
-    // Fourier returns raw floats — no header needed.
-    assert_eq!(encoded.len(), num_bins * 2); // real + imag per bin
-    assert!(
-        !decoded.is_empty(),
-        "Fourier decoded output must be non-empty"
+    // token[0] is the original-length header `decode` needs to run the
+    // inverse transform at the right size (see `FourierTokenizer::encode`'s
+    // docs); tokens[1..] are the real + imag pair per bin.
+    assert_eq!(encoded.len(), 1 + num_bins * 2);
+    assert_eq!(
+        decoded.len(),
+        signal.len(),
+        "decode must reconstruct the original signal length, not num_bins"
     );
     assert!(
         decoded.iter().all(|x| x.is_finite()),
@@ -238,8 +241,14 @@ fn test_fourier_magnitude_only_scale_sensitivity() {
     let encoded_1 = tokenizer.encode(&signal_1).expect("encode 1");
     let encoded_4 = tokenizer.encode(&signal_4).expect("encode 4");
 
+    // token[0] is the length header (constant across both signals, since
+    // both are length 64); tokens[1..] are the magnitudes, the first of
+    // which should scale with the signal.
+    assert_eq!(encoded_1[0], 64.0);
+    assert_eq!(encoded_4[0], 64.0);
+
     // Magnitudes of a 4× scaled signal should be ≈ 4× larger.
-    let ratio = encoded_4[0] / encoded_1[0];
+    let ratio = encoded_4[1] / encoded_1[1];
     assert!(
         (ratio - 4.0).abs() < 0.5,
         "Fourier magnitude ratio expected ≈ 4.0, got {}",

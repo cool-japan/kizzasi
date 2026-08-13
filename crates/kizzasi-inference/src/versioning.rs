@@ -206,14 +206,17 @@ impl ModelStats {
         }
     }
 
-    /// Generate health check from current stats
-    pub fn to_health_check(&self) -> HealthCheck {
+    /// Generate a health check from current stats, using `config`'s
+    /// `max_error_rate` and `max_latency_ms` thresholds instead of hardcoded
+    /// constants — so a stricter (or looser) `VersioningConfig` actually
+    /// changes what counts as `Degraded`/`Unhealthy`.
+    pub fn to_health_check(&self, config: &VersioningConfig) -> HealthCheck {
         let error_rate = self.error_rate();
         let avg_latency = self.avg_latency_ms();
 
-        let status = if error_rate > 0.5 {
+        let status = if error_rate > config.max_error_rate {
             HealthStatus::Unhealthy
-        } else if error_rate > 0.1 || avg_latency > 1000.0 {
+        } else if avg_latency > config.max_latency_ms {
             HealthStatus::Degraded
         } else {
             HealthStatus::Healthy
@@ -234,14 +237,14 @@ impl ModelStats {
 }
 
 /// Fallback strategy when primary model fails
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FallbackStrategy {
     /// Use the next available version
     NextVersion,
     /// Use the previous stable version
     PreviousStable,
-    /// Use a specific version
-    SpecificVersion,
+    /// Use a specific, named version
+    SpecificVersion(ModelVersion),
     /// Return an error (no fallback)
     NoFallback,
 }
@@ -422,10 +425,66 @@ impl ModelVersionManager {
                 ))
             })?;
 
-        let health_check = entry.stats.to_health_check();
+        let health_check = entry.stats.to_health_check(&self.config);
         entry.stats.last_health_check = Some(health_check.clone());
 
         Ok(health_check)
+    }
+
+    /// Run health checks for every version of `model_id` whose last check is
+    /// at least `VersioningConfig::health_check_interval` old (or has never
+    /// been checked), applying `VersioningConfig::auto_recovery` along the
+    /// way.
+    ///
+    /// A version that was `Unhealthy`/`Degraded` at its last check and is due
+    /// again has its stats reset before being re-evaluated when
+    /// `auto_recovery` is enabled — a half-open circuit breaker: it gets a
+    /// clean rolling window to prove itself healthy again instead of being
+    /// held down forever by one historical bad patch of *cumulative* stats.
+    ///
+    /// Returns the fresh [`HealthCheck`] for each version that was actually
+    /// (re)checked; a version whose interval has not yet elapsed is skipped
+    /// and excluded from the result. Call this periodically (e.g. from a
+    /// caller-owned timer, since this crate does not itself assume any
+    /// particular async runtime) to get real periodic health checking.
+    pub fn run_health_checks(
+        &self,
+        model_id: &str,
+    ) -> InferenceResult<Vec<(ModelVersion, HealthCheck)>> {
+        let mut models = self.models.write().map_err(|e| {
+            InferenceError::LockError(format!("Failed to acquire write lock: {}", e))
+        })?;
+        let entries = models
+            .get_mut(model_id)
+            .ok_or_else(|| InferenceError::ForwardError(format!("Model {} not found", model_id)))?;
+
+        let mut results = Vec::new();
+        for entry in entries.iter_mut() {
+            let due = match &entry.stats.last_health_check {
+                Some(previous) => previous.timestamp.elapsed() >= self.config.health_check_interval,
+                None => true,
+            };
+            if !due {
+                continue;
+            }
+
+            let was_unhealthy = entry
+                .stats
+                .last_health_check
+                .as_ref()
+                .map(|c| c.status != HealthStatus::Healthy)
+                .unwrap_or(false);
+
+            if was_unhealthy && self.config.auto_recovery {
+                entry.stats = ModelStats::default();
+            }
+
+            let health_check = entry.stats.to_health_check(&self.config);
+            entry.stats.last_health_check = Some(health_check.clone());
+            results.push((entry.metadata.version.clone(), health_check));
+        }
+
+        Ok(results)
     }
 
     /// Get fallback version for a model
@@ -437,7 +496,7 @@ impl ModelVersionManager {
         let models = self.models.read().ok()?;
         let entries = models.get(model_id)?;
 
-        match self.config.fallback_strategy {
+        match &self.config.fallback_strategy {
             FallbackStrategy::NextVersion => {
                 // Find next lower version
                 entries
@@ -455,9 +514,16 @@ impl ModelVersionManager {
                     .next()
             }
             FallbackStrategy::NoFallback => None,
-            FallbackStrategy::SpecificVersion => {
-                // Would need to be configured separately
-                None
+            FallbackStrategy::SpecificVersion(target) => {
+                if target == current_version {
+                    // Falling back to the version already active isn't a
+                    // fallback.
+                    return None;
+                }
+                entries
+                    .iter()
+                    .find(|e| &e.metadata.version == target)
+                    .map(|e| e.metadata.version.clone())
             }
         }
     }
@@ -572,20 +638,121 @@ mod tests {
 
     #[test]
     fn test_model_stats_health_check() {
+        let config = VersioningConfig::default();
         let mut stats = ModelStats::default();
 
         // Low error rate, low latency -> Healthy
         stats.record_success(50.0);
         stats.record_success(60.0);
-        let check = stats.to_health_check();
+        let check = stats.to_health_check(&config);
         assert_eq!(check.status, HealthStatus::Healthy);
 
         // High error rate -> Unhealthy
         stats.record_error(100.0);
         stats.record_error(100.0);
         stats.record_error(100.0);
-        let check = stats.to_health_check();
+        let check = stats.to_health_check(&config);
         assert_eq!(check.status, HealthStatus::Unhealthy);
+    }
+
+    /// Regression: `to_health_check` used to hardcode `0.5`/`0.1`/`1000.0`
+    /// thresholds instead of reading `VersioningConfig`, so a strict SLO
+    /// (`max_error_rate: 0.01`) had no effect.
+    #[test]
+    fn test_health_check_uses_configured_thresholds() {
+        let strict = VersioningConfig {
+            max_error_rate: 0.01,
+            ..Default::default()
+        };
+        let mut stats = ModelStats::default();
+        stats.record_success(10.0);
+        stats.record_error(10.0); // error_rate = 0.5
+
+        // The old hardcoded 0.5 cutoff would call this exactly borderline
+        // (not `>` 0.5) / Healthy under the old 0.1 "degraded" line; under a
+        // strict 0.01 configured threshold it must be Unhealthy.
+        let strict_check = stats.to_health_check(&strict);
+        assert_eq!(strict_check.status, HealthStatus::Unhealthy);
+
+        let lenient = VersioningConfig {
+            max_error_rate: 0.9,
+            ..Default::default()
+        };
+        let lenient_check = stats.to_health_check(&lenient);
+        assert_eq!(lenient_check.status, HealthStatus::Healthy);
+    }
+
+    /// Regression: `FallbackStrategy::SpecificVersion` was a unit variant
+    /// with nowhere to store which version to fall back to, so
+    /// `get_fallback_version` always returned `None` for it.
+    #[test]
+    fn test_fallback_specific_version() {
+        let v1 = ModelVersion::new(1, 0, 0);
+        let v2 = ModelVersion::new(1, 1, 0);
+        let v3 = ModelVersion::new(1, 2, 0);
+
+        let config = VersioningConfig {
+            fallback_strategy: FallbackStrategy::SpecificVersion(v1.clone()),
+            ..Default::default()
+        };
+        let manager = ModelVersionManager::new(config);
+
+        manager
+            .register_version(ModelMetadata::new("m", v1.clone(), "t"), true)
+            .unwrap();
+        manager
+            .register_version(ModelMetadata::new("m", v2, "t"), false)
+            .unwrap();
+        manager
+            .register_version(ModelMetadata::new("m", v3.clone(), "t"), false)
+            .unwrap();
+
+        assert_eq!(manager.get_fallback_version("m", &v3), Some(v1.clone()));
+        // Falling back to the currently active version is not a fallback.
+        assert_eq!(manager.get_fallback_version("m", &v1), None);
+    }
+
+    /// Regression: `health_check_interval` and `auto_recovery` were accepted
+    /// and stored but never read anywhere — `run_health_checks` must now
+    /// honour both: skip a version whose interval has not elapsed, and give
+    /// a previously-unhealthy version a clean slate once it has.
+    #[test]
+    fn test_run_health_checks_respects_interval_and_auto_recovers() {
+        let config = VersioningConfig {
+            max_error_rate: 0.1,
+            max_latency_ms: 1000.0,
+            health_check_interval: Duration::from_millis(50),
+            auto_recovery: true,
+            ..Default::default()
+        };
+        let manager = ModelVersionManager::new(config);
+        let v1 = ModelVersion::new(1, 0, 0);
+        manager
+            .register_version(ModelMetadata::new("m", v1.clone(), "t"), true)
+            .unwrap();
+
+        for _ in 0..5 {
+            manager.record_request("m", &v1, 10.0, true).unwrap();
+        }
+
+        let first = manager.run_health_checks("m").expect("first tick");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].1.status, HealthStatus::Unhealthy);
+
+        // Immediately re-running before the interval elapses must skip it.
+        let immediate = manager.run_health_checks("m").expect("second tick");
+        assert!(
+            immediate.is_empty(),
+            "a tick within health_check_interval must be skipped"
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Once the interval elapses, auto-recovery resets stats and the
+        // version gets a clean slate (Healthy again).
+        let second = manager.run_health_checks("m").expect("third tick");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].1.status, HealthStatus::Healthy);
     }
 
     #[test]

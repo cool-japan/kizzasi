@@ -17,13 +17,35 @@ Example
 """
 
 from ._kizzasi import (
+    BeamSearch,
     Config,
+    ConstrainedBeamSearch,
+    ConstraintSpec,
+    EnsemblePredictor,
+    LoRAAdapter,
+    ModelType,
+    MuLawCodec,
+    OptimizedPredictor,
     Predictor,
+    RejectionSampler,
+    Sampler,
+    SamplingConfig,
     __version__,
 )
 
 __all__ = [
+    "BeamSearch",
     "Config",
+    "ConstrainedBeamSearch",
+    "ConstraintSpec",
+    "EnsemblePredictor",
+    "LoRAAdapter",
+    "ModelType",
+    "MuLawCodec",
+    "OptimizedPredictor",
     "Predictor",
+    "RejectionSampler",
+    "Sampler",
+    "SamplingConfig",
     "__version__",
 ]

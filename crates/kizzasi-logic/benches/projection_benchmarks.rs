@@ -95,7 +95,7 @@ pub fn bench_gradient_projection() {
 
 /// Benchmark set membership projection
 pub fn bench_set_projection() {
-    let ball = GeometricSet::ball(vec![0.0, 0.0], 1.0);
+    let ball = GeometricSet::ball(vec![0.0, 0.0], 1.0).expect("valid ball");
     let constraint = SetMembershipConstraint::new("unit_ball", ball);
 
     let input = vec![2.0, 2.0];

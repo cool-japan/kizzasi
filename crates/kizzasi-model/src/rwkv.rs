@@ -75,9 +75,15 @@ pub struct RwkvConfig {
     pub num_heads: usize,
     /// Head dimension
     pub head_dim: usize,
-    /// Dropout rate
+    /// Dropout rate applied to each layer output while
+    /// [`Rwkv::set_training`] is enabled (inverted dropout, disabled by default)
     pub dropout: f32,
-    /// Time decay initialization
+    /// Time decay initialization, in RWKV's *log-log* parameterisation.
+    ///
+    /// The per-step decay multiplier is `exp(-exp(time_decay))`, so this value
+    /// must be a log-space number (the reference implementations initialise it
+    /// around `-5.0`, giving a decay of ≈0.993). Passing a decay *factor* such
+    /// as `0.99` here yields `exp(-exp(0.99)) ≈ 0.068` — a one-step memory.
     pub time_decay_init: f32,
     /// Use RMSNorm instead of LayerNorm
     pub use_rms_norm: bool,
@@ -185,11 +191,24 @@ struct TimeMixing {
     gate_proj: Array2<f32>,
     output_proj: Array2<f32>,
 
-    /// State: WKV accumulator and normalizer per head
-    wkv_state: Vec<Array1<f32>>, // [num_heads][head_dim]
-    wkv_norm: Vec<f32>, // [num_heads]
+    /// WKV recurrence state, held **per (head, channel)**.
+    ///
+    /// The recurrence is kept in the numerically stable "running maximum" form
+    /// used by the reference RWKV implementations: `wkv_num` and `wkv_den` are
+    /// the numerator and denominator *relative to* the running maximum
+    /// `wkv_max`, so `exp(k)` is never evaluated directly and can never
+    /// overflow to infinity.
+    wkv_num: Vec<Array1<f32>>, // [num_heads][head_dim]
+    wkv_den: Vec<Array1<f32>>, // [num_heads][head_dim]
+    wkv_max: Vec<Array1<f32>>, // [num_heads][head_dim]
     prev_x: Array1<f32>,
 }
+
+/// Sentinel for the WKV running maximum before any key has been observed.
+///
+/// Any real key dominates it, so the first step reduces exactly to
+/// `wkv = v` / `norm = 1` without special-casing.
+const WKV_MAX_INIT: f32 = -1e30;
 
 impl TimeMixing {
     fn new(config: &RwkvConfig) -> ModelResult<Self> {
@@ -226,10 +245,15 @@ impl TimeMixing {
         });
 
         // Initialize states
-        let wkv_state = (0..config.num_heads)
+        let wkv_num: Vec<Array1<f32>> = (0..config.num_heads)
             .map(|_| Array1::zeros(config.head_dim))
             .collect();
-        let wkv_norm = vec![0.0; config.num_heads];
+        let wkv_den: Vec<Array1<f32>> = (0..config.num_heads)
+            .map(|_| Array1::zeros(config.head_dim))
+            .collect();
+        let wkv_max: Vec<Array1<f32>> = (0..config.num_heads)
+            .map(|_| Array1::from_elem(config.head_dim, WKV_MAX_INIT))
+            .collect();
         let prev_x = Array1::zeros(config.hidden_dim);
 
         Ok(Self {
@@ -246,8 +270,9 @@ impl TimeMixing {
             receptance_proj,
             gate_proj,
             output_proj,
-            wkv_state,
-            wkv_norm,
+            wkv_num,
+            wkv_den,
+            wkv_max,
             prev_x,
         })
     }
@@ -305,20 +330,33 @@ impl TimeMixing {
                     break;
                 }
 
-                // Get time decay for this head and dimension
-                let w = self.time_decay[[head, i]].exp();
+                // Per-step decay for this (head, channel).
+                //
+                // RWKV parameterises the decay in log-log space: the
+                // multiplicative factor is `exp(-exp(w_raw))`, which is
+                // guaranteed to lie in (0, 1) for every finite `w_raw`. `w_log`
+                // is its logarithm, i.e. `-exp(w_raw)`, and is applied additively
+                // to the running maximum below.
+                let w_log = -self.time_decay[[head, i]].exp();
 
-                // Update WKV state: num_t = e^{-w}·num_{t-1} + e^{k_t}·v_t
-                let exp_k = k[idx].exp();
-                let new_wkv = w * self.wkv_state[head][i] + exp_k * v[idx];
-                self.wkv_state[head][i] = new_wkv;
+                // Numerically stable update (aa / bb / pp form): shift the
+                // accumulators by the running maximum of the decayed previous
+                // maximum and the current key, so no `exp` argument is positive.
+                let key = k[idx];
+                let shifted = self.wkv_max[head][i] + w_log;
+                let new_max = shifted.max(key);
+                let e_decay = (shifted - new_max).exp();
+                let e_key = (key - new_max).exp();
 
-                // Update normalizer: den_t = e^{-w}·den_{t-1} + e^{k_t}
-                self.wkv_norm[head] = w * self.wkv_norm[head] + exp_k;
+                let num = e_decay * self.wkv_num[head][i] + e_key * v[idx];
+                let den = e_decay * self.wkv_den[head][i] + e_key;
 
-                // Output: wkv / norm
-                let norm = self.wkv_norm[head].max(1e-8);
-                wkv_output[idx] = new_wkv / norm;
+                self.wkv_num[head][i] = num;
+                self.wkv_den[head][i] = den;
+                self.wkv_max[head][i] = new_max;
+
+                // Output: wkv / norm (denominator is non-negative by construction)
+                wkv_output[idx] = num / den.max(1e-8);
             }
         }
 
@@ -357,10 +395,17 @@ impl TimeMixing {
     }
 
     fn reset(&mut self) {
-        for state in &mut self.wkv_state {
+        for state in &mut self.wkv_num {
             state.fill(0.0);
         }
-        self.wkv_norm.fill(0.0);
+        for state in &mut self.wkv_den {
+            state.fill(0.0);
+        }
+        // The running maximum must go back to its sentinel, not to zero:
+        // a zero maximum would make the first key's `exp` shift wrong.
+        for state in &mut self.wkv_max {
+            state.fill(WKV_MAX_INIT);
+        }
         self.prev_x.fill(0.0);
     }
 }
@@ -573,6 +618,8 @@ pub struct Rwkv {
     ln_out: LayerNorm,
     input_proj: Array2<f32>,
     output_proj: Array2<f32>,
+    /// Whether `RwkvConfig::dropout` is active (see [`Rwkv::set_training`]).
+    training: bool,
 }
 
 impl Rwkv {
@@ -612,6 +659,7 @@ impl Rwkv {
             ln_out,
             input_proj,
             output_proj,
+            training: false,
         })
     }
 
@@ -872,6 +920,22 @@ impl Rwkv {
         Ok(())
     }
 
+    /// Enable or disable training mode.
+    ///
+    /// Models are created in inference mode, where `RwkvConfig::dropout` is inert
+    /// and [`step`](crate::SignalPredictor::step) is deterministic. Set this to
+    /// `true` during training so the configured dropout rate is applied to each
+    /// layer output (inverted dropout — no rescale is needed when switching
+    /// back to inference).
+    pub fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
+    /// Whether the model is currently in training mode (dropout active).
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
     /// Load weights from a JSON file previously written by `save_weights_json`.
     pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
         let file = std::fs::File::open(path.as_ref()).map_err(|e| {
@@ -884,7 +948,23 @@ impl Rwkv {
                     format!("JSON deserialization failed: {e}"),
                 )
             })?;
+        self.load_weights_map(&weights).map(|_| ())
+    }
 
+    /// Load weights from an in-memory `name → flat f32 values` map.
+    ///
+    /// This is the in-process counterpart of [`Self::load_weights_json`]: it
+    /// applies exactly the same shape checks and partial-loading semantics
+    /// without routing the parameters through a serialized file.
+    pub fn load_weights_map(
+        &mut self,
+        weights: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> ModelResult<usize> {
+        // Number of tensors actually applied. The caller needs this to tell a
+        // genuine partial load from a weight map whose names match nothing at
+        // all — the latter would otherwise leave the model randomly
+        // initialised while reporting success.
+        let applied = std::cell::Cell::new(0usize);
         let load_array2 = |map: &std::collections::HashMap<String, Vec<f32>>,
                            key: &str,
                            rows: usize,
@@ -910,6 +990,7 @@ impl Rwkv {
                         format!("failed to reshape '{}': {e}", key),
                     )
                 })?;
+                applied.set(applied.get() + 1);
                 Ok(Some(arr))
             } else {
                 Ok(None)
@@ -932,6 +1013,7 @@ impl Rwkv {
                         ),
                     ));
                 }
+                applied.set(applied.get() + 1);
                 Ok(Some(Array1::from_vec(data.clone())))
             } else {
                 Ok(None)
@@ -943,10 +1025,10 @@ impl Rwkv {
         let num_heads = self.config.num_heads;
         let head_dim = self.config.head_dim;
 
-        if let Some(arr) = load_array2(&weights, "input_proj", self.config.input_dim, hidden)? {
+        if let Some(arr) = load_array2(weights, "input_proj", self.config.input_dim, hidden)? {
             self.input_proj = arr;
         }
-        if let Some(arr) = load_array2(&weights, "output_proj", hidden, self.config.input_dim)? {
+        if let Some(arr) = load_array2(weights, "output_proj", hidden, self.config.input_dim)? {
             self.output_proj = arr;
         }
 
@@ -955,72 +1037,67 @@ impl Rwkv {
             let tm = format!("{}.time_mixing", prefix);
             let cm = format!("{}.channel_mixing", prefix);
 
-            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_k", tm), hidden)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.time_mix_k", tm), hidden)? {
                 layer.time_mixing.time_mix_k = arr;
             }
-            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_v", tm), hidden)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.time_mix_v", tm), hidden)? {
                 layer.time_mixing.time_mix_v = arr;
             }
-            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_r", tm), hidden)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.time_mix_r", tm), hidden)? {
                 layer.time_mixing.time_mix_r = arr;
             }
-            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_g", tm), hidden)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.time_mix_g", tm), hidden)? {
                 layer.time_mixing.time_mix_g = arr;
             }
             if let Some(arr) =
-                load_array2(&weights, &format!("{}.time_decay", tm), num_heads, head_dim)?
+                load_array2(weights, &format!("{}.time_decay", tm), num_heads, head_dim)?
             {
                 layer.time_mixing.time_decay = arr;
             }
-            if let Some(arr) = load_array2(&weights, &format!("{}.key_proj", tm), hidden, hidden)? {
+            if let Some(arr) = load_array2(weights, &format!("{}.key_proj", tm), hidden, hidden)? {
                 layer.time_mixing.key_proj = arr;
             }
-            if let Some(arr) = load_array2(&weights, &format!("{}.value_proj", tm), hidden, hidden)?
+            if let Some(arr) = load_array2(weights, &format!("{}.value_proj", tm), hidden, hidden)?
             {
                 layer.time_mixing.value_proj = arr;
             }
             if let Some(arr) =
-                load_array2(&weights, &format!("{}.receptance_proj", tm), hidden, hidden)?
+                load_array2(weights, &format!("{}.receptance_proj", tm), hidden, hidden)?
             {
                 layer.time_mixing.receptance_proj = arr;
             }
-            if let Some(arr) = load_array2(&weights, &format!("{}.gate_proj", tm), hidden, hidden)?
-            {
+            if let Some(arr) = load_array2(weights, &format!("{}.gate_proj", tm), hidden, hidden)? {
                 layer.time_mixing.gate_proj = arr;
             }
-            if let Some(arr) =
-                load_array2(&weights, &format!("{}.output_proj", tm), hidden, hidden)?
+            if let Some(arr) = load_array2(weights, &format!("{}.output_proj", tm), hidden, hidden)?
             {
                 layer.time_mixing.output_proj = arr;
             }
 
-            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_k", cm), hidden)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.time_mix_k", cm), hidden)? {
                 layer.channel_mixing.time_mix_k = arr;
             }
-            if let Some(arr) = load_array1(&weights, &format!("{}.time_mix_r", cm), hidden)? {
+            if let Some(arr) = load_array1(weights, &format!("{}.time_mix_r", cm), hidden)? {
                 layer.channel_mixing.time_mix_r = arr;
             }
             if let Some(arr) =
-                load_array2(&weights, &format!("{}.key_proj", cm), hidden, intermediate)?
+                load_array2(weights, &format!("{}.key_proj", cm), hidden, intermediate)?
             {
                 layer.channel_mixing.key_proj = arr;
             }
-            if let Some(arr) = load_array2(
-                &weights,
-                &format!("{}.value_proj", cm),
-                intermediate,
-                hidden,
-            )? {
+            if let Some(arr) =
+                load_array2(weights, &format!("{}.value_proj", cm), intermediate, hidden)?
+            {
                 layer.channel_mixing.value_proj = arr;
             }
             if let Some(arr) =
-                load_array2(&weights, &format!("{}.receptance_proj", cm), hidden, hidden)?
+                load_array2(weights, &format!("{}.receptance_proj", cm), hidden, hidden)?
             {
                 layer.channel_mixing.receptance_proj = arr;
             }
         }
 
-        Ok(())
+        Ok(applied.get())
     }
 
     /// Save model weights to a SafeTensors file.
@@ -1164,12 +1241,17 @@ impl Rwkv {
 impl SignalPredictor for Rwkv {
     #[instrument(skip(self, input))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.input_proj.shape()[0])?;
+
         // Project input to hidden dimension
         let mut hidden = input.dot(&self.input_proj);
 
         // Pass through each layer
+        let dropout_rate = self.config.dropout;
+        let training = self.training;
         for layer in &mut self.layers {
             hidden = layer.forward(&hidden)?;
+            crate::dropout::apply_dropout(&mut hidden, dropout_rate, training);
         }
 
         // Final layer normalization
@@ -1209,20 +1291,41 @@ impl AutoregressiveModel for Rwkv {
         ModelType::Rwkv
     }
 
+    /// Export the complete recurrent state of every layer.
+    ///
+    /// A layer's state is a single column laid out as
+    /// `[wkv_num | wkv_den | wkv_max | time_mix.prev_x | channel_mix.prev_x]`,
+    /// where each WKV component spans `num_heads · head_dim` rows and each
+    /// token-shift buffer spans `hidden_dim` rows.
+    ///
+    /// All five components are required for a faithful round-trip: restoring
+    /// only the WKV numerator would leave the recurrence de-normalised and
+    /// silently change every subsequent output.
     fn get_states(&self) -> Vec<HiddenState> {
-        // Collect WKV states from each layer
         self.layers
             .iter()
             .map(|layer| {
-                // Flatten multi-head WKV states
-                let total_size = layer.time_mixing.num_heads * layer.time_mixing.head_dim;
-                let mut combined = Array2::zeros((total_size, 1));
+                let tm = &layer.time_mixing;
+                let stride = tm.num_heads * tm.head_dim;
+                let hidden = tm.hidden_dim;
+                let mut combined = Array2::zeros((stride * 3 + hidden * 2, 1));
 
-                for (head_idx, head_state) in layer.time_mixing.wkv_state.iter().enumerate() {
-                    let start_idx = head_idx * layer.time_mixing.head_dim;
-                    for i in 0..layer.time_mixing.head_dim.min(head_state.len()) {
-                        combined[[start_idx + i, 0]] = head_state[i];
+                for head_idx in 0..tm.num_heads {
+                    let start_idx = head_idx * tm.head_dim;
+                    for i in 0..tm.head_dim {
+                        combined[[start_idx + i, 0]] = tm.wkv_num[head_idx][i];
+                        combined[[stride + start_idx + i, 0]] = tm.wkv_den[head_idx][i];
+                        combined[[2 * stride + start_idx + i, 0]] = tm.wkv_max[head_idx][i];
                     }
+                }
+
+                let shift_base = stride * 3;
+                for i in 0..hidden.min(tm.prev_x.len()) {
+                    combined[[shift_base + i, 0]] = tm.prev_x[i];
+                }
+                let cm = &layer.channel_mixing;
+                for i in 0..hidden.min(cm.prev_x.len()) {
+                    combined[[shift_base + hidden + i, 0]] = cm.prev_x[i];
                 }
 
                 let mut hs = HiddenState::new(combined.shape()[0], combined.shape()[1]);
@@ -1243,15 +1346,35 @@ impl AutoregressiveModel for Rwkv {
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let combined = states[layer_idx].state();
+            let stride = layer.time_mixing.num_heads * layer.time_mixing.head_dim;
+            let hidden = layer.time_mixing.hidden_dim;
+            let expected_rows = stride * 3 + hidden * 2;
 
-            // Split combined state back into per-head WKV states
-            for (head_idx, head_state) in layer.time_mixing.wkv_state.iter_mut().enumerate() {
-                let start_idx = head_idx * layer.time_mixing.head_dim;
-                for i in 0..layer.time_mixing.head_dim.min(head_state.len()) {
-                    if start_idx + i < combined.shape()[0] && 0 < combined.shape()[1] {
-                        head_state[i] = combined[[start_idx + i, 0]];
-                    }
+            if combined.shape()[0] != expected_rows || combined.shape()[1] == 0 {
+                return Err(ModelError::dimension_mismatch(
+                    format!("RWKV set_states (layer {})", layer_idx),
+                    expected_rows,
+                    combined.shape()[0],
+                ));
+            }
+
+            let tm = &mut layer.time_mixing;
+            for head_idx in 0..tm.num_heads {
+                let start_idx = head_idx * tm.head_dim;
+                for i in 0..tm.head_dim {
+                    tm.wkv_num[head_idx][i] = combined[[start_idx + i, 0]];
+                    tm.wkv_den[head_idx][i] = combined[[stride + start_idx + i, 0]];
+                    tm.wkv_max[head_idx][i] = combined[[2 * stride + start_idx + i, 0]];
                 }
+            }
+
+            let shift_base = stride * 3;
+            for i in 0..hidden.min(tm.prev_x.len()) {
+                tm.prev_x[i] = combined[[shift_base + i, 0]];
+            }
+            let cm = &mut layer.channel_mixing;
+            for i in 0..hidden.min(cm.prev_x.len()) {
+                cm.prev_x[i] = combined[[shift_base + hidden + i, 0]];
             }
         }
 
@@ -1360,13 +1483,233 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    // ─── WKV exp(k) correctness ──────────────────────────────────────────
+    // ─── WKV recurrence correctness ──────────────────────────────────────
+
+    /// Build a 4-channel / 2-head time-mixing block whose key and value
+    /// projections have known row sums, so `k` and `v` are exactly predictable
+    /// for a constant input vector.
+    fn wkv_probe() -> (RwkvConfig, TimeMixing) {
+        let config = RwkvConfig {
+            input_dim: 1,
+            hidden_dim: 4,
+            intermediate_dim: 16,
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 2,
+            dropout: 0.0,
+            time_decay_init: -5.0,
+            use_rms_norm: false,
+        };
+        let mut tm = TimeMixing::new(&config).expect("TimeMixing::new");
+        // xx == x (no token-shift mixing) so k/v depend only on the current input.
+        tm.time_mix_k.fill(1.0);
+        tm.time_mix_r.fill(1.0);
+        tm.time_mix_g.fill(1.0);
+
+        let hidden = config.hidden_dim as f32;
+        for i in 0..config.hidden_dim {
+            for j in 0..config.hidden_dim {
+                // Row sums: key row i → i + 1, value row i → i - 1.5
+                tm.key_proj[[i, j]] = (i as f32 + 1.0) / hidden;
+                tm.value_proj[[i, j]] = (i as f32 - 1.5) / hidden;
+            }
+        }
+        (config, tm)
+    }
+
+    #[test]
+    fn test_rwkv_wkv_recurrence_matches_reference() {
+        let (config, mut tm) = wkv_probe();
+
+        // ── Step 1: the running-max sentinel must reduce the update to (v, 1).
+        let x1 = Array1::from_elem(config.hidden_dim, 1.0f32);
+        tm.forward(&x1).expect("forward step 1");
+
+        for head in 0..config.num_heads {
+            for i in 0..config.head_dim {
+                let idx = head * config.head_dim + i;
+                let k1 = idx as f32 + 1.0;
+                let v1 = idx as f32 - 1.5;
+                assert!(
+                    (tm.wkv_num[head][i] - v1).abs() < 1e-5,
+                    "head {head} ch {i}: numerator {} != {v1}",
+                    tm.wkv_num[head][i]
+                );
+                assert!(
+                    (tm.wkv_den[head][i] - 1.0).abs() < 1e-5,
+                    "head {head} ch {i}: denominator {} != 1",
+                    tm.wkv_den[head][i]
+                );
+                assert!(
+                    (tm.wkv_max[head][i] - k1).abs() < 1e-5,
+                    "head {head} ch {i}: running max {} != {k1}",
+                    tm.wkv_max[head][i]
+                );
+            }
+        }
+
+        // ── Step 2: compare against the max-shifted reference recurrence.
+        let x2 = Array1::from_elem(config.hidden_dim, 2.0f32);
+        tm.forward(&x2).expect("forward step 2");
+
+        for head in 0..config.num_heads {
+            for i in 0..config.head_dim {
+                let idx = head * config.head_dim + i;
+                let k1 = idx as f32 + 1.0;
+                let k2 = 2.0 * k1;
+                let v1 = idx as f32 - 1.5;
+                let v2 = 2.0 * v1;
+
+                // Decay convention: exp(-exp(w_raw)), applied in log space.
+                let w_log = -tm.time_decay[[head, i]].exp();
+                let shifted = k1 + w_log;
+                let new_max = shifted.max(k2);
+                let e_decay = (shifted - new_max).exp();
+                let e_key = (k2 - new_max).exp();
+                let num = e_decay * v1 + e_key * v2;
+                let den = e_decay + e_key;
+
+                assert!(
+                    (tm.wkv_num[head][i] - num).abs() < 1e-4,
+                    "head {head} ch {i}: numerator {} != {num}",
+                    tm.wkv_num[head][i]
+                );
+                assert!(
+                    (tm.wkv_den[head][i] - den).abs() < 1e-4,
+                    "head {head} ch {i}: denominator {} != {den}",
+                    tm.wkv_den[head][i]
+                );
+                assert!(
+                    (tm.wkv_max[head][i] - new_max).abs() < 1e-5,
+                    "head {head} ch {i}: running max {} != {new_max}",
+                    tm.wkv_max[head][i]
+                );
+            }
+        }
+
+        // Channels inside one head must keep *independent* normalizers: with
+        // different keys they cannot share a single scalar denominator.
+        assert!(
+            (tm.wkv_den[0][0] - tm.wkv_den[0][1]).abs() > 1e-3,
+            "channels 0 and 1 of head 0 share a denominator ({} vs {})",
+            tm.wkv_den[0][0],
+            tm.wkv_den[0][1]
+        );
+    }
+
+    #[test]
+    fn test_rwkv_decay_is_exp_of_negative_exp() {
+        // With a constant input the denominator after two steps is
+        // 1 + exp(-exp(w_raw)). For w_raw = -5 that is ≈ 1.9933; the discarded
+        // `exp(w_raw)` convention would give ≈ 1.0067.
+        let (config, mut tm) = wkv_probe();
+        let x = Array1::from_elem(config.hidden_dim, 1.0f32);
+        tm.forward(&x).expect("forward step 1");
+        tm.forward(&x).expect("forward step 2");
+
+        let w_raw = tm.time_decay[[0, 0]];
+        assert!(
+            (w_raw - (-5.0)).abs() < 1e-6,
+            "probe expects w_raw = -5.0, got {w_raw}"
+        );
+        let expected = 1.0 + (-(w_raw.exp())).exp();
+        assert!(
+            (tm.wkv_den[0][0] - expected).abs() < 1e-4,
+            "denominator {} != {expected} (decay must be exp(-exp(w)))",
+            tm.wkv_den[0][0]
+        );
+        assert!(
+            tm.wkv_den[0][0] > 1.9,
+            "decay ≈ {} is far too fast; the log-log transform is missing",
+            tm.wkv_den[0][0] - 1.0
+        );
+    }
+
+    #[test]
+    fn test_rwkv_wkv_state_stays_finite_over_long_run() {
+        // Keys of ±400 overflow `exp` in f32 (its argument limit is ≈ 88).
+        // The max-shifted recurrence must stay finite for a long sequence.
+        let (config, mut tm) = wkv_probe();
+        for i in 0..config.hidden_dim {
+            for j in 0..config.hidden_dim {
+                tm.key_proj[[i, j]] = if i % 2 == 0 { 100.0 } else { -100.0 };
+                tm.value_proj[[i, j]] = 1.0;
+            }
+        }
+
+        let x = Array1::from_elem(config.hidden_dim, 1.0f32);
+        for step in 0..10_000usize {
+            let out = tm.forward(&x).expect("forward");
+            if step % 1000 == 0 {
+                assert!(
+                    out.iter().all(|v| v.is_finite()),
+                    "step {step}: non-finite output {out:?}"
+                );
+            }
+        }
+
+        for head in 0..config.num_heads {
+            for i in 0..config.head_dim {
+                assert!(
+                    tm.wkv_num[head][i].is_finite(),
+                    "numerator overflowed at head {head} ch {i}"
+                );
+                assert!(
+                    tm.wkv_den[head][i].is_finite() && tm.wkv_den[head][i] > 0.0,
+                    "denominator invalid at head {head} ch {i}: {}",
+                    tm.wkv_den[head][i]
+                );
+                assert!(
+                    tm.wkv_max[head][i].is_finite(),
+                    "running max overflowed at head {head} ch {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rwkv_state_round_trip_restores_full_wkv_state() {
+        let config = RwkvConfig::new().hidden_dim(16).num_heads(4).num_layers(2);
+        let mut model = Rwkv::new(config).expect("Rwkv::new");
+        let input = Array1::from_vec(vec![0.75f32]);
+
+        for _ in 0..5 {
+            model.step(&input).expect("warm-up step");
+        }
+        let snapshot = model.get_states();
+        let expected = model.step(&input).expect("reference step");
+
+        for _ in 0..7 {
+            model.step(&input).expect("divergence step");
+        }
+        model.set_states(snapshot).expect("set_states");
+        let restored = model.step(&input).expect("restored step");
+
+        for (i, (a, b)) in expected.iter().zip(restored.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "component {i}: {a} != {b} after state restore"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rwkv_set_states_rejects_wrong_shape() {
+        let config = RwkvConfig::new().hidden_dim(16).num_heads(4).num_layers(1);
+        let mut model = Rwkv::new(config).expect("Rwkv::new");
+        // Legacy shape: numerator only (one third of the required rows).
+        let bad = vec![HiddenState::new(16, 1)];
+        assert!(
+            model.set_states(bad).is_err(),
+            "a truncated state must be rejected, not silently partially applied"
+        );
+    }
 
     #[test]
     fn test_rwkv_wkv_exp_k_bounded_output() {
         // key_proj filled with -1.0 → k = Σ(-1)*1 = -hidden_dim for unit input
-        // Bug: wkv_norm += k (negative) → clamped to 1e-8 → output ≈ |k|*|v|/1e-8 ~ 1e8
-        // Fix: wkv_norm += exp(k) = exp(-4) ≈ 0.018 → output bounded O(1)
+        // Bug: denominator += k (negative) → clamped to 1e-8 → output ≈ |k|*|v|/1e-8 ~ 1e8
+        // Fix: max-shifted denominator is ≥ exp(0) = 1 → output bounded O(1)
         let config = RwkvConfig {
             input_dim: 1,
             hidden_dim: 4,

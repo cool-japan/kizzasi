@@ -35,9 +35,20 @@ pub struct EnsembleConfig {
     pub strategy: EnsembleStrategy,
     /// Model weights (for weighted averaging)
     pub weights: Option<Vec<f32>>,
-    /// Whether to normalize outputs before combining
+    /// Whether to normalize (softmax) the combined output *after*
+    /// `Average`/`Weighted` combine the component predictions.
+    ///
+    /// Off by default: an AGSP predicting continuous next-signal values
+    /// wants the averaged *signal*, not a probability simplex, so turning
+    /// this on is an explicit opt-in rather than a silent default. `Voting`
+    /// and `ProductOfExperts` are unaffected — they always produce a
+    /// probability-like output by construction.
     pub normalize_outputs: bool,
-    /// Temperature for final sampling
+    /// Softmax temperature applied wherever this ensemble produces a
+    /// probability distribution — `normalize_outputs == true` for
+    /// `Average`/`Weighted`, and always for `ProductOfExperts` (which
+    /// softmaxes each model's prediction before multiplying). Values `<= 0.0`
+    /// or non-finite are treated as `1.0` (no scaling).
     pub temperature: f32,
 }
 
@@ -46,7 +57,7 @@ impl Default for EnsembleConfig {
         Self {
             strategy: EnsembleStrategy::Average,
             weights: None,
-            normalize_outputs: true,
+            normalize_outputs: false,
             temperature: 1.0,
         }
     }
@@ -293,10 +304,24 @@ impl ModelEnsemble {
         self.softmax(output)
     }
 
-    /// Apply softmax
+    /// Apply temperature-scaled softmax: `softmax(x / temperature)`.
+    ///
+    /// A `temperature < 1.0` sharpens the distribution towards the largest
+    /// element, `> 1.0` smooths it towards uniform. `EnsembleConfig::temperature`
+    /// previously built a `Sampler` that nothing ever invoked, making it
+    /// silently inert; applying it here is the real, minimal effect it can
+    /// have without changing the shape of `step`'s output (which sampling
+    /// via `self.sampler` would, by collapsing it to a single index).
     fn softmax(&self, x: &Array1<f32>) -> Array1<f32> {
-        let max_x = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exp_x = x.mapv(|v| (v - max_x).exp());
+        let temperature = self.config.temperature;
+        let scaled = if temperature.is_finite() && temperature > 0.0 && temperature != 1.0 {
+            x.mapv(|v| v / temperature)
+        } else {
+            x.clone()
+        };
+
+        let max_x = scaled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exp_x = scaled.mapv(|v| (v - max_x).exp());
         let sum_exp: f32 = exp_x.sum();
 
         if sum_exp > 0.0 {
@@ -353,6 +378,12 @@ impl EnsembleBuilder {
     /// Set model weights
     pub fn weights(mut self, weights: Vec<f32>) -> Self {
         self.config.weights = Some(weights);
+        self
+    }
+
+    /// Enable/disable output normalization (softmax after combining)
+    pub fn normalize_outputs(mut self, normalize: bool) -> Self {
+        self.config.normalize_outputs = normalize;
         self
     }
 
@@ -475,5 +506,152 @@ mod tests {
             .diagonal(true);
 
         S4D::new(config).unwrap()
+    }
+
+    /// A model whose `step` always returns a fixed, non-uniform, multi-element
+    /// vector — deterministic (unlike S4D's randomly-initialised weights) and
+    /// multi-dimensional (unlike `CountingModel`, whose single-element output
+    /// can't exercise softmax sharpening/smoothing).
+    #[derive(Debug, Clone)]
+    struct FixedVectorModel {
+        output: Vec<f32>,
+    }
+
+    impl FixedVectorModel {
+        fn new(output: Vec<f32>) -> Self {
+            Self { output }
+        }
+    }
+
+    impl kizzasi_core::SignalPredictor for FixedVectorModel {
+        fn step(&mut self, _input: &Array1<f32>) -> kizzasi_core::CoreResult<Array1<f32>> {
+            Ok(Array1::from_vec(self.output.clone()))
+        }
+        fn reset(&mut self) {}
+        fn context_window(&self) -> usize {
+            usize::MAX
+        }
+    }
+
+    impl AutoregressiveModel for FixedVectorModel {
+        fn hidden_dim(&self) -> usize {
+            self.output.len()
+        }
+        fn state_dim(&self) -> usize {
+            1
+        }
+        fn num_layers(&self) -> usize {
+            1
+        }
+        fn model_type(&self) -> kizzasi_model::ModelType {
+            kizzasi_model::ModelType::S4D
+        }
+        fn get_states(&self) -> Vec<kizzasi_core::HiddenState> {
+            vec![]
+        }
+        fn set_states(
+            &mut self,
+            _states: Vec<kizzasi_core::HiddenState>,
+        ) -> kizzasi_model::ModelResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_normalize_outputs_defaults_to_false() {
+        assert!(!EnsembleConfig::default().normalize_outputs);
+    }
+
+    /// Regression: `normalize_outputs` used to default to `true`, and
+    /// combination happened *after* averaging despite being documented as
+    /// happening before — turning a continuous averaged signal into a
+    /// probability simplex by default. With normalization off (the new
+    /// default), `Average` over two identical predictions must return that
+    /// prediction unchanged.
+    #[test]
+    fn test_average_without_normalization_returns_raw_prediction() {
+        use crate::testutil::CountingModel;
+        use kizzasi_core::SignalPredictor;
+
+        let mut solo = CountingModel::new();
+        let input = Array1::from_vec(vec![0.5]);
+        let expected = solo.step(&input).expect("solo step must succeed");
+
+        let mut ensemble = ModelEnsemble::new(
+            vec![
+                Box::new(CountingModel::new()),
+                Box::new(CountingModel::new()),
+            ],
+            EnsembleConfig::new(), // normalize_outputs defaults to false
+        )
+        .expect("ensemble must build");
+
+        let combined = ensemble.step(&input).expect("ensemble step must succeed");
+        assert_eq!(
+            combined, expected,
+            "averaging two identical CountingModel predictions with normalization off must \
+             return the raw prediction, not a softmaxed one"
+        );
+    }
+
+    /// Regression: `EnsembleConfig::temperature` built a `Sampler` that
+    /// nothing ever invoked, so it had no effect on `step`'s output.
+    #[test]
+    fn test_temperature_changes_normalized_distribution_sharpness() {
+        let input = Array1::from_vec(vec![0.0]);
+
+        let mut sharp = ModelEnsemble::new(
+            vec![
+                Box::new(FixedVectorModel::new(vec![1.0, 2.0, 3.0])),
+                Box::new(FixedVectorModel::new(vec![1.0, 2.0, 3.0])),
+            ],
+            EnsembleConfig::new()
+                .normalize_outputs(true)
+                .temperature(0.1),
+        )
+        .unwrap();
+        let sharp_out = sharp.step(&input).unwrap();
+
+        let mut smooth = ModelEnsemble::new(
+            vec![
+                Box::new(FixedVectorModel::new(vec![1.0, 2.0, 3.0])),
+                Box::new(FixedVectorModel::new(vec![1.0, 2.0, 3.0])),
+            ],
+            EnsembleConfig::new()
+                .normalize_outputs(true)
+                .temperature(5.0),
+        )
+        .unwrap();
+        let smooth_out = smooth.step(&input).unwrap();
+
+        // Averaging two identical [1,2,3] predictions gives [1,2,3] either
+        // way pre-softmax; temperature must still change how sharply softmax
+        // spreads it across the three elements.
+        assert!(
+            (sharp_out[2] - smooth_out[2]).abs() > 0.05,
+            "temperature must change the normalized distribution's sharpness: sharp={:?} smooth={:?}",
+            sharp_out.to_vec(),
+            smooth_out.to_vec()
+        );
+        assert!(
+            sharp_out[2] > 0.9,
+            "low temperature must sharpen toward the max element, got {:?}",
+            sharp_out.to_vec()
+        );
+    }
+
+    #[test]
+    fn test_ensemble_builder_normalize_outputs() {
+        let model1 = create_test_model();
+        let model2 = create_test_model();
+
+        let ensemble = EnsembleBuilder::new()
+            .add_model(Box::new(model1))
+            .add_model(Box::new(model2))
+            .normalize_outputs(true)
+            .build()
+            .expect("ensemble must build");
+
+        assert!(ensemble.config().normalize_outputs);
     }
 }

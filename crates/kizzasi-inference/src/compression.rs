@@ -47,6 +47,15 @@ pub struct CompressedState {
     zero_point: i32,
     /// Sparsity metadata (indices of non-zero elements)
     sparse_indices: Option<Vec<usize>>,
+    /// Set when every quantized element (or, for `QuantizedSparse`, every
+    /// surviving above-threshold element) shares the same value, making a
+    /// scale-based quantization degenerate (`scale` would be `0.0`).
+    ///
+    /// When `Some`, decompression reconstructs the state directly from this
+    /// value instead of decoding `data`, so the round-trip is exact instead
+    /// of landing on `0.0` via a `scale == 0.0` / `zero_point == i32::MIN`
+    /// computation.
+    degenerate_value: Option<f32>,
 }
 
 impl CompressedState {
@@ -58,7 +67,23 @@ impl CompressedState {
                 .sparse_indices
                 .as_ref()
                 .map(|v| v.len() * std::mem::size_of::<usize>())
+                .unwrap_or(0)
+            + self
+                .degenerate_value
+                .map(|_| std::mem::size_of::<f32>())
                 .unwrap_or(0);
+
+        if compressed_size == 0 {
+            // Nothing at all was stored: only possible for a zero-element
+            // state, where "original / compressed" (0 / 0) is not a
+            // meaningful ratio.
+            return if original_size == 0 {
+                1.0
+            } else {
+                f32::INFINITY
+            };
+        }
+
         original_size as f32 / compressed_size as f32
     }
 
@@ -126,6 +151,7 @@ impl StateCompressor {
             scale: 1.0,
             zero_point: 0,
             sparse_indices: None,
+            degenerate_value: None,
         })
     }
 
@@ -145,13 +171,44 @@ impl StateCompressor {
     }
 
     /// 8-bit quantization
+    ///
+    /// A constant-valued (or empty) state makes a `(max - min) / 255` scale
+    /// degenerate (`0.0`, which would drive `zero_point` to `i32::MIN` and
+    /// every decoded element to `0.0`). Both cases are stored as an exact
+    /// [`CompressedState::degenerate_value`] instead.
     fn compress_quantize_8bit(&self, state: &HiddenState) -> InferenceResult<CompressedState> {
+        let shape_vec: Vec<usize> = state.state().shape().to_vec();
+
+        if state.state().is_empty() {
+            return Ok(CompressedState {
+                method: CompressionMethod::Quantize8Bit,
+                data: Vec::new(),
+                shape: shape_vec,
+                scale: 1.0,
+                zero_point: 0,
+                sparse_indices: None,
+                degenerate_value: None,
+            });
+        }
+
         let min_val = state.state().iter().copied().fold(f32::INFINITY, f32::min);
         let max_val = state
             .state()
             .iter()
             .copied()
             .fold(f32::NEG_INFINITY, f32::max);
+
+        if max_val == min_val {
+            return Ok(CompressedState {
+                method: CompressionMethod::Quantize8Bit,
+                data: Vec::new(),
+                shape: shape_vec,
+                scale: 1.0,
+                zero_point: 0,
+                sparse_indices: None,
+                degenerate_value: Some(max_val),
+            });
+        }
 
         let scale = (max_val - min_val) / 255.0;
         let zero_point = (-min_val / scale).round() as i32;
@@ -165,8 +222,6 @@ impl StateCompressor {
             })
             .collect();
 
-        let shape_vec: Vec<usize> = state.state().shape().to_vec();
-
         Ok(CompressedState {
             method: CompressionMethod::Quantize8Bit,
             data: quantized,
@@ -174,6 +229,7 @@ impl StateCompressor {
             scale,
             zero_point,
             sparse_indices: None,
+            degenerate_value: None,
         })
     }
 
@@ -181,6 +237,10 @@ impl StateCompressor {
         &self,
         compressed: &CompressedState,
     ) -> InferenceResult<HiddenState> {
+        if let Some(value) = compressed.degenerate_value {
+            return Self::dense_from_constant(&compressed.shape, value);
+        }
+
         let dequantized: Vec<f32> = compressed
             .data
             .iter()
@@ -196,13 +256,42 @@ impl StateCompressor {
     }
 
     /// 4-bit quantization (2 values per byte)
+    ///
+    /// See [`StateCompressor::compress_quantize_8bit`]: constant-valued and
+    /// empty states are handled the same way here, for the same reason.
     fn compress_quantize_4bit(&self, state: &HiddenState) -> InferenceResult<CompressedState> {
+        let shape_vec: Vec<usize> = state.state().shape().to_vec();
+
+        if state.state().is_empty() {
+            return Ok(CompressedState {
+                method: CompressionMethod::Quantize4Bit,
+                data: Vec::new(),
+                shape: shape_vec,
+                scale: 1.0,
+                zero_point: 0,
+                sparse_indices: None,
+                degenerate_value: None,
+            });
+        }
+
         let min_val = state.state().iter().copied().fold(f32::INFINITY, f32::min);
         let max_val = state
             .state()
             .iter()
             .copied()
             .fold(f32::NEG_INFINITY, f32::max);
+
+        if max_val == min_val {
+            return Ok(CompressedState {
+                method: CompressionMethod::Quantize4Bit,
+                data: Vec::new(),
+                shape: shape_vec,
+                scale: 1.0,
+                zero_point: 0,
+                sparse_indices: None,
+                degenerate_value: Some(max_val),
+            });
+        }
 
         let scale = (max_val - min_val) / 15.0;
         let zero_point = (-min_val / scale).round() as i32;
@@ -220,8 +309,6 @@ impl StateCompressor {
             quantized.push((q1 << 4) | q2);
         }
 
-        let shape_vec: Vec<usize> = state.state().shape().to_vec();
-
         Ok(CompressedState {
             method: CompressionMethod::Quantize4Bit,
             data: quantized,
@@ -229,6 +316,7 @@ impl StateCompressor {
             scale,
             zero_point,
             sparse_indices: None,
+            degenerate_value: None,
         })
     }
 
@@ -236,6 +324,10 @@ impl StateCompressor {
         &self,
         compressed: &CompressedState,
     ) -> InferenceResult<HiddenState> {
+        if let Some(value) = compressed.degenerate_value {
+            return Self::dense_from_constant(&compressed.shape, value);
+        }
+
         let total_elements = compressed.shape.iter().product();
         let mut dequantized = Vec::with_capacity(total_elements);
 
@@ -280,6 +372,7 @@ impl StateCompressor {
             scale: 1.0,
             zero_point: 0,
             sparse_indices: Some(indices),
+            degenerate_value: None,
         })
     }
 
@@ -314,6 +407,11 @@ impl StateCompressor {
     }
 
     /// Combined quantized sparse encoding
+    ///
+    /// The *surviving* (above-threshold) values can themselves be constant
+    /// even when the full dense state is not (e.g. several equal spikes on a
+    /// zero background) — the same degeneracy as
+    /// [`StateCompressor::compress_quantize_8bit`], handled the same way.
     fn compress_quantized_sparse(&self, state: &HiddenState) -> InferenceResult<CompressedState> {
         let mut values = Vec::new();
         let mut indices = Vec::new();
@@ -335,11 +433,24 @@ impl StateCompressor {
                 scale: 1.0,
                 zero_point: 0,
                 sparse_indices: Some(indices),
+                degenerate_value: None,
             });
         }
 
         let min_val = values.iter().copied().fold(f32::INFINITY, f32::min);
         let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+        if max_val == min_val {
+            return Ok(CompressedState {
+                method: CompressionMethod::QuantizedSparse,
+                data: Vec::new(),
+                shape: shape_vec,
+                scale: 1.0,
+                zero_point: 0,
+                sparse_indices: Some(indices),
+                degenerate_value: Some(max_val),
+            });
+        }
 
         let scale = (max_val - min_val) / 255.0;
         let zero_point = (-min_val / scale).round() as i32;
@@ -359,6 +470,7 @@ impl StateCompressor {
             scale,
             zero_point,
             sparse_indices: Some(indices),
+            degenerate_value: None,
         })
     }
 
@@ -376,7 +488,13 @@ impl StateCompressor {
         let total_elements: usize = compressed.shape.iter().product();
         let mut dense = vec![0.0f32; total_elements];
 
-        if !compressed.data.is_empty() {
+        if let Some(value) = compressed.degenerate_value {
+            for &idx in indices {
+                if idx < dense.len() {
+                    dense[idx] = value;
+                }
+            }
+        } else if !compressed.data.is_empty() {
             for (&idx, &q) in indices.iter().zip(compressed.data.iter()) {
                 if idx < dense.len() {
                     dense[idx] = (q as f32 - compressed.zero_point as f32) * compressed.scale;
@@ -388,6 +506,25 @@ impl StateCompressor {
             .map_err(|e| InferenceError::ForwardError(e.to_string()))?;
 
         let mut hidden = HiddenState::new(compressed.shape[0], compressed.shape[1]);
+        hidden.update(data);
+        Ok(hidden)
+    }
+
+    /// Build a dense `HiddenState` of `shape` where every element is `value`.
+    ///
+    /// Shared by the degenerate-value decode path of every quantization
+    /// method. `shape` is always 2-D in practice (it always originates from
+    /// an `Array2`'s own `.shape()`), but this reports a clear error for a
+    /// malformed shape rather than indexing into it unchecked.
+    fn dense_from_constant(shape: &[usize], value: f32) -> InferenceResult<HiddenState> {
+        let &[rows, cols] = shape else {
+            return Err(InferenceError::ForwardError(format!(
+                "expected a 2-D shape, got {shape:?}"
+            )));
+        };
+        let data = Array2::from_shape_vec((rows, cols), vec![value; rows * cols])
+            .map_err(|e| InferenceError::ForwardError(e.to_string()))?;
+        let mut hidden = HiddenState::new(rows, cols);
         hidden.update(data);
         Ok(hidden)
     }
@@ -533,46 +670,86 @@ mod tests {
         assert_eq!(compressed.method(), CompressionMethod::Quantize8Bit);
     }
 
-    // Test 5: a `[0, 0]` state. The `None` path round-trips cleanly to an
-    // empty state. (The 8-bit path computes scale from min/max of an empty
-    // iterator and produces NaN; we therefore document the `None` method as
-    // the supported behavior for empty states.)
+    // Test 5: a `[0, 0]` state must round-trip cleanly through every
+    // compression method, including 8-bit/4-bit quantization — which used to
+    // compute `scale` from the min/max of an empty iterator and produce NaN.
     #[test]
     fn test_compress_empty_state() {
         let original = hidden_from_array(Array2::<f32>::zeros((0, 0)));
-        let compressor = StateCompressor::new(CompressionMethod::None);
 
-        let compressed = compressor.compress(&original).unwrap();
-        assert_eq!(compressed.shape, vec![0, 0]);
-        assert!(compressed.data.is_empty());
+        for method in [
+            CompressionMethod::None,
+            CompressionMethod::Quantize8Bit,
+            CompressionMethod::Quantize4Bit,
+            CompressionMethod::Sparse,
+            CompressionMethod::QuantizedSparse,
+        ] {
+            let compressor = StateCompressor::new(method);
+            let compressed = compressor
+                .compress(&original)
+                .unwrap_or_else(|e| panic!("{:?} compress failed on empty state: {:?}", method, e));
+            assert_eq!(compressed.shape, vec![0, 0]);
 
-        let decompressed = compressor.decompress(&compressed).unwrap();
-        assert_eq!(decompressed.state().shape(), &[0, 0]);
-        assert_eq!(decompressed.state().len(), 0);
+            let decompressed = compressor.decompress(&compressed).unwrap_or_else(|e| {
+                panic!("{:?} decompress failed on empty state: {:?}", method, e)
+            });
+            assert_eq!(decompressed.state().shape(), &[0, 0]);
+            assert_eq!(decompressed.state().len(), 0);
+        }
     }
 
     // Test 6: a `[1, 1]` state with a single value round-trips losslessly
-    // through the `None` path. (8-bit quantization is degenerate when
-    // `min == max`, so the lossless path is exercised here.)
+    // through every method, including 8-bit/4-bit quantization (previously
+    // degenerate whenever `min == max`, i.e. always for a single element).
     #[test]
     fn test_compress_single_element() {
         let mut arr = Array2::<f32>::zeros((1, 1));
         arr[[0, 0]] = 0.42;
         let original = hidden_from_array(arr);
 
-        // 8-bit quant collapses to scale==0 when min==max, so use None for
-        // the single-element exact path. The lossless path is sufficient to
-        // confirm the shape and data plumbing handle a 1x1.
-        let compressor = StateCompressor::new(CompressionMethod::None);
-        let compressed = compressor.compress(&original).unwrap();
+        for method in [
+            CompressionMethod::None,
+            CompressionMethod::Quantize8Bit,
+            CompressionMethod::Quantize4Bit,
+        ] {
+            let compressor = StateCompressor::new(method);
+            let compressed = compressor.compress(&original).unwrap();
+            let decompressed = compressor.decompress(&compressed).unwrap();
+
+            assert_eq!(decompressed.state().shape(), &[1, 1]);
+            assert!(
+                (decompressed.state()[[0, 0]] - 0.42).abs() < 1e-6,
+                "{:?}: 1x1 roundtrip drifted: got {}",
+                method,
+                decompressed.state()[[0, 0]]
+            );
+        }
+    }
+
+    /// Regression: `QuantizedSparse`'s *surviving* (above-threshold) values
+    /// can be constant even when the full dense state is not (e.g. equal
+    /// spikes on a zero background) — the same `scale == 0.0` degeneracy as
+    /// the dense quantizers, previously unhandled here.
+    #[test]
+    fn test_compress_quantized_sparse_degenerate_survivors() {
+        let mut arr = Array2::<f32>::zeros((2, 4));
+        arr[[0, 0]] = 0.9;
+        arr[[0, 2]] = 0.9;
+        arr[[1, 1]] = 0.9;
+        let state = hidden_from_array(arr);
+
+        let compressor = StateCompressor::new(CompressionMethod::QuantizedSparse);
+        let compressed = compressor.compress(&state).unwrap();
         let decompressed = compressor.decompress(&compressed).unwrap();
 
-        assert_eq!(decompressed.state().shape(), &[1, 1]);
-        assert!(
-            (decompressed.state()[[0, 0]] - 0.42).abs() < 1e-6,
-            "1x1 roundtrip drifted: got {}",
-            decompressed.state()[[0, 0]]
-        );
+        for (got, expected) in decompressed.state().iter().zip(state.state().iter()) {
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "QuantizedSparse degenerate-survivor round-trip drifted: got {} expected {}",
+                got,
+                expected
+            );
+        }
     }
 
     // Test 7: an all-zero state must round-trip back to all-zero (within a
@@ -601,18 +778,46 @@ mod tests {
         }
     }
 
-    // Test 8: a state where every entry is 0.5. The 8-bit quantizer collapses
-    // to a degenerate `scale == 0.0`, so we use the lossless `None` path to
-    // verify the constant-value invariant.
+    // Test 8: a state where every entry is 0.5. The 8-bit/4-bit quantizers
+    // used to collapse to a degenerate `scale == 0.0` here (and
+    // `zero_point` would saturate to `i32::MIN`), silently decoding to
+    // all-zeros. They must now round-trip exactly, with a finite,
+    // better-than-1x compression ratio (not the `inf`/near-zero a
+    // `scale == 0.0` bug would produce).
     #[test]
     fn test_compress_all_identical() {
         let original = hidden_from_array(Array2::<f32>::from_elem((16, 16), 0.5));
 
+        for method in [
+            CompressionMethod::Quantize8Bit,
+            CompressionMethod::Quantize4Bit,
+        ] {
+            let compressor = StateCompressor::new(method);
+            let compressed = compressor.compress(&original).unwrap();
+            let decompressed = compressor.decompress(&compressed).unwrap();
+
+            assert_eq!(decompressed.state().shape(), &[16, 16]);
+            for v in decompressed.state().iter() {
+                assert!(
+                    (v - 0.5).abs() < 1e-6,
+                    "{:?}: all-identical drifted: got {}",
+                    method,
+                    v
+                );
+            }
+            let ratio = compressed.compression_ratio();
+            assert!(
+                ratio.is_finite() && ratio > 1.0,
+                "{:?}: compression_ratio must be finite and > 1.0, got {}",
+                method,
+                ratio
+            );
+        }
+
+        // The lossless `None` path remains available too.
         let compressor = StateCompressor::new(CompressionMethod::None);
         let compressed = compressor.compress(&original).unwrap();
         let decompressed = compressor.decompress(&compressed).unwrap();
-
-        assert_eq!(decompressed.state().shape(), &[16, 16]);
         for v in decompressed.state().iter() {
             assert!((v - 0.5).abs() < 1e-6, "all-identical drifted: got {}", v);
         }

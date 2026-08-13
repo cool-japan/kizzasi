@@ -1,4 +1,4 @@
-// Blelloch work-efficient parallel SSM scan kernel.
+// Blelloch work-efficient parallel SSM scan — per-block pass.
 //
 // Implements an inclusive prefix scan over SSM elements (a, bu) with the
 // associative operator:
@@ -8,7 +8,15 @@
 // Input/output layout: flat f32 buffer interleaved as
 //   [a_0, bu_0, a_1, bu_1, ..., a_{n-1}, bu_{n-1}]
 //
-// This single-pass kernel handles sequences up to 256 elements (one work-group).
+// Each work-group scans its own block of 256 elements and additionally writes
+// the block aggregate (the inclusive value of the block's last lane) to
+// `block_sums[workgroup_id]`.  Lanes past `n` load the identity element, which
+// is a no-op on the right of the operator, so the aggregate is exact for a
+// partially filled trailing block.
+//
+// A driver scans `block_sums` with the same kernel (recursively when there is
+// more than one block of aggregates) and then applies the resulting prefixes
+// with `ssm_scan_apply.wgsl`, so sequences of any length are handled exactly.
 
 struct Params {
     n: u32,
@@ -17,6 +25,7 @@ struct Params {
 @group(0) @binding(0) var<uniform>             params:     Params;
 @group(0) @binding(1) var<storage, read>       input_buf:  array<f32>;
 @group(0) @binding(2) var<storage, read_write> output_buf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> block_sums: array<f32>;
 
 const WORKGROUP_SIZE: u32 = 256u;
 
@@ -27,18 +36,20 @@ var<workgroup> sh_bu: array<f32, 256>;
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(workgroup_id)        wid: vec3<u32>,
 ) {
     let i: u32       = gid.x;
     let local_i: u32 = lid.x;
 
     // --- Load into shared memory (pad with identity element beyond seq_len) ---
+    var inp_a:  f32 = 1.0;
+    var inp_bu: f32 = 0.0;
     if i < params.n {
-        sh_a[local_i]  = input_buf[2u * i];
-        sh_bu[local_i] = input_buf[2u * i + 1u];
-    } else {
-        sh_a[local_i]  = 1.0;
-        sh_bu[local_i] = 0.0;
+        inp_a  = input_buf[2u * i];
+        inp_bu = input_buf[2u * i + 1u];
     }
+    sh_a[local_i]  = inp_a;
+    sh_bu[local_i] = inp_bu;
     workgroupBarrier();
 
     // --- Up-sweep (reduce phase) ---
@@ -91,15 +102,23 @@ fn main(
     }
 
     // --- Convert exclusive → inclusive: incl[i] = excl[i] ⊗ input[i] ---
-    // The exclusive scan gives the product of all elements *before* i.
-    // Combining with input[i] yields the inclusive prefix at i.
+    // The exclusive scan gives the product of all elements *before* i within
+    // this block.  Combining with input[i] yields the block-local inclusive
+    // prefix at i.
+    let excl_a: f32  = sh_a[local_i];
+    let excl_bu: f32 = sh_bu[local_i];
+    let incl_a: f32  = inp_a * excl_a;
+    let incl_bu: f32 = inp_a * excl_bu + inp_bu;
+
     if i < params.n {
-        let excl_a: f32  = sh_a[local_i];
-        let excl_bu: f32 = sh_bu[local_i];
-        let inp_a: f32   = input_buf[2u * i];
-        let inp_bu: f32  = input_buf[2u * i + 1u];
-        // incl = excl ⊗ inp = (inp_a·excl_a, inp_a·excl_bu + inp_bu)
-        output_buf[2u * i]       = inp_a * excl_a;
-        output_buf[2u * i + 1u] = inp_a * excl_bu + inp_bu;
+        output_buf[2u * i]      = incl_a;
+        output_buf[2u * i + 1u] = incl_bu;
+    }
+
+    // The last lane holds the aggregate of the whole block (padding lanes are
+    // identity elements and therefore do not perturb it).
+    if local_i == WORKGROUP_SIZE - 1u {
+        block_sums[2u * wid.x]      = incl_a;
+        block_sums[2u * wid.x + 1u] = incl_bu;
     }
 }

@@ -243,7 +243,7 @@ fn bench_differentiable_projection(c: &mut Criterion) {
     let mut group = c.benchmark_group("differentiable_projection");
 
     for temp in [0.1, 1.0, 10.0].iter() {
-        let proj = DifferentiableProjection::new(*temp);
+        let proj = DifferentiableProjection::new(*temp).expect("positive temperature");
 
         group.bench_with_input(BenchmarkId::from_parameter(temp), temp, |b, _| {
             b.iter(|| {
@@ -269,7 +269,7 @@ fn bench_consensus_admm(c: &mut Criterion) {
         let mut admm = ConsensusADMM::new(*num_blocks, dimension, config);
 
         let x0 = Array1::from_vec(vec![1.0; dimension]);
-        admm.initialize(&x0);
+        admm.initialize(&x0).expect("matching dimension");
 
         group.throughput(Throughput::Elements(*num_blocks as u64));
         group.bench_with_input(
@@ -303,7 +303,7 @@ fn bench_block_coordinate_descent(c: &mut Criterion) {
         let mut bcd = BlockCoordinateDescent::new(blocks, dimension).unwrap();
 
         let x0 = Array1::from_vec(vec![1.0; dimension]);
-        bcd.initialize(&x0);
+        bcd.initialize(&x0).expect("matching dimension");
 
         group.throughput(Throughput::Elements(*block_size as u64));
         group.bench_with_input(
@@ -311,9 +311,9 @@ fn bench_block_coordinate_descent(c: &mut Criterion) {
             block_size,
             |b, _| {
                 b.iter(|| {
-                    bcd.update_block(0, |_full_x, indices| {
+                    let _ = bcd.update_block(0, |_full_x, indices| {
                         Array1::from_vec(vec![0.0; indices.len()])
-                    })
+                    });
                 })
             },
         );
@@ -329,7 +329,7 @@ fn bench_block_coordinate_descent(c: &mut Criterion) {
 fn bench_chance_constraint(c: &mut Criterion) {
     let mut group = c.benchmark_group("chance_constraint");
 
-    let chance = ChanceConstraint::gaussian("test", 0.95, 25.0, 3.0);
+    let chance = ChanceConstraint::gaussian("test", 0.95, 25.0, 3.0).expect("valid chance");
 
     group.bench_function("get_tightened_bound", |b| {
         b.iter(|| black_box(chance.get_tightened_bound()))
@@ -342,7 +342,7 @@ fn bench_cvar_constraint(c: &mut Criterion) {
     let mut group = c.benchmark_group("cvar_constraint");
 
     for num_samples in [100, 500, 1000, 5000].iter() {
-        let cvar = CVaRConstraint::new("test", 0.05, 100.0, *num_samples);
+        let cvar = CVaRConstraint::new("test", 0.05, 100.0, *num_samples).expect("valid CVaR");
 
         let losses: Vec<f32> = (0..*num_samples).map(|i| i as f32 * 0.1).collect();
 
@@ -360,7 +360,8 @@ fn bench_cvar_constraint(c: &mut Criterion) {
 fn bench_robust_constraint(c: &mut Criterion) {
     let mut group = c.benchmark_group("robust_constraint");
 
-    let robust = RobustConstraint::box_uncertain("test", vec![-5.0, -3.0], vec![5.0, 3.0]);
+    let robust = RobustConstraint::box_uncertain("test", vec![-5.0, -3.0], vec![5.0, 3.0])
+        .expect("valid robust");
 
     group.bench_function("worst_case_scenario", |b| {
         b.iter(|| {

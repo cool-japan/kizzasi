@@ -977,9 +977,8 @@
 
 ## Proposed follow-ups
 
-- **Vague items needing decomposition:** `vqvae-candle-nn-training-integration`, `perceptual-quantization-psychoacoustic`, `lazy-evaluation-pipeline`, `edge-case-coverage`, `regression-test-suite`, `cross-modal-tokenization`, `multi-speaker-tokenization` — each should become 2-3 concrete sub-items in a future planning pass.
-- **Oversized items:** `peaq-perceptual-audio-quality` (ITU-R BS.1387 scope), `rest-api-tokenization-service` (belongs in separate service binary), `adversarial-training-perceptual` (gate on candle training-loop maturity).
-- **`kizzasi-inference-integration-examples` (currently blocked):** Re-classify as `ready` — kizzasi-inference crate is production-ready; this is now a documentation/example task.
+- **Vague items needing decomposition:** `vqvae-candle-nn-training-integration`, `lazy-evaluation-pipeline` — each should become 2-3 concrete sub-items in a future planning pass. (`perceptual-quantization-psychoacoustic`, `edge-case-coverage`, `regression-test-suite`, `cross-modal-tokenization`, `multi-speaker-tokenization` are now complete — see checkboxes above.)
+- **Oversized items:** `rest-api-tokenization-service` (belongs in separate service binary), `adversarial-training-perceptual` (gate on candle training-loop maturity). (`peaq-perceptual-audio-quality` is now complete — see the PEAQ weights verification follow-up below.)
 - **Tutorial documentation for advanced features:** Split per phase (Phase 1-5) into separate tutorial tasks.
 - **API reference updates:** Run `cargo doc --no-deps` to collect missing-doc warnings; turn those into concrete `- [ ]` items.
 

@@ -25,16 +25,25 @@ use std::time::Instant;
 // ============================================================================
 
 /// Configuration for parallel constraint solving
+///
+/// `use_simd` and `prefetch_distance` fields previously existed here but
+/// were stored and never read by anything in this module: nothing in
+/// [`ParallelFeasibilityChecker`]/[`IncrementalParallelSolver`] operates
+/// through virtual (`Box<dyn FastConstraint>`) dispatch in a way that a
+/// bool could toggle real SIMD codegen for, and there is no safe, portable
+/// way in stable Rust to make `prefetch_distance` do anything either
+/// without target-specific `unsafe` intrinsics. Rather than leave two
+/// tuning knobs that silently changed nothing, they have been removed;
+/// [`SimdConstraintEvaluator`] (this module) is the type that is actually
+/// written to be auto-vectorization friendly, unconditionally.
 #[derive(Debug, Clone)]
 pub struct ParallelConfig {
-    /// Number of threads — 0 means auto-detect (uses rayon global pool)
+    /// Number of threads — 0 means the global rayon pool (the default);
+    /// any other value builds a dedicated pool with that many threads (see
+    /// `ParallelConfig::build_thread_pool`).
     pub num_threads: usize,
     /// Number of points per worker chunk (default 64)
     pub chunk_size: usize,
-    /// Enable SIMD-optimized inner loops
-    pub use_simd: bool,
-    /// Data prefetch distance (default 8)
-    pub prefetch_distance: usize,
 }
 
 impl Default for ParallelConfig {
@@ -42,9 +51,43 @@ impl Default for ParallelConfig {
         Self {
             num_threads: 0,
             chunk_size: 64,
-            use_simd: true,
-            prefetch_distance: 8,
         }
+    }
+}
+
+impl ParallelConfig {
+    /// Build a dedicated rayon thread pool sized by `num_threads`, or
+    /// `None` when `num_threads == 0` (meaning "use the global pool") or
+    /// when pool construction fails (logged; callers fall back to running
+    /// on the global pool rather than erroring, since a scoped pool is a
+    /// performance hint, not a correctness requirement).
+    fn build_thread_pool(&self) -> Option<rayon::ThreadPool> {
+        if self.num_threads == 0 {
+            return None;
+        }
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(self.num_threads)
+            .build()
+        {
+            Ok(pool) => Some(pool),
+            Err(err) => {
+                tracing::warn!(
+                    "ParallelConfig: failed to build a {}-thread pool ({err}); falling back to \
+                     the global rayon pool",
+                    self.num_threads
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Run `f` inside `pool` if one was built, or directly on the current
+/// (global-pool-backed) thread otherwise.
+fn run_on_pool<R: Send>(pool: &Option<rayon::ThreadPool>, f: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(pool) => pool.install(f),
+        None => f(),
     }
 }
 
@@ -355,14 +398,21 @@ impl FastConstraint for SimplexConstraint {
 pub struct ParallelFeasibilityChecker {
     constraints: Vec<Box<dyn FastConstraint>>,
     config: ParallelConfig,
+    /// Dedicated thread pool built from `config.num_threads` at
+    /// construction (`None` when `num_threads == 0`, meaning "use the
+    /// global rayon pool"). `config` is private and never mutated after
+    /// `new`, so caching this here is sound.
+    thread_pool: Option<rayon::ThreadPool>,
 }
 
 impl ParallelFeasibilityChecker {
     /// Create a new checker with the given configuration.
     pub fn new(config: ParallelConfig) -> Self {
+        let thread_pool = config.build_thread_pool();
         Self {
             constraints: Vec::new(),
             config,
+            thread_pool,
         }
     }
 
@@ -385,17 +435,19 @@ impl ParallelFeasibilityChecker {
         let constraints = &self.constraints;
         let chunk_size = self.config.chunk_size.max(1);
 
-        (0..n_points)
-            .into_par_iter()
-            .with_min_len(chunk_size)
-            .map(|i| {
-                let row: Array1<f32> = points.slice(scirs2_core::ndarray::s![i, ..]).to_owned();
-                if row.len() != dim {
-                    return false;
-                }
-                constraints.iter().all(|c| c.is_feasible(&row))
-            })
-            .collect()
+        run_on_pool(&self.thread_pool, || {
+            (0..n_points)
+                .into_par_iter()
+                .with_min_len(chunk_size)
+                .map(|i| {
+                    let row: Array1<f32> = points.slice(scirs2_core::ndarray::s![i, ..]).to_owned();
+                    if row.len() != dim {
+                        return false;
+                    }
+                    constraints.iter().all(|c| c.is_feasible(&row))
+                })
+                .collect()
+        })
     }
 
     /// Compute violation for each point against all constraints.
@@ -413,14 +465,16 @@ impl ParallelFeasibilityChecker {
         let chunk_size = self.config.chunk_size.max(1);
         let constraints = &self.constraints;
 
-        let rows: Vec<Vec<f32>> = (0..n_points)
-            .into_par_iter()
-            .with_min_len(chunk_size)
-            .map(|i| {
-                let row: Array1<f32> = points.slice(scirs2_core::ndarray::s![i, ..]).to_owned();
-                constraints.iter().map(|c| c.violation(&row)).collect()
-            })
-            .collect();
+        let rows: Vec<Vec<f32>> = run_on_pool(&self.thread_pool, || {
+            (0..n_points)
+                .into_par_iter()
+                .with_min_len(chunk_size)
+                .map(|i| {
+                    let row: Array1<f32> = points.slice(scirs2_core::ndarray::s![i, ..]).to_owned();
+                    constraints.iter().map(|c| c.violation(&row)).collect()
+                })
+                .collect()
+        });
 
         let mut out = Array2::zeros((n_points, n_constraints));
         for (i, row) in rows.iter().enumerate() {
@@ -444,15 +498,17 @@ impl ParallelFeasibilityChecker {
         let chunk_size = self.config.chunk_size.max(1);
         let constraints = &self.constraints;
 
-        let projected: Vec<Vec<f32>> = (0..n_points)
-            .into_par_iter()
-            .with_min_len(chunk_size)
-            .map(|i| {
-                let row: Array1<f32> = points.slice(scirs2_core::ndarray::s![i, ..]).to_owned();
-                let result = dykstra_project(&row, constraints.as_slice(), max_iter);
-                result.into_raw_vec_and_offset().0
-            })
-            .collect();
+        let projected: Vec<Vec<f32>> = run_on_pool(&self.thread_pool, || {
+            (0..n_points)
+                .into_par_iter()
+                .with_min_len(chunk_size)
+                .map(|i| {
+                    let row: Array1<f32> = points.slice(scirs2_core::ndarray::s![i, ..]).to_owned();
+                    let result = dykstra_project(&row, constraints.as_slice(), max_iter);
+                    result.into_raw_vec_and_offset().0
+                })
+                .collect()
+        });
 
         let mut out = Array2::zeros((n_points, dim));
         for (i, row) in projected.iter().enumerate() {
@@ -895,8 +951,13 @@ pub struct SolverResult {
 /// - On constraint *removal*: the solution remains feasible for remaining constraints,
 ///   so no re-solve is needed; `solution_valid` is kept `true`.
 pub struct IncrementalParallelSolver {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // read by `build_thread_pool` at construction time only
     config: ParallelConfig,
+    /// Dedicated thread pool built from `config.num_threads` at
+    /// construction (`None` when `num_threads == 0`, meaning "use the
+    /// global rayon pool"). `config` is private and never mutated after
+    /// `new`, so caching this here is sound.
+    thread_pool: Option<rayon::ThreadPool>,
     constraints: Vec<Box<dyn FastConstraint>>,
     solution: Option<Array1<f32>>,
     solution_valid: bool,
@@ -905,8 +966,10 @@ pub struct IncrementalParallelSolver {
 impl IncrementalParallelSolver {
     /// Create a new solver with the given configuration.
     pub fn new(config: ParallelConfig) -> Self {
+        let thread_pool = config.build_thread_pool();
         Self {
             config,
+            thread_pool,
             constraints: Vec::new(),
             solution: None,
             solution_valid: false,
@@ -979,12 +1042,19 @@ impl IncrementalParallelSolver {
 
         let result = dykstra_project(&start_point, &self.constraints, actual_max_iter);
 
-        // Assess feasibility
-        let num_violations = self
-            .constraints
-            .iter()
-            .filter(|c| !c.is_feasible(&result))
-            .count();
+        // Assess feasibility. This is the one step here that is genuinely
+        // parallel over independent work (one check per constraint against
+        // the same, now-fixed, `result`), so it is what honors
+        // `config.num_threads`'s dedicated pool — `dykstra_project` above
+        // is inherently sequential across constraints (each alternating
+        // projection depends on the previous one's output).
+        let constraints = &self.constraints;
+        let num_violations = run_on_pool(&self.thread_pool, || {
+            constraints
+                .par_iter()
+                .filter(|c| !c.is_feasible(&result))
+                .count()
+        });
         let feasible = num_violations == 0;
 
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -1328,5 +1398,50 @@ mod tests {
             warm_result.iterations,
             cold_result.iterations
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 14. Regression (finding 137): ParallelConfig::num_threads is honored
+    // -----------------------------------------------------------------------
+
+    /// A `ParallelFeasibilityChecker` built with a fixed thread count must
+    /// produce results identical to the default (global-pool) config — the
+    /// dedicated pool changes *where* work runs, never the answer.
+    #[test]
+    fn test_parallel_config_num_threads_matches_default_pool_results() {
+        let mut default_checker = ParallelFeasibilityChecker::new(ParallelConfig::default());
+        let mut fixed_pool_checker = ParallelFeasibilityChecker::new(ParallelConfig {
+            num_threads: 2,
+            chunk_size: 4,
+        });
+        default_checker.add_constraint(Box::new(make_box()));
+        fixed_pool_checker.add_constraint(Box::new(make_box()));
+
+        let points = Array2::from_shape_vec(
+            (4, 3),
+            vec![0.5, 0.5, 0.5, 2.0, 2.0, 2.0, -1.0, 0.5, 0.5, 0.1, 0.1, 0.1],
+        )
+        .expect("valid shape");
+
+        assert_eq!(
+            default_checker.check_batch(&points),
+            fixed_pool_checker.check_batch(&points)
+        );
+    }
+
+    /// `IncrementalParallelSolver` must also work correctly with a
+    /// dedicated `num_threads` pool.
+    #[test]
+    fn test_incremental_solver_with_fixed_thread_count() {
+        let mut solver = IncrementalParallelSolver::new(ParallelConfig {
+            num_threads: 2,
+            chunk_size: 8,
+        });
+        solver.add_constraint(Box::new(make_box()));
+
+        let init = Array1::from(vec![5.0f32, 5.0, 5.0]);
+        let result = solver.solve(init, 50);
+        assert!(result.feasible);
+        assert!(make_box().is_feasible(&result.solution));
     }
 }

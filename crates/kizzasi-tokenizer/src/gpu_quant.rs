@@ -8,11 +8,35 @@
 //! - Automatic GPU detection and fallback to CPU
 //! - Batch quantization for maximum throughput
 //! - Zero-copy tensor operations where possible
-//! - Support for CUDA, Metal, and CPU backends
+//! - Metal and CPU backends
+//!
+//! # Which backend actually runs
+//!
+//! [`auto_device`] can only return a GPU device when candle was compiled with
+//! a GPU backend, which for kizzasi means this crate's off-by-default `metal`
+//! feature (Apple platforms). In every other build the "GPU" quantizers here
+//! run on CPU — correctly, but with no acceleration. There is deliberately no
+//! CUDA path: kizzasi ships no CUDA feature at all (see `kizzasi-core`'s
+//! `[features]`), so `candle_core::utils::cuda_is_available()` is a compile-
+//! time `false` here and probing it would only look like a GPU option that
+//! does not exist.
 
 use crate::error::{TokenizerError, TokenizerResult};
 use crate::Quantizer;
 use candle_core::{Device, Tensor};
+
+/// Select the best candle device this build can actually reach.
+///
+/// Returns a Metal device when the `metal` feature is enabled and a Metal GPU
+/// is present, and [`Device::Cpu`] otherwise (including when Metal
+/// initialisation fails, so a driver problem degrades instead of erroring).
+pub fn auto_device() -> Device {
+    if candle_core::utils::metal_is_available() {
+        Device::new_metal(0).unwrap_or(Device::Cpu)
+    } else {
+        Device::Cpu
+    }
+}
 
 /// GPU-accelerated linear quantizer using candle
 pub struct GpuLinearQuantizer {
@@ -48,14 +72,8 @@ impl GpuLinearQuantizer {
 
         let levels = 1usize << bits;
 
-        // Try to use CUDA, then Metal, then CPU
-        let device = if candle_core::utils::cuda_is_available() {
-            Device::new_cuda(0).unwrap_or(Device::Cpu)
-        } else if candle_core::utils::metal_is_available() {
-            Device::new_metal(0).unwrap_or(Device::Cpu)
-        } else {
-            Device::Cpu
-        };
+        // Metal when this build can reach it, CPU otherwise.
+        let device = auto_device();
 
         Ok(Self {
             min,
@@ -188,6 +206,10 @@ impl GpuLinearQuantizer {
     }
 
     /// Check if using GPU
+    ///
+    /// `Device::Cuda` is matched for completeness -- `candle_core::Device`
+    /// carries the variant on every build -- but kizzasi never constructs one:
+    /// only the `metal` feature can produce a GPU device here.
     pub fn is_gpu(&self) -> bool {
         matches!(self.device, Device::Cuda(_) | Device::Metal(_))
     }
@@ -232,14 +254,8 @@ impl GpuVectorQuantizer {
     /// * `codebook_size` - Number of codebook vectors
     /// * `vector_dim` - Dimension of each vector
     pub fn new(codebook_size: usize, vector_dim: usize) -> TokenizerResult<Self> {
-        // Auto-select device
-        let device = if candle_core::utils::cuda_is_available() {
-            Device::new_cuda(0).unwrap_or(Device::Cpu)
-        } else if candle_core::utils::metal_is_available() {
-            Device::new_metal(0).unwrap_or(Device::Cpu)
-        } else {
-            Device::Cpu
-        };
+        // Auto-select device (Metal when reachable, CPU otherwise).
+        let device = auto_device();
 
         // Random initialization
         let codebook = Tensor::randn(0.0f32, 1.0f32, (codebook_size, vector_dim), &device)

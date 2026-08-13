@@ -120,12 +120,38 @@ impl ModelRegistry {
     }
 
     /// Create a model from configuration
+    ///
+    /// If `config.weights_path` is set, the weights are loaded into the
+    /// freshly constructed model before it is returned (propagating any
+    /// [`ModelRegistry::load_weights`] error) instead of silently handing
+    /// back an untrained model.
     fn create_from_config(
         &self,
         config: &ModelConfig,
     ) -> InferenceResult<Box<dyn AutoregressiveModel>> {
+        let mut model = self.build_model(config)?;
+
+        if let Some(path) = &config.weights_path {
+            self.load_weights(model.as_mut(), path)?;
+        }
+
+        Ok(model)
+    }
+
+    /// Construct a fresh (randomly initialised) model for `config`.
+    ///
+    /// Seven of the ten architectures below (everything except MultiModal,
+    /// Snn and MultiScale) have no output-projection layer in
+    /// `kizzasi-model`: they always emit `input_dim`-wide output, so a
+    /// configured `output_dim` that disagrees with `input_dim` can never be
+    /// honoured. Rather than silently ignoring it (the model would then emit
+    /// a different width than the caller configured, discovered only as
+    /// downstream shape confusion), those branches reject the mismatch with
+    /// a clear [`InferenceError::PipelineConfig`].
+    fn build_model(&self, config: &ModelConfig) -> InferenceResult<Box<dyn AutoregressiveModel>> {
         match config.model_type {
             ModelType::Mamba2 => {
+                Self::require_output_dim_matches_input(config, "Mamba2")?;
                 #[cfg(feature = "mamba")]
                 {
                     use kizzasi_model::mamba2::{Mamba2, Mamba2Config};
@@ -152,6 +178,7 @@ impl ModelRegistry {
                 ))
             }
             ModelType::Rwkv => {
+                Self::require_output_dim_matches_input(config, "RWKV")?;
                 use kizzasi_model::rwkv::{Rwkv, RwkvConfig};
                 let num_heads = (config.hidden_dim / 64).max(1);
                 let model_config = RwkvConfig {
@@ -169,6 +196,7 @@ impl ModelRegistry {
                 Ok(Box::new(model))
             }
             ModelType::S4 | ModelType::S4D => {
+                Self::require_output_dim_matches_input(config, "S4/S4D")?;
                 use kizzasi_model::s4::{S4Config, S4D};
                 let model_config = S4Config {
                     input_dim: config.input_dim,
@@ -185,6 +213,7 @@ impl ModelRegistry {
                 Ok(Box::new(model))
             }
             ModelType::Transformer => {
+                Self::require_output_dim_matches_input(config, "Transformer")?;
                 use kizzasi_model::transformer::{Transformer, TransformerConfig};
                 let num_heads = (config.hidden_dim / 64).max(1);
                 let model_config = TransformerConfig {
@@ -203,6 +232,7 @@ impl ModelRegistry {
                 Ok(Box::new(model))
             }
             ModelType::Mamba => {
+                Self::require_output_dim_matches_input(config, "Mamba")?;
                 #[cfg(feature = "mamba")]
                 {
                     use kizzasi_model::mamba::{Mamba, MambaConfig};
@@ -225,6 +255,7 @@ impl ModelRegistry {
                 ))
             }
             ModelType::Rwkv5 => {
+                Self::require_output_dim_matches_input(config, "RWKV5")?;
                 use kizzasi_model::rwkv5::{Rwkv5Config, Rwkv5Model};
                 let num_heads = (config.hidden_dim / 64).max(1);
                 let model_config = Rwkv5Config {
@@ -241,6 +272,7 @@ impl ModelRegistry {
                 Ok(Box::new(model))
             }
             ModelType::NeuralOde => {
+                Self::require_output_dim_matches_input(config, "NeuralODE")?;
                 use kizzasi_model::neural_ode::{NeuralOdeConfig, NeuralOdeModel, OdeSolver};
                 let model_config = NeuralOdeConfig {
                     input_dim: config.input_dim,
@@ -311,6 +343,21 @@ impl ModelRegistry {
                 Ok(Box::new(model))
             }
         }
+    }
+
+    /// Reject a configuration whose `output_dim` disagrees with `input_dim`
+    /// for an architecture that has no output-projection layer and can
+    /// therefore never honour a different `output_dim`.
+    fn require_output_dim_matches_input(config: &ModelConfig, arch: &str) -> InferenceResult<()> {
+        if config.output_dim != config.input_dim {
+            return Err(InferenceError::PipelineConfig(format!(
+                "{arch} has no output-projection layer and always emits input_dim-wide output, \
+                 but output_dim ({}) != input_dim ({}); set output_dim == input_dim, or choose \
+                 MultiModal/Snn/MultiScale, which do support projecting to a different output_dim",
+                config.output_dim, config.input_dim
+            )));
+        }
+        Ok(())
     }
 
     /// Load weights from a JSON file into a model.
@@ -481,7 +528,9 @@ mod tests {
     #[test]
     fn test_create_rwkv_model() {
         let mut registry = ModelRegistry::new();
-        let config = ModelBuilder::rwkv().dims(1, 64, 10).layers(2).build();
+        // RWKV has no output-projection layer, so output_dim must equal
+        // input_dim (see `require_output_dim_matches_input`).
+        let config = ModelBuilder::rwkv().dims(1, 64, 1).layers(2).build();
 
         registry.register("rwkv_test", config);
 
@@ -496,7 +545,8 @@ mod tests {
     #[test]
     fn test_create_s4_model() {
         let mut registry = ModelRegistry::new();
-        let config = ModelBuilder::s4d().dims(1, 128, 10).layers(3).build();
+        // S4D has no output-projection layer: output_dim must equal input_dim.
+        let config = ModelBuilder::s4d().dims(1, 128, 1).layers(3).build();
 
         registry.register("s4_test", config);
 
@@ -510,8 +560,10 @@ mod tests {
     #[test]
     fn test_create_transformer_model() {
         let mut registry = ModelRegistry::new();
+        // Transformer has no output-projection layer: output_dim must equal
+        // input_dim.
         let config = ModelBuilder::transformer()
-            .dims(1, 128, 10)
+            .dims(1, 128, 1)
             .layers(2)
             .build();
 
@@ -522,6 +574,94 @@ mod tests {
 
         let model = result.unwrap();
         assert_eq!(model.model_type(), ModelType::Transformer);
+    }
+
+    /// Regression: `output_dim` used to be silently ignored for the seven
+    /// architectures with no output-projection layer. It must now be
+    /// rejected with a clear error instead of producing a model that emits a
+    /// different width than configured.
+    #[test]
+    fn test_output_dim_mismatch_rejected_for_unsupported_architectures() {
+        let mut registry = ModelRegistry::new();
+        let config = ModelBuilder::transformer()
+            .dims(1, 64, 10)
+            .layers(1)
+            .build();
+        registry.register("bad_output_dim", config);
+
+        let result = registry.create_model("bad_output_dim");
+        assert!(matches!(result, Err(InferenceError::PipelineConfig(_))));
+    }
+
+    /// Architectures that *do* support a distinct `output_dim` (MultiModal,
+    /// Snn, MultiScale) must remain unaffected by the new check.
+    #[test]
+    fn test_output_dim_mismatch_allowed_for_supported_architectures() {
+        let mut registry = ModelRegistry::new();
+        let config = ModelConfig {
+            model_type: ModelType::Snn,
+            input_dim: 4,
+            hidden_dim: 16,
+            output_dim: 2,
+            num_layers: 1,
+            state_dim: 8,
+            weights_path: None,
+        };
+        registry.register("snn_projects", config);
+
+        let result = registry.create_model("snn_projects");
+        assert!(result.is_ok(), "Snn create failed: {:?}", result.err());
+    }
+
+    /// Regression: `weights_path` was accepted by `ModelConfig` but never
+    /// read by `create_from_config` — a registered config with a weights
+    /// path silently yielded fresh, untrained weights. It must now actually
+    /// be loaded (or the attempt must fail loudly, for architectures that
+    /// don't support `load_weights_json`).
+    #[test]
+    fn test_create_model_loads_configured_weights_path() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WEIGHTS_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uid = WEIGHTS_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let registry = ModelRegistry::new();
+
+        // Build and save a small Transformer's weights to a temp file.
+        let source_config = ModelBuilder::transformer().dims(1, 64, 1).layers(1).build();
+        let source_model = registry
+            .create_from_config(&source_config)
+            .expect("create source model");
+
+        let mut save_path = std::env::temp_dir();
+        save_path.push(format!("kizzasi_registry_weights_path_test_{}.json", uid));
+        source_model
+            .save_weights_json(&save_path)
+            .expect("save_weights_json via trait");
+
+        // A config carrying `weights_path` must load it during creation.
+        let mut loaded_config = ModelBuilder::transformer().dims(1, 64, 1).layers(1).build();
+        loaded_config = loaded_config.weights_path(save_path.to_string_lossy().to_string());
+
+        let result = registry.create_from_config(&loaded_config);
+        let _ = std::fs::remove_file(&save_path);
+
+        assert!(
+            result.is_ok(),
+            "create_from_config with a valid weights_path must succeed: {:?}",
+            result.err()
+        );
+    }
+
+    /// A `weights_path` pointing at a nonexistent file must fail
+    /// `create_from_config` rather than silently returning fresh weights.
+    #[test]
+    fn test_create_model_rejects_missing_weights_path() {
+        let registry = ModelRegistry::new();
+        let mut config = ModelBuilder::transformer().dims(1, 64, 1).layers(1).build();
+        config = config.weights_path("/nonexistent/kizzasi_weights_that_do_not_exist.json");
+
+        let result = registry.create_from_config(&config);
+        assert!(result.is_err());
     }
 
     #[cfg(feature = "mamba")]

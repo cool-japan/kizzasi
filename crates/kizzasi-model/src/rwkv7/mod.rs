@@ -537,6 +537,24 @@ impl Rwkv7Model {
                 format!("JSON deserialization failed: {e}"),
             )
         })?;
+        self.load_weights_map(&weights).map(|_| ())
+    }
+
+    /// Load weights from an in-memory `name → flat f32 values` map.
+    ///
+    /// This is the in-process counterpart of [`Self::load_weights_json`]: it
+    /// applies exactly the same shape checks and partial-loading semantics
+    /// without routing the parameters through a serialized file.
+    pub fn load_weights_map(
+        &mut self,
+        weights: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> ModelResult<usize> {
+        // Number of tensors actually applied. The caller needs this to tell a
+        // genuine partial load from a weight map whose names match nothing at
+        // all — the latter would otherwise leave the model randomly
+        // initialised while reporting success.
+        let applied = std::cell::Cell::new(0usize);
+        use std::collections::HashMap;
 
         let load_2d = |map: &HashMap<String, Vec<f32>>,
                        key: &str,
@@ -563,6 +581,7 @@ impl Rwkv7Model {
                         format!("failed to reshape '{}': {e}", key),
                     )
                 })?;
+                applied.set(applied.get() + 1);
                 Ok(Some(arr))
             } else {
                 Ok(None)
@@ -585,6 +604,7 @@ impl Rwkv7Model {
                         ),
                     ));
                 }
+                applied.set(applied.get() + 1);
                 Ok(Some(Array1::from_vec(data.clone())))
             } else {
                 Ok(None)
@@ -594,10 +614,10 @@ impl Rwkv7Model {
         let d = self.config.hidden_dim;
         let inter = (d as f32 * self.config.expand_factor) as usize;
 
-        if let Some(arr) = load_2d(&weights, "input_proj", self.config.input_dim, d)? {
+        if let Some(arr) = load_2d(weights, "input_proj", self.config.input_dim, d)? {
             self.input_proj = arr;
         }
-        if let Some(arr) = load_2d(&weights, "output_proj", d, self.config.input_dim)? {
+        if let Some(arr) = load_2d(weights, "output_proj", d, self.config.input_dim)? {
             self.output_proj = arr;
         }
 
@@ -605,67 +625,69 @@ impl Rwkv7Model {
             let tm = format!("layers.{}.time_mixing", i);
             let cm = format!("layers.{}.channel_mixing", i);
 
-            if let Some(arr) = load_2d(&weights, &format!("{}.w_r", tm), d, d)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.w_r", tm), d, d)? {
                 layer.time_mixing.w_r = arr;
             }
-            if let Some(arr) = load_2d(&weights, &format!("{}.w_w", tm), d, d)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.w_w", tm), d, d)? {
                 layer.time_mixing.w_w = arr;
             }
-            if let Some(arr) = load_2d(&weights, &format!("{}.w_k", tm), d, d)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.w_k", tm), d, d)? {
                 layer.time_mixing.w_k = arr;
             }
-            if let Some(arr) = load_2d(&weights, &format!("{}.w_v", tm), d, d)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.w_v", tm), d, d)? {
                 layer.time_mixing.w_v = arr;
             }
-            if let Some(arr) = load_2d(&weights, &format!("{}.w_o", tm), d, d)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.w_o", tm), d, d)? {
                 layer.time_mixing.w_o = arr;
             }
-            if let Some(arr) = load_2d(&weights, &format!("{}.w_g", tm), d, d)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.w_g", tm), d, d)? {
                 layer.time_mixing.w_g = arr;
             }
-            if let Some(arr) = load_2d(&weights, &format!("{}.w_a", tm), d, d)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.w_a", tm), d, d)? {
                 layer.time_mixing.w_a = arr;
             }
-            if let Some(arr) = load_2d(&weights, &format!("{}.w_b", tm), d, d)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.w_b", tm), d, d)? {
                 layer.time_mixing.w_b = arr;
             }
-            if let Some(arr) = load_1d(&weights, &format!("{}.lerp_r", tm), d)? {
+            if let Some(arr) = load_1d(weights, &format!("{}.lerp_r", tm), d)? {
                 layer.time_mixing.lerp_r = arr;
             }
-            if let Some(arr) = load_1d(&weights, &format!("{}.lerp_w", tm), d)? {
+            if let Some(arr) = load_1d(weights, &format!("{}.lerp_w", tm), d)? {
                 layer.time_mixing.lerp_w = arr;
             }
-            if let Some(arr) = load_1d(&weights, &format!("{}.lerp_k", tm), d)? {
+            if let Some(arr) = load_1d(weights, &format!("{}.lerp_k", tm), d)? {
                 layer.time_mixing.lerp_k = arr;
             }
-            if let Some(arr) = load_1d(&weights, &format!("{}.lerp_v", tm), d)? {
+            if let Some(arr) = load_1d(weights, &format!("{}.lerp_v", tm), d)? {
                 layer.time_mixing.lerp_v = arr;
             }
 
-            if let Some(arr) = load_1d(&weights, &format!("{}.time_mix_k", cm), d)? {
+            if let Some(arr) = load_1d(weights, &format!("{}.time_mix_k", cm), d)? {
                 layer.channel_mixing.time_mix_k = arr;
             }
-            if let Some(arr) = load_1d(&weights, &format!("{}.time_mix_r", cm), d)? {
+            if let Some(arr) = load_1d(weights, &format!("{}.time_mix_r", cm), d)? {
                 layer.channel_mixing.time_mix_r = arr;
             }
-            if let Some(arr) = load_2d(&weights, &format!("{}.key_proj", cm), d, inter)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.key_proj", cm), d, inter)? {
                 layer.channel_mixing.key_proj = arr;
             }
-            if let Some(arr) = load_2d(&weights, &format!("{}.value_proj", cm), inter, d)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.value_proj", cm), inter, d)? {
                 layer.channel_mixing.value_proj = arr;
             }
-            if let Some(arr) = load_2d(&weights, &format!("{}.receptance_proj", cm), d, d)? {
+            if let Some(arr) = load_2d(weights, &format!("{}.receptance_proj", cm), d, d)? {
                 layer.channel_mixing.receptance_proj = arr;
             }
         }
 
-        Ok(())
+        Ok(applied.get())
     }
 }
 
 impl SignalPredictor for Rwkv7Model {
     #[instrument(skip(self, input))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.input_proj.shape()[0])?;
+
         // Project input to hidden dim
         let mut hidden = input.dot(&self.input_proj);
 

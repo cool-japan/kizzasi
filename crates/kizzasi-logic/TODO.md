@@ -18,7 +18,7 @@
 
 - [x] **Signal Temporal Logic (STL)** - Quantitative robustness semantics for continuous-time temporal reasoning
 - [x] **Benders Decomposition** - Mixed-integer constrained optimization with master/subproblem decomposition
-- [x] **GPU-Accelerated Constraint Checking** - Parallel constraint evaluation on GPU hardware
+- [x] **GPU-Accelerated Constraint Checking** - Batch constraint evaluation API (`GPUConstraintChecker`, `GPUProjector`, `GPUGradientComputer`) with a `gpu` feature hook; the device path currently runs on CPU
 - [x] **Constraint Repair** - Algorithms for handling infeasible constraint sets (IIS, minimal relaxation)
 - [x] **Multi-Objective Optimization** - Pareto frontier computation, NSGA-II, hypervolume indicators
 - [x] **Constraint Propagation** - Arc consistency (AC-3), backtracking search for discrete CSP
@@ -67,10 +67,10 @@
 
 ## TensorLogic Integration
 
-- [x] Use tensorlogic prover for complex constraints (SymbolicExpr framework)
+- [x] Compile complex constraints via `tensorlogic-ir`'s `TLExpr` IR (`TlExprCompiler`, `TLExprEvaluator`)
 - [x] Add symbolic constraint simplification (expression simplification rules)
 - [x] Implement constraint learning (ConstraintLearner with centroid-based separation)
-- [x] Support first-order logic constraints (via SymbolicExpr with variables and operators)
+- [x] Support quantifier-free predicate constraints via `TLExpr` (`Pred`/`Term` variables, arithmetic, comparison, and boolean operators; `Exists`/`ForAll` quantifiers are not lowered or evaluated)
 - [x] Add constraint synthesis from examples (ConstraintSynthesizer with templates)
 
 ## Performance
@@ -88,7 +88,7 @@
 - [x] Benchmark projection algorithms (benches/projection_benchmarks.rs with performance metrics)
 - [x] Add numerical stability tests (comprehensive tests in tests/numerical_stability.rs)
 
-## Advanced Features (Phase 3) - In Progress
+## Advanced Features (Phase 3) - COMPLETE
 
 ### Constraint Analysis and Verification
 - [x] **Constraint Consistency Checking** - Verify that constraint sets are consistent (no contradictions)
@@ -129,7 +129,7 @@
   - Fault-tolerant distributed solving
 
 - [x] **Advanced Parallelization** - Enhanced parallel constraint evaluation
-  - GPU-accelerated batch projection
+  - Batch projection with GPU-dispatch scaffolding (CPU fallback — no kernel dispatch yet)
   - Parallel constraint graph traversal
   - SIMD-optimized constraint checking
   - Multi-threaded incremental solving

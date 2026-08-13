@@ -6,6 +6,7 @@
 //! - Human-readable violation reports
 //! - Counterfactual constraint analysis
 
+use crate::error::{LogicError, LogicResult};
 use crate::ViolationComputable;
 use scirs2_core::ndarray::Array1;
 use serde::{Deserialize, Serialize};
@@ -119,9 +120,19 @@ pub struct MinimalViolatingSubsetFinder<C: ViolationComputable> {
 
 impl<C: ViolationComputable + Clone> MinimalViolatingSubsetFinder<C> {
     /// Create a new MVS finder
-    pub fn new(constraints: Vec<C>, names: Vec<String>) -> Self {
-        assert_eq!(constraints.len(), names.len());
-        Self { constraints, names }
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::DimensionMismatch`] when `names` does not have one entry
+    /// per constraint.
+    pub fn new(constraints: Vec<C>, names: Vec<String>) -> LogicResult<Self> {
+        if constraints.len() != names.len() {
+            return Err(LogicError::DimensionMismatch {
+                expected: constraints.len(),
+                got: names.len(),
+            });
+        }
+        Ok(Self { constraints, names })
     }
 
     /// Compute violation gradient for constraint `idx` at `point` via central finite differences.
@@ -166,14 +177,14 @@ impl<C: ViolationComputable + Clone> MinimalViolatingSubsetFinder<C> {
     /// magnitude, then removes any constraint whose gradient direction is dominated (cosine
     /// similarity > 0.9) by another constraint already in the subset.
     pub fn find_mvs(&self, point: &Array1<f32>) -> Vec<usize> {
-        let point_slice = point.as_slice().unwrap_or(&[]);
+        let point_slice = crate::array_utils::contiguous(point);
 
         // Step 1: collect all violated constraint indices.
         let violated: Vec<usize> = self
             .constraints
             .iter()
             .enumerate()
-            .filter(|(_, c)| !c.check(point_slice))
+            .filter(|(_, c)| !c.check(&point_slice))
             .map(|(i, _)| i)
             .collect();
 
@@ -186,8 +197,8 @@ impl<C: ViolationComputable + Clone> MinimalViolatingSubsetFinder<C> {
         let violations: Vec<(usize, f32, Vec<f32>)> = violated
             .iter()
             .map(|&idx| {
-                let mag = self.constraints[idx].violation(point_slice);
-                let grad = self.compute_violation_gradient(idx, point_slice);
+                let mag = self.constraints[idx].violation(&point_slice);
+                let grad = self.compute_violation_gradient(idx, &point_slice);
                 (idx, mag, grad)
             })
             .collect();
@@ -258,7 +269,7 @@ impl<C: ViolationComputable + Clone> MinimalViolatingSubsetFinder<C> {
 
     /// Explain violation with minimal subset
     pub fn explain(&self, point: &Array1<f32>) -> ViolationExplanation {
-        let point_slice = point.as_slice().unwrap_or(&[]);
+        let point_slice = crate::array_utils::contiguous(point);
         let mvs = self.find_mvs(point);
 
         let mut explanation = ViolationExplanation::new(format!(
@@ -268,7 +279,7 @@ impl<C: ViolationComputable + Clone> MinimalViolatingSubsetFinder<C> {
         ));
 
         for &idx in &mvs {
-            let violation = self.constraints[idx].violation(point_slice);
+            let violation = self.constraints[idx].violation(&point_slice);
             explanation.add_violated_constraint(idx, violation);
             explanation.add_suggestion(format!(
                 "Fix constraint '{}' (violation: {:.4})",
@@ -305,14 +316,14 @@ impl<C: ViolationComputable + Clone> ViolationAttributionAnalyzer<C> {
 
     /// Compute feature attribution for violations using finite differences
     pub fn attribute_violations(&self, point: &Array1<f32>) -> Vec<(usize, f32)> {
-        let point_slice = point.as_slice().unwrap_or(&[]);
+        let point_slice = crate::array_utils::contiguous(point);
         let mut attributions = Vec::new();
 
         // Compute total violation
         let total_violation: f32 = self
             .constraints
             .iter()
-            .map(|c| c.violation(point_slice).max(0.0))
+            .map(|c| c.violation(&point_slice).max(0.0))
             .sum();
 
         if total_violation < 1e-8 {
@@ -329,7 +340,10 @@ impl<C: ViolationComputable + Clone> ViolationAttributionAnalyzer<C> {
             let viol_plus: f32 = self
                 .constraints
                 .iter()
-                .map(|c| c.violation(perturbed.as_slice().unwrap_or(&[])).max(0.0))
+                .map(|c| {
+                    c.violation(&crate::array_utils::contiguous(&perturbed))
+                        .max(0.0)
+                })
                 .sum();
 
             // Try negative perturbation
@@ -337,7 +351,10 @@ impl<C: ViolationComputable + Clone> ViolationAttributionAnalyzer<C> {
             let viol_minus: f32 = self
                 .constraints
                 .iter()
-                .map(|c| c.violation(perturbed.as_slice().unwrap_or(&[])).max(0.0))
+                .map(|c| {
+                    c.violation(&crate::array_utils::contiguous(&perturbed))
+                        .max(0.0)
+                })
                 .sum();
 
             // Sensitivity: how much violation changes with this dimension
@@ -356,13 +373,13 @@ impl<C: ViolationComputable + Clone> ViolationAttributionAnalyzer<C> {
 
     /// Create explanation with attributions
     pub fn explain(&self, point: &Array1<f32>) -> ViolationExplanation {
-        let point_slice = point.as_slice().unwrap_or(&[]);
+        let point_slice = crate::array_utils::contiguous(point);
         let attributions = self.attribute_violations(point);
 
         let total_violation: f32 = self
             .constraints
             .iter()
-            .map(|c| c.violation(point_slice).max(0.0))
+            .map(|c| c.violation(&point_slice).max(0.0))
             .sum();
 
         let mut explanation =
@@ -416,10 +433,10 @@ impl<C: ViolationComputable + Clone> CounterfactualAnalyzer<C> {
         let epsilon = 1e-4;
 
         for _ in 0..self.max_iterations {
-            let current_slice = current.as_slice().unwrap_or(&[]);
+            let current_slice = crate::array_utils::contiguous(&current);
 
             // Check if feasible
-            let is_feasible = self.constraints.iter().all(|c| c.check(current_slice));
+            let is_feasible = self.constraints.iter().all(|c| c.check(&current_slice));
             if is_feasible {
                 return Some(current);
             }
@@ -428,7 +445,7 @@ impl<C: ViolationComputable + Clone> CounterfactualAnalyzer<C> {
             let total_violation: f32 = self
                 .constraints
                 .iter()
-                .map(|c| c.violation(current_slice).max(0.0))
+                .map(|c| c.violation(&current_slice).max(0.0))
                 .sum();
 
             if total_violation < 1e-6 {
@@ -443,7 +460,10 @@ impl<C: ViolationComputable + Clone> CounterfactualAnalyzer<C> {
                 let viol_plus: f32 = self
                     .constraints
                     .iter()
-                    .map(|c| c.violation(perturbed.as_slice().unwrap_or(&[])).max(0.0))
+                    .map(|c| {
+                        c.violation(&crate::array_utils::contiguous(&perturbed))
+                            .max(0.0)
+                    })
                     .sum();
 
                 let grad = (viol_plus - total_violation) / epsilon;
@@ -459,11 +479,11 @@ impl<C: ViolationComputable + Clone> CounterfactualAnalyzer<C> {
 
     /// Generate counterfactual explanation
     pub fn explain(&self, point: &Array1<f32>) -> ViolationExplanation {
-        let point_slice = point.as_slice().unwrap_or(&[]);
+        let point_slice = crate::array_utils::contiguous(point);
         let total_violation: f32 = self
             .constraints
             .iter()
-            .map(|c| c.violation(point_slice).max(0.0))
+            .map(|c| c.violation(&point_slice).max(0.0))
             .sum();
 
         let mut explanation = ViolationExplanation::new(format!(
@@ -524,9 +544,14 @@ impl<C: ViolationComputable + Clone> ViolationExplainer<C> {
     }
 
     /// Set minimal violating subset finder
-    pub fn with_mvs_finder(mut self, constraints: Vec<C>, names: Vec<String>) -> Self {
-        self.mvs_finder = Some(MinimalViolatingSubsetFinder::new(constraints, names));
-        self
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::DimensionMismatch`] when `names` does not have one entry
+    /// per constraint.
+    pub fn with_mvs_finder(mut self, constraints: Vec<C>, names: Vec<String>) -> LogicResult<Self> {
+        self.mvs_finder = Some(MinimalViolatingSubsetFinder::new(constraints, names)?);
+        Ok(self)
     }
 
     /// Set attribution analyzer
@@ -617,7 +642,11 @@ mod tests {
             LinearConstraint::less_eq(vec![1.0], 3.0),
         ];
         let names = vec!["c1".to_string(), "c2".to_string()];
-        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names).expect("matched names");
+        assert!(
+            MinimalViolatingSubsetFinder::new(finder.constraints.clone(), vec![]).is_err(),
+            "a names/constraints length mismatch must be a recoverable error"
+        );
 
         let point = Array1::from_vec(vec![7.0]); // Violates both
         let mvs = finder.find_mvs(&point);
@@ -660,6 +689,7 @@ mod tests {
 
         let explainer = ViolationExplainer::new()
             .with_mvs_finder(constraints.clone(), names)
+            .expect("matched names")
             .with_attribution_analyzer(constraints.clone(), features)
             .with_counterfactual_analyzer(constraints, 100, 0.1);
 
@@ -704,7 +734,7 @@ mod tests {
             },
         ];
         let names = vec!["c0".to_string(), "c1".to_string()];
-        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names).expect("matched names");
 
         // Point (3.0, 3.0) satisfies both x0 <= 10 and x1 <= 10.
         let point = Array1::from_vec(vec![3.0_f32, 3.0]);
@@ -727,7 +757,7 @@ mod tests {
             },
         ];
         let names = vec!["c0".to_string(), "c1".to_string()];
-        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names).expect("matched names");
 
         // Point (8.0, 2.0): only constraint 0 (x0 <= 5) is violated.
         let point = Array1::from_vec(vec![8.0_f32, 2.0]);
@@ -757,7 +787,7 @@ mod tests {
             SimpleBound { dim: 1, upper: 3.0 },
         ];
         let names = vec!["c0".to_string(), "c1".to_string()];
-        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names).expect("matched names");
 
         // Both violated: x0 = 5 > 3, x1 = 5 > 3.
         let point = Array1::from_vec(vec![5.0_f32, 5.0]);
@@ -787,7 +817,7 @@ mod tests {
             SimpleBound { dim: 0, upper: 4.0 }, // index 1, larger violation
         ];
         let names = vec!["c0".to_string(), "c1".to_string()];
-        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names).expect("matched names");
 
         // x0 = 8 violates both.
         let point = Array1::from_vec(vec![8.0_f32]);
@@ -824,7 +854,7 @@ mod tests {
             SimpleBound { dim: 1, upper: 3.0 }, // index 2 (orthogonal)
         ];
         let names = vec!["c0".to_string(), "c1".to_string(), "c2".to_string()];
-        let finder = MinimalViolatingSubsetFinder::new(constraints, names);
+        let finder = MinimalViolatingSubsetFinder::new(constraints, names).expect("matched names");
 
         let point = Array1::from_vec(vec![8.0_f32, 5.0]);
         let mut mvs = finder.find_mvs(&point);

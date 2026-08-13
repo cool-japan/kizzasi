@@ -47,7 +47,7 @@ fn main() {
     println!("3. Differentiable Projection (Soft Projection)");
     println!("   Smooth projections that preserve gradients:\n");
 
-    let diff_proj = DifferentiableProjection::new(1.0);
+    let diff_proj = DifferentiableProjection::new(1.0).expect("positive temperature");
 
     println!("   Temperature: {}", diff_proj.temperature());
     println!("   Soft box projections (lower=0, upper=10):\n");
@@ -67,7 +67,7 @@ fn main() {
 
     let x_test = 15.0f32;
     for &temp in &[5.0f32, 2.0, 1.0, 0.5, 0.1] {
-        let proj = DifferentiableProjection::new(temp);
+        let proj = DifferentiableProjection::new(temp).expect("positive temperature");
         let result = proj.soft_project_box(x_test, 0.0, 10.0);
         println!("   Temperature {:.1}: x={} -> {:.2}", temp, x_test, result);
     }

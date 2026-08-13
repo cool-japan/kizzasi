@@ -218,6 +218,32 @@ fn test_wavelet_analysis() {
     assert!(!result.approximation.is_empty());
     assert!(!result.detail.is_empty());
     assert_eq!(result.level, 1); // dwt performs single level decomposition
+
+    // The transform must actually be invertible. This assertion is what was
+    // missing while `idwt` silently returned samples unrelated to the input
+    // for every wavelet except Haar.
+    let samples = signal.as_slice().unwrap();
+    let reconstructed = analyzer.idwt(&result.approximation, &result.detail, samples.len());
+    assert_eq!(reconstructed.len(), samples.len());
+    let max_error = samples
+        .iter()
+        .zip(reconstructed.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_error < 1e-4, "DWT round trip error {max_error}");
+
+    // ... and so must the multi-level transform used by `denoise`.
+    let multi = analyzer.dwt_multilevel(samples, 3);
+    let rebuilt = analyzer.idwt_multilevel(&multi);
+    let multi_error = samples
+        .iter()
+        .zip(rebuilt.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        multi_error < 1e-3,
+        "multi-level round trip error {multi_error}"
+    );
 }
 
 #[test]
@@ -245,15 +271,21 @@ async fn test_async_stream_processing() {
     let config = StreamConfig::default();
     let mut stream = AsyncMemoryStream::new(data.clone(), config);
 
-    // Read asynchronously - stream returns buffers of buffer_size (1024 default)
-    // Not the actual data length
+    // Read asynchronously. Per the stream read contract the buffer holds
+    // ONLY real samples: an 8-sample source yields an 8-sample block, not a
+    // 1024-sample block zero-padded with fabricated silence (which is what
+    // this test used to assert).
     let chunk = stream.read().await.unwrap();
 
-    // Should have read data (zero-padded to buffer_size)
-    assert_eq!(chunk.len(), 1024);
-    // First 8 samples should match our data
+    assert_eq!(chunk.len(), data.len());
     assert_eq!(chunk[0], 1.0);
     assert_eq!(chunk[7], 8.0);
+
+    // Once exhausted the stream reports EndOfStream rather than zeros.
+    assert!(matches!(
+        stream.read().await,
+        Err(kizzasi_io::IoError::EndOfStream)
+    ));
 }
 
 #[tokio::test]
@@ -300,7 +332,7 @@ fn test_zmq_message_construction() {
     assert_eq!(config.pattern, ZmqPattern::Pub);
 }
 
-#[cfg(all(feature = "ros2", not(target_os = "macos")))]
+#[cfg(feature = "ros2")]
 #[test]
 fn test_ros2_config_creation() {
     use kizzasi_io::{QosProfile, Ros2Config, Ros2MessageType};
@@ -326,7 +358,7 @@ fn test_ros2_config_creation() {
     assert_eq!(config.qos, QosProfile::SystemDefault);
 }
 
-#[cfg(all(feature = "ros2", not(target_os = "macos")))]
+#[cfg(feature = "ros2")]
 #[test]
 fn test_ros2_message_types() {
     use kizzasi_io::Ros2MessageType;
@@ -388,7 +420,7 @@ fn test_audio_device_listing() {
     // (This might fail on headless CI systems, so we just check the call succeeds)
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-pure"))]
 #[test]
 fn test_optical_flow_computation() {
     use kizzasi_io::{OpticalFlowEstimator, OpticalFlowMethod, VideoFrame};
@@ -452,7 +484,7 @@ fn test_optical_flow_computation() {
     }
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-pure"))]
 #[test]
 fn test_optical_flow_properties() {
     use kizzasi_io::{OpticalFlowEstimator, OpticalFlowMethod, VideoFrame};
@@ -497,7 +529,7 @@ fn test_optical_flow_properties() {
     assert!(out_of_bounds.is_none());
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-pure"))]
 #[test]
 fn test_camera_device_enumeration() {
     use kizzasi_io::CameraDevice;
@@ -532,7 +564,7 @@ fn test_camera_device_enumeration() {
     }
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-pure"))]
 #[test]
 fn test_video_config_camera() {
     use kizzasi_io::{VideoConfig, VideoSource};
@@ -557,7 +589,7 @@ fn test_video_config_camera() {
     }
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-pure"))]
 #[test]
 fn test_video_frame_conversions() {
     use kizzasi_io::VideoFrame;
@@ -577,8 +609,9 @@ fn test_video_frame_conversions() {
         ],
     };
 
-    // Convert to grayscale
-    let gray_frame = rgb_frame.to_grayscale();
+    // Convert to grayscale (fallible now: a frame whose data length does not
+    // match its dimensions returns an error instead of panicking)
+    let gray_frame = rgb_frame.to_grayscale().expect("valid RGB frame");
     assert_eq!(gray_frame.channels, 1);
     assert_eq!(gray_frame.data.len(), 4);
 
@@ -588,7 +621,7 @@ fn test_video_frame_conversions() {
     assert!(normalized.iter().all(|&x| (0.0..=1.0).contains(&x)));
 
     // Test array conversion
-    let array = rgb_frame.to_array();
+    let array = rgb_frame.to_array().expect("valid RGB frame");
     assert_eq!(array.shape(), &[2, 2, 3]);
 }
 
@@ -648,21 +681,29 @@ async fn test_channel_stream_async() {
     let (tx, rx) = mpsc::channel(10);
 
     // Create stream
-    let config = StreamConfig::default();
+    let config = StreamConfig::default().buffer_size(4);
     let mut stream = ChannelStream::new(config, rx);
 
     // Send some data
     tx.send(vec![1.0, 2.0, 3.0, 4.0]).await.unwrap();
 
-    // Read from stream
+    // Read from stream. Per the stream read contract the block contains only
+    // real samples -- this test used to assert a 1024-long buffer in which
+    // 1020 samples were fabricated zeros.
     let data = stream.read().await.unwrap();
 
-    // Should have received data (zero-padded to buffer_size)
-    assert_eq!(data.len(), 1024); // default buffer size
+    assert_eq!(data.len(), 4);
     assert_eq!(data[0], 1.0);
     assert_eq!(data[1], 2.0);
     assert_eq!(data[2], 3.0);
     assert_eq!(data[3], 4.0);
+
+    // Closing the producer ends the stream instead of yielding zeros forever.
+    drop(tx);
+    assert!(matches!(
+        stream.read().await,
+        Err(kizzasi_io::IoError::EndOfStream)
+    ));
 }
 
 #[test]

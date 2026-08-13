@@ -30,15 +30,13 @@ use crate::simd_neon::{
 
 // ─── dot product ─────────────────────────────────────────────────────────────
 
-/// Compute dot product of two equal-length f32 slices.
+/// Compute dot product of two f32 slices.
 ///
 /// Uses NEON FMA on aarch64; falls back to a scalar sum on other targets.
-///
-/// # Panics
-///
-/// Panics if `a.len() != b.len()`.
+/// `neon_dot_product` already handles a length mismatch internally (falling
+/// back to a zip-based scalar sum over the common prefix), so this wrapper
+/// does not need its own precondition check.
 pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "dot_product_f32: length mismatch");
     neon_dot_product(a, b)
 }
 
@@ -48,16 +46,15 @@ pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// NEON-vectorised on aarch64 (4 lanes per iteration).
 ///
-/// # Panics
-///
-/// Panics if `input.len() != output.len()`.
+/// `input`/`output` are truncated to their common length (matching
+/// [`crate::simd::dot_product`]'s documented truncation behaviour), so a
+/// mismatched length computes the well-defined prefix rather than panicking.
 pub fn relu_f32(input: &[f32], output: &mut [f32]) {
-    assert_eq!(input.len(), output.len(), "relu_f32: length mismatch");
-    // neon_relu returns CoreResult; a length mismatch was already checked above
-    // so the only remaining error path cannot fire here.
-    neon_relu(input, output).unwrap_or_else(|e| {
-        panic!("relu_f32: unexpected error from neon_relu: {e}");
-    });
+    let len = input.len().min(output.len());
+    // `neon_relu`'s only error condition is `x.len() != y.len()`; slicing
+    // both to the same `len` makes that structurally unreachable here, so
+    // discarding the (impossible) error is safe rather than a hedge.
+    let _ = neon_relu(&input[..len], &mut output[..len]);
 }
 
 // ─── addition ────────────────────────────────────────────────────────────────
@@ -66,15 +63,16 @@ pub fn relu_f32(input: &[f32], output: &mut [f32]) {
 ///
 /// NEON-vectorised on aarch64 (4 lanes per iteration).
 ///
-/// # Panics
-///
-/// Panics if slice lengths differ.
+/// `a`/`b`/`output` are truncated to their common length (matching
+/// [`crate::simd::dot_product`]'s documented truncation behaviour), so a
+/// mismatched length computes the well-defined prefix rather than panicking.
 pub fn add_f32(a: &[f32], b: &[f32], output: &mut [f32]) {
-    assert_eq!(a.len(), b.len(), "add_f32: a/b length mismatch");
-    assert_eq!(a.len(), output.len(), "add_f32: a/output length mismatch");
-    neon_vec_add(a, b, output).unwrap_or_else(|e| {
-        panic!("add_f32: unexpected error from neon_vec_add: {e}");
-    });
+    let len = a.len().min(b.len()).min(output.len());
+    // `neon_vec_add`'s only error condition is a length mismatch among its
+    // three arguments; slicing all three to the same `len` makes that
+    // structurally unreachable here, so discarding the (impossible) error is
+    // safe rather than a hedge.
+    let _ = neon_vec_add(&a[..len], &b[..len], &mut output[..len]);
 }
 
 // ─── scale ───────────────────────────────────────────────────────────────────
@@ -161,14 +159,16 @@ pub fn softmax_f32(x: &mut [f32]) {
 ///
 /// NEON-vectorised on aarch64 for both the sum-of-squares and the scale pass.
 ///
-/// # Panics
-///
-/// Panics if `x.len() != output.len()`.
+/// `x`/`output` are truncated to their common length (matching
+/// [`crate::simd::dot_product`]'s documented truncation behaviour): the RMS
+/// statistic is computed over the shared prefix rather than panicking on a
+/// mismatched length.
 pub fn rms_norm_f32(x: &[f32], output: &mut [f32], eps: f32) {
-    assert_eq!(x.len(), output.len(), "rms_norm_f32: length mismatch");
-    neon_rms_norm(x, output, eps).unwrap_or_else(|e| {
-        panic!("rms_norm_f32: unexpected error: {e}");
-    });
+    let len = x.len().min(output.len());
+    // `neon_rms_norm`'s only error condition is `x.len() != output.len()`;
+    // slicing both to the same `len` makes that structurally unreachable
+    // here, so discarding the (impossible) error is safe rather than a hedge.
+    let _ = neon_rms_norm(&x[..len], &mut output[..len], eps);
 }
 
 // ─── SSM state update ────────────────────────────────────────────────────────
@@ -179,23 +179,16 @@ pub fn rms_norm_f32(x: &[f32], output: &mut [f32], eps: f32) {
 ///
 /// Uses NEON FMA on aarch64 (4 lanes per iteration).
 ///
-/// # Panics
-///
-/// Panics if slice lengths differ.
+/// `a_bar`/`h`/`b_bar` are truncated to their common length (matching
+/// [`crate::simd::dot_product`]'s documented truncation behaviour), so a
+/// mismatched length updates the well-defined prefix rather than panicking.
 pub fn ssm_state_update_f32(a_bar: &[f32], h: &mut [f32], b_bar: &[f32], x_val: f32) {
-    assert_eq!(
-        a_bar.len(),
-        h.len(),
-        "ssm_state_update_f32: a_bar/h length mismatch"
-    );
-    assert_eq!(
-        b_bar.len(),
-        h.len(),
-        "ssm_state_update_f32: b_bar/h length mismatch"
-    );
-    neon_ssm_update(a_bar, h, b_bar, x_val).unwrap_or_else(|e| {
-        panic!("ssm_state_update_f32: unexpected error: {e}");
-    });
+    let len = a_bar.len().min(h.len()).min(b_bar.len());
+    // `neon_ssm_update`'s only error condition is a length mismatch among
+    // `a_bar`/`h`/`b_bar`; slicing all three to the same `len` makes that
+    // structurally unreachable here, so discarding the (impossible) error is
+    // safe rather than a hedge.
+    let _ = neon_ssm_update(&a_bar[..len], &mut h[..len], &b_bar[..len], x_val);
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────

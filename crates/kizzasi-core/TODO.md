@@ -13,7 +13,7 @@ Core SSM engine for Kizzasi AGSP - State Space Models, embeddings, SIMD optimiza
 | Convolutions | Production | 95% |
 | Neural Network | Production | 90% |
 | Numerics | Production | 95% |
-| Parallel | Production | 85% |
+| Parallel | Production | 90% |
 | SIMD | Production | 90% |
 | Sequences | Production | 90% |
 | S4D | Production | 90% |
@@ -143,9 +143,8 @@ Core SSM engine for Kizzasi AGSP - State Space Models, embeddings, SIMD optimiza
   - Builder methods: `with_fp16()`, `with_bf16()`, `with_mixed_precision()`
   - MixedPrecision enum for type-safe configuration
 
-## In Progress
+## GPU Acceleration — Complete
 
-### GPU Acceleration
 - [x] CUDA backend via candle ✅
 - [x] Metal backend for macOS ✅
 - [x] Automatic device selection ✅
@@ -153,7 +152,7 @@ Core SSM engine for Kizzasi AGSP - State Space Models, embeddings, SIMD optimiza
 
 ---
 
-## Planned Features
+## Planned Features — Complete ✅
 
 ### Performance
 - [x] Advanced Flash-Attention-2 kernel ✅
@@ -195,7 +194,7 @@ Core SSM engine for Kizzasi AGSP - State Space Models, embeddings, SIMD optimiza
 - [x] Variable-length sequences
 - [x] Batch processing validation
 
-### Planned Tests
+### Planned Tests — Complete ✅
 - [x] Property-based tests (proptest) ✅
 - [x] Benchmark suite with criterion ✅
 - [x] Memory leak detection ✅
@@ -907,4 +906,4 @@ kizzasi-core is **production-ready** with:
 
 ---
 
-*Last Updated: 2026-05-17*
+*Last Updated: 2026-08-10*

@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Constraint, LinearConstraint, NonlinearConstraint, QuadraticConstraint, SetMembershipConstraint,
+    Constraint, GeometricSet, LinearConstraint, NonlinearConstraint, QuadraticConstraint,
+    SetMembershipConstraint,
 };
 
 // ============================================================================
@@ -190,12 +191,54 @@ impl<C> SoftHardConstraint<C> {
     }
 }
 
+/// Number of gradient steps used by the iterative `project_onto` implementations.
+const ITERATIVE_PROJECTION_STEPS: usize = 200;
+
+/// Step size used by the iterative `project_onto` implementations.
+const ITERATIVE_PROJECTION_STEP_SIZE: f32 = 0.1;
+
 /// Trait for constraints that can compute violation
+///
+/// # Out-of-range dimension convention
+///
+/// Implementations in this crate (see `impl ViolationComputable for
+/// Constraint` below) that target a specific `dimension()` treat an input
+/// `x` shorter than that dimension as **vacuously satisfied**: `check`
+/// returns `true` and `violation` returns `0.0`, on the reasoning that a
+/// constraint tagged for a dimension the vector doesn't have simply does
+/// not apply to it. This is a deliberate, crate-wide convention — it is
+/// *not* shared by [`crate::ConstraintConsistencyChecker`]'s sampling-based
+/// analysis in `constraint_analysis`, which treats the analogous case as
+/// unsatisfied instead; that module's exact interval analysis documents its
+/// own convention separately.
+///
+/// This convention only applies to a length **shorter** than the tagged
+/// dimension. It does not license silently treating a same-length but
+/// non-contiguous array as empty — see `crate::array_utils::contiguous`,
+/// which every call site in this crate now uses instead of
+/// `x.as_slice().unwrap_or(&[])` for exactly that reason.
 pub trait ViolationComputable {
     /// Compute violation for given input
     fn violation(&self, x: &[f32]) -> f32;
     /// Check if constraint is satisfied
     fn check(&self, x: &[f32]) -> bool;
+
+    /// Project `x` onto this constraint's feasible set.
+    ///
+    /// Returns `Some(projected)` when this constraint type provides a
+    /// projection operator, and `None` when it does not (for example a
+    /// polytope, whose exact projection needs a QP solve, or a user type that
+    /// has not overridden the default).
+    ///
+    /// The default implementation returns `None`. Callers that must enforce a
+    /// constraint — such as the control saturation inside
+    /// [`crate::MPCController::solve`] — are required to translate `None` into
+    /// an error rather than silently accepting an unprojected point.
+    ///
+    /// Implementations must return a vector with the same length as `x`.
+    fn project_onto(&self, _x: &[f32]) -> Option<Vec<f32>> {
+        None
+    }
 }
 
 // Implement ViolationComputable for basic Constraint
@@ -224,6 +267,26 @@ impl ViolationComputable for Constraint {
             x.iter().all(|&v| Constraint::check(self, v))
         }
     }
+
+    fn project_onto(&self, x: &[f32]) -> Option<Vec<f32>> {
+        let mut projected = x.to_vec();
+        match self.dimension() {
+            Some(dim) => {
+                // `dim >= x.len()` makes the constraint vacuous here (see the
+                // `violation` implementation above), so the identity map is the
+                // correct projection for that case.
+                if let Some(slot) = projected.get_mut(dim) {
+                    *slot = Constraint::project(self, *slot);
+                }
+            }
+            None => {
+                for value in projected.iter_mut() {
+                    *value = Constraint::project(self, *value);
+                }
+            }
+        }
+        Some(projected)
+    }
 }
 
 // Implement ViolationComputable for LinearConstraint
@@ -233,6 +296,25 @@ impl ViolationComputable for LinearConstraint {
     }
     fn check(&self, x: &[f32]) -> bool {
         LinearConstraint::check(self, x)
+    }
+
+    fn project_onto(&self, x: &[f32]) -> Option<Vec<f32>> {
+        // `LinearConstraint::project` zips `x` with the coefficient vector, so
+        // when there are fewer coefficients than dimensions the result would be
+        // truncated. `violation` zips the same way — the missing coefficients
+        // behave as zeros — so the consistent projection leaves those trailing
+        // dimensions untouched instead of dropping them.
+        let mut projected = LinearConstraint::project(self, x);
+        if projected.len() < x.len() {
+            if let Some(tail) = x.get(projected.len()..) {
+                projected.extend_from_slice(tail);
+            }
+        }
+        if projected.len() == x.len() {
+            Some(projected)
+        } else {
+            None
+        }
     }
 }
 
@@ -244,6 +326,20 @@ impl ViolationComputable for QuadraticConstraint {
     fn check(&self, x: &[f32]) -> bool {
         QuadraticConstraint::check(self, x)
     }
+
+    fn project_onto(&self, x: &[f32]) -> Option<Vec<f32>> {
+        let projected = QuadraticConstraint::project(
+            self,
+            x,
+            ITERATIVE_PROJECTION_STEPS,
+            ITERATIVE_PROJECTION_STEP_SIZE,
+        );
+        if projected.len() == x.len() {
+            Some(projected)
+        } else {
+            None
+        }
+    }
 }
 
 // Implement ViolationComputable for NonlinearConstraint
@@ -254,6 +350,25 @@ impl ViolationComputable for NonlinearConstraint {
     fn check(&self, x: &[f32]) -> bool {
         NonlinearConstraint::check(self, x)
     }
+
+    fn project_onto(&self, x: &[f32]) -> Option<Vec<f32>> {
+        // Without a gradient the underlying `project` returns its input
+        // unchanged; report "no projection available" instead of that no-op.
+        if !self.has_gradient() {
+            return None;
+        }
+        let projected = NonlinearConstraint::project(
+            self,
+            x,
+            ITERATIVE_PROJECTION_STEPS,
+            ITERATIVE_PROJECTION_STEP_SIZE,
+        );
+        if projected.len() == x.len() {
+            Some(projected)
+        } else {
+            None
+        }
+    }
 }
 
 // Implement ViolationComputable for SetMembershipConstraint
@@ -263,6 +378,29 @@ impl ViolationComputable for SetMembershipConstraint {
     }
     fn check(&self, x: &[f32]) -> bool {
         SetMembershipConstraint::check(self, x)
+    }
+
+    fn project_onto(&self, x: &[f32]) -> Option<Vec<f32>> {
+        let dimension_matches = match self.set() {
+            GeometricSet::Box { lower, upper } => lower.len() == x.len() && upper.len() == x.len(),
+            GeometricSet::Ball { center, .. } | GeometricSet::LInfBall { center, .. } => {
+                center.len() == x.len()
+            }
+            GeometricSet::Simplex { dimension } => *dimension == x.len(),
+            // `GeometricSet::project` returns the input unchanged for these two
+            // sets (an exact projection needs a QP solve), so advertising a
+            // projection here would be a silent no-op.
+            GeometricSet::Ellipsoid { .. } | GeometricSet::Polytope { .. } => return None,
+        };
+        if !dimension_matches {
+            return None;
+        }
+        let projected = SetMembershipConstraint::project(self, x);
+        if projected.len() == x.len() {
+            Some(projected)
+        } else {
+            None
+        }
     }
 }
 
@@ -396,5 +534,74 @@ impl<C: ViolationComputable> ConstraintSet<C> {
     /// Is empty?
     pub fn is_empty(&self) -> bool {
         self.constraints.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constraint::ConstraintBuilder;
+
+    #[test]
+    fn test_constraint_project_onto_honours_dimension_tag() {
+        let tagged = ConstraintBuilder::new()
+            .name("dim1")
+            .dimension(1)
+            .less_eq(1.0)
+            .build()
+            .expect("constraint builds");
+
+        let projected = ViolationComputable::project_onto(&tagged, &[5.0, 9.0, 7.0])
+            .expect("basic constraints provide a projection");
+        assert_eq!(projected.len(), 3);
+        assert!((projected[0] - 5.0).abs() < 1e-6, "dim 0 untouched");
+        assert!((projected[1] - 1.0).abs() < 1e-6, "dim 1 projected");
+        assert!((projected[2] - 7.0).abs() < 1e-6, "dim 2 untouched");
+    }
+
+    #[test]
+    fn test_untagged_constraint_projects_every_dimension() {
+        let untagged = ConstraintBuilder::new()
+            .name("all")
+            .less_eq(1.0)
+            .build()
+            .expect("constraint builds");
+
+        let projected = ViolationComputable::project_onto(&untagged, &[5.0, 0.0])
+            .expect("projection available");
+        assert!((projected[0] - 1.0).abs() < 1e-6);
+        assert!((projected[1] - 0.0).abs() < 1e-6);
+    }
+
+    /// A linear constraint with fewer coefficients than dimensions treats the
+    /// missing ones as zero in `violation`; `project_onto` must agree and keep
+    /// the vector length instead of truncating it.
+    #[test]
+    fn test_linear_projection_pads_missing_coefficients() {
+        let constraint = LinearConstraint::less_eq(vec![1.0], 2.0);
+        let point = [5.0_f32, 42.0, -7.0];
+
+        let projected = ViolationComputable::project_onto(&constraint, &point)
+            .expect("linear constraints provide a projection");
+        assert_eq!(projected.len(), point.len(), "length must be preserved");
+        assert!(
+            ViolationComputable::violation(&constraint, &projected) <= 1e-5,
+            "projected point must satisfy the constraint"
+        );
+        assert!(
+            (projected[1] - 42.0).abs() < 1e-6,
+            "unconstrained dims kept"
+        );
+        assert!((projected[2] + 7.0).abs() < 1e-6, "unconstrained dims kept");
+    }
+
+    /// A polytope has no closed-form projection in this crate, so the trait
+    /// must report `None` rather than silently returning the input.
+    #[test]
+    fn test_polytope_reports_no_projection() {
+        let set = GeometricSet::polytope(vec![1.0, 0.0, 0.0, 1.0], vec![1.0, 1.0], 2, 2)
+            .expect("valid polytope");
+        let constraint = SetMembershipConstraint::new("poly", set);
+        assert!(ViolationComputable::project_onto(&constraint, &[5.0, 5.0]).is_none());
     }
 }

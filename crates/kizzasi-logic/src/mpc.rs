@@ -19,16 +19,27 @@
 //! - Resource scheduling with temporal constraints
 
 use crate::constraint::ViolationComputable;
-use crate::error::LogicResult;
+use crate::error::{LogicError, LogicResult};
 use scirs2_core::ndarray::{Array1, Array2};
 use std::collections::VecDeque;
 
+/// Maximum number of cyclic-projection sweeps used to enforce control constraints.
+const CONTROL_PROJECTION_SWEEPS: usize = 200;
+
+/// Finite-difference step used for the numerical constraint-penalty gradient.
+const GRADIENT_EPSILON: f32 = 1e-5;
+
 /// MPC Configuration
+///
+/// `prediction_horizon` (N) is the number of steps the plant is rolled out and
+/// costed; `control_horizon` (M) is the number of control vectors that are
+/// actually optimised. `M <= N` is required. Steps `M..N` reuse the last
+/// optimised control (a "hold-last" move-blocking scheme).
 #[derive(Debug, Clone)]
 pub struct MPCConfig {
     /// Prediction horizon (time steps to predict)
     pub prediction_horizon: usize,
-    /// Control horizon (time steps to optimize)
+    /// Control horizon (time steps to optimize); must be `>= 1` and `<= prediction_horizon`
     pub control_horizon: usize,
     /// State dimension
     pub state_dim: usize,
@@ -56,6 +67,39 @@ impl Default for MPCConfig {
             warm_start: true,
             terminal_weight: 1.0,
         }
+    }
+}
+
+impl MPCConfig {
+    /// Validate the horizon and dimension settings.
+    ///
+    /// Returns [`LogicError::InvalidInput`] when the configuration cannot
+    /// describe a well-posed MPC problem: a zero control/prediction horizon, a
+    /// control horizon longer than the prediction horizon, or a zero control
+    /// dimension.
+    pub fn validate(&self) -> LogicResult<()> {
+        if self.prediction_horizon == 0 {
+            return Err(LogicError::InvalidInput(
+                "prediction_horizon must be >= 1".to_string(),
+            ));
+        }
+        if self.control_horizon == 0 {
+            return Err(LogicError::InvalidInput(
+                "control_horizon must be >= 1".to_string(),
+            ));
+        }
+        if self.control_horizon > self.prediction_horizon {
+            return Err(LogicError::InvalidInput(format!(
+                "control_horizon ({}) must not exceed prediction_horizon ({})",
+                self.control_horizon, self.prediction_horizon
+            )));
+        }
+        if self.control_dim == 0 {
+            return Err(LogicError::InvalidInput(
+                "control_dim must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -271,39 +315,64 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
 
     /// Solve MPC problem for current state
     ///
-    /// Returns the optimal control sequence
+    /// The plant is rolled out for `config.prediction_horizon` (N) steps while
+    /// only `config.control_horizon` (M) control vectors are optimised; the
+    /// last optimised control is held constant for the remaining `N - M` steps
+    /// (hold-last move blocking). The returned
+    /// [`MPCSolution::controls`] therefore has `M` entries and
+    /// [`MPCSolution::predicted_states`] has `N + 1` entries.
+    ///
+    /// Every candidate control is projected onto the registered control
+    /// constraints; if that projection cannot be carried out (no projection
+    /// operator, or an empty constraint intersection) the solve fails with
+    /// [`LogicError::ProjectionFailed`] instead of returning a control that
+    /// violates the configured limits.
     pub fn solve(&mut self, current_state: &Array1<f32>) -> LogicResult<MPCSolution> {
-        let horizon = self.config.control_horizon;
+        self.config.validate()?;
 
-        // Initialize control sequence
-        let mut controls = if self.config.warm_start {
-            if let Some(prev_controls) = &self.previous_controls {
-                // Warm start from previous solution (shift and append)
-                let mut prev = prev_controls.clone();
-                if !prev.is_empty() {
-                    prev.pop_front();
-                    prev.push_back(Array1::zeros(self.config.control_dim));
-                }
-                prev.into_iter().collect::<Vec<_>>()
-            } else {
-                // Cold start with zeros
-                vec![Array1::zeros(self.config.control_dim); horizon]
+        let control_horizon = self.config.control_horizon;
+        let prediction_horizon = self.config.prediction_horizon;
+        let control_dim = self.config.control_dim;
+
+        // Initialize the decision variables (one control vector per control step)
+        let mut controls = match (self.config.warm_start, self.previous_controls.as_ref()) {
+            (true, Some(prev_controls)) => {
+                // Warm start from the previous solution (shift by one step) and
+                // resize to the horizon/dimension currently configured.
+                let mut shifted: Vec<Array1<f32>> = prev_controls
+                    .iter()
+                    .skip(1)
+                    .map(|u| {
+                        if u.len() == control_dim {
+                            u.clone()
+                        } else {
+                            Array1::zeros(control_dim)
+                        }
+                    })
+                    .collect();
+                shifted.resize(control_horizon, Array1::zeros(control_dim));
+                shifted
             }
-        } else {
-            // Cold start with zeros
-            vec![Array1::zeros(self.config.control_dim); horizon]
+            _ => vec![Array1::zeros(control_dim); control_horizon],
         };
+
+        // Every control must start inside the feasible set, otherwise the very
+        // first reported solution could violate the configured limits.
+        for control in controls.iter_mut() {
+            *control = self.project_control(control)?;
+        }
 
         // Gradient descent optimization
         let step_size = 0.01;
         let mut best_cost = f32::INFINITY;
 
         for iteration in 0..self.config.max_iterations {
-            // Forward simulate to get state trajectory
-            let states = self.simulate_trajectory(current_state, &controls);
+            // Forward simulate the full prediction horizon
+            let applied = Self::expand_controls(&controls, prediction_horizon);
+            let states = self.simulate_trajectory(current_state, &applied);
 
             // Compute total cost
-            let cost = self.compute_total_cost(&states, &controls);
+            let cost = self.compute_total_cost(&states, &applied);
 
             if cost < best_cost {
                 best_cost = cost;
@@ -315,12 +384,12 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
             }
 
             // Compute gradient and update controls
-            for t in 0..horizon {
-                let grad = self.compute_control_gradient(&states, &controls, t);
+            for (t, control) in controls.iter_mut().enumerate() {
+                let grad = self.compute_control_gradient(&states, &applied, t, control_horizon)?;
 
                 // Gradient descent step with projection
-                let new_control = &controls[t] - &(&grad * step_size);
-                controls[t] = self.project_control(&new_control);
+                let new_control = &*control - &(&grad * step_size);
+                *control = self.project_control(&new_control)?;
             }
         }
 
@@ -329,18 +398,35 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
             self.previous_controls = Some(controls.iter().cloned().collect());
         }
 
-        // Simulate final trajectory
-        let final_states = self.simulate_trajectory(current_state, &controls);
-        let final_cost = self.compute_total_cost(&final_states, &controls);
-        let constraint_violation = self.compute_raw_violation(&final_states, &controls);
+        // Simulate final trajectory over the full prediction horizon
+        let applied = Self::expand_controls(&controls, prediction_horizon);
+        let final_states = self.simulate_trajectory(current_state, &applied);
+        let final_cost = self.compute_total_cost(&final_states, &applied);
+        let constraint_violation = self.compute_raw_violation(&final_states, &applied);
 
         Ok(MPCSolution {
             controls,
             predicted_states: final_states,
             total_cost: final_cost,
-            horizon,
+            horizon: prediction_horizon,
+            control_horizon,
             constraint_violation,
         })
+    }
+
+    /// Expand the `M` optimised controls into the `N` controls that are applied
+    /// over the prediction horizon, holding the last optimised control constant
+    /// for steps `M..N`.
+    fn expand_controls(controls: &[Array1<f32>], prediction_horizon: usize) -> Vec<Array1<f32>> {
+        let mut applied = Vec::with_capacity(prediction_horizon);
+        for step in 0..prediction_horizon {
+            let index = step.min(controls.len().saturating_sub(1));
+            match controls.get(index) {
+                Some(control) => applied.push(control.clone()),
+                None => break,
+            }
+        }
+        applied
     }
 
     /// Simulate trajectory forward
@@ -370,10 +456,11 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
 
         // Stage costs
         for (t, control) in controls.iter().enumerate() {
-            cost += self.cost.stage_cost(&states[t], control, t);
+            let Some(state) = states.get(t) else { break };
+            cost += self.cost.stage_cost(state, control, t);
 
             // Add constraint violations
-            cost += self.constraint_violation_cost(&states[t], control);
+            cost += self.constraint_violation_cost(state, control);
         }
 
         // Terminal cost
@@ -412,7 +499,8 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
     fn compute_raw_violation(&self, states: &[Array1<f32>], controls: &[Array1<f32>]) -> f32 {
         let mut v = 0.0_f32;
         for (t, control) in controls.iter().enumerate() {
-            let s: Vec<f32> = states[t].iter().copied().collect();
+            let Some(state) = states.get(t) else { break };
+            let s: Vec<f32> = state.iter().copied().collect();
             for c in &self.state_constraints {
                 v += c.violation(&s);
             }
@@ -424,49 +512,154 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
         v
     }
 
-    /// Compute gradient of cost w.r.t. control at time t
+    /// Compute the gradient of the cost w.r.t. the `t`-th *decision* control.
+    ///
+    /// `controls` is the expanded (applied) sequence of length
+    /// `prediction_horizon`. Decision control `t` drives prediction step `t`,
+    /// and the last decision control is additionally held for every step in
+    /// `control_horizon..prediction_horizon`, so its gradient accumulates the
+    /// contribution of all held steps.
     fn compute_control_gradient(
         &self,
         states: &[Array1<f32>],
         controls: &[Array1<f32>],
         t: usize,
-    ) -> Array1<f32> {
-        // Direct gradient from cost function
-        let direct_grad = self
-            .cost
-            .stage_cost_grad_control(&states[t], &controls[t], t);
+        control_horizon: usize,
+    ) -> LogicResult<Array1<f32>> {
+        let control_dim = self.config.control_dim;
+        let mut gradient = Array1::<f32>::zeros(control_dim);
 
-        // Numerical gradient for constraints (simplified)
-        let mut constraint_grad = Array1::zeros(self.config.control_dim);
-        let eps = 1e-5;
+        let last_decision = control_horizon.saturating_sub(1);
+        let end = if t == last_decision {
+            controls.len()
+        } else {
+            (t + 1).min(controls.len())
+        };
 
-        for i in 0..self.config.control_dim {
-            let mut control_plus = controls[t].clone();
-            control_plus[i] += eps;
+        for step in t..end {
+            let (Some(state), Some(control)) = (states.get(step), controls.get(step)) else {
+                break;
+            };
 
-            let cost_plus = self.constraint_violation_cost(&states[t], &control_plus);
-            let cost_base = self.constraint_violation_cost(&states[t], &controls[t]);
+            // Direct gradient from the cost function
+            let direct = self.cost.stage_cost_grad_control(state, control, step);
+            if direct.len() != control_dim {
+                return Err(LogicError::DimensionMismatch {
+                    expected: control_dim,
+                    got: direct.len(),
+                });
+            }
+            gradient = &gradient + &direct;
 
-            constraint_grad[i] = (cost_plus - cost_base) / eps;
-        }
-
-        &direct_grad + &constraint_grad
-    }
-
-    /// Project control onto constraint set
-    fn project_control(&self, control: &Array1<f32>) -> Array1<f32> {
-        let mut projected = control.clone();
-
-        // Simple box projection for each constraint
-        for constraint in &self.control_constraints {
-            let control_slice: Vec<f32> = projected.iter().copied().collect();
-            if constraint.violation(&control_slice) > 0.0 {
-                // Simplified projection (would use more sophisticated method in practice)
-                projected = projected.mapv(|x| x.clamp(-10.0, 10.0));
+            // Numerical gradient of the constraint penalty. The unperturbed
+            // penalty is invariant across the control dimensions, so it is
+            // evaluated once per step rather than once per dimension.
+            let base = self.constraint_violation_cost(state, control);
+            let mut perturbed = control.clone();
+            for i in 0..control_dim {
+                let Some(original) = perturbed.get(i).copied() else {
+                    break;
+                };
+                if let Some(slot) = perturbed.get_mut(i) {
+                    *slot = original + GRADIENT_EPSILON;
+                }
+                let plus = self.constraint_violation_cost(state, &perturbed);
+                if let Some(slot) = perturbed.get_mut(i) {
+                    *slot = original;
+                }
+                if let Some(slot) = gradient.get_mut(i) {
+                    *slot += (plus - base) / GRADIENT_EPSILON;
+                }
             }
         }
 
-        projected
+        Ok(gradient)
+    }
+
+    /// Project a control vector onto the registered control constraint set.
+    ///
+    /// Uses cyclic projection (POCS): each violated constraint is replaced by
+    /// its own projection operator, sweeping until every constraint is
+    /// satisfied within `config.tolerance`. For a single constraint this is the
+    /// exact Euclidean projection.
+    ///
+    /// # Errors
+    ///
+    /// * [`LogicError::ProjectionFailed`] when a violated constraint offers no
+    ///   projection operator ([`ViolationComputable::project_onto`] returned
+    ///   `None`), or when the sweeps do not reach a feasible point (an empty or
+    ///   numerically empty constraint intersection).
+    /// * [`LogicError::DimensionMismatch`] when a projection returns a vector
+    ///   of a different length.
+    fn project_control(&self, control: &Array1<f32>) -> LogicResult<Array1<f32>> {
+        if self.control_constraints.is_empty() {
+            return Ok(control.clone());
+        }
+
+        let tolerance = self.config.tolerance.max(f32::EPSILON);
+        let mut current: Vec<f32> = control.iter().copied().collect();
+
+        for _ in 0..CONTROL_PROJECTION_SWEEPS {
+            let mut max_move = 0.0_f32;
+
+            for constraint in &self.control_constraints {
+                if constraint.violation(&current) <= tolerance {
+                    continue;
+                }
+
+                let projected = constraint.project_onto(&current).ok_or_else(|| {
+                    LogicError::ProjectionFailed(
+                        "control constraint has no projection operator \
+                         (ViolationComputable::project_onto returned None)"
+                            .to_string(),
+                    )
+                })?;
+
+                if projected.len() != current.len() {
+                    return Err(LogicError::DimensionMismatch {
+                        expected: current.len(),
+                        got: projected.len(),
+                    });
+                }
+
+                max_move = max_move.max(
+                    projected
+                        .iter()
+                        .zip(current.iter())
+                        .map(|(p, c)| (p - c).abs())
+                        .fold(0.0_f32, f32::max),
+                );
+                current = projected;
+            }
+
+            if self.total_control_violation(&current) <= tolerance {
+                return Ok(Array1::from_vec(current));
+            }
+
+            if max_move <= tolerance {
+                // The sweep stalled: no constraint could move the point any
+                // further, yet the point is still infeasible.
+                break;
+            }
+        }
+
+        let residual = self.total_control_violation(&current);
+        if residual <= tolerance {
+            Ok(Array1::from_vec(current))
+        } else {
+            Err(LogicError::ProjectionFailed(format!(
+                "control projection did not converge: residual violation {residual} \
+                 exceeds tolerance {tolerance}"
+            )))
+        }
+    }
+
+    /// Sum of all control-constraint violations at `control`.
+    fn total_control_violation(&self, control: &[f32]) -> f32 {
+        self.control_constraints
+            .iter()
+            .map(|constraint| constraint.violation(control))
+            .sum()
     }
 
     /// Reset warm start cache
@@ -476,24 +669,36 @@ impl<D: DynamicsModel, C: MPCCost> MPCController<D, C> {
 }
 
 /// MPC Solution
+///
+/// `controls` holds the `control_horizon` optimised control vectors; the last
+/// one is held constant for the remaining prediction steps, so
+/// `predicted_states` has `horizon + 1` entries.
+///
+/// Control constraints registered on the controller are hard-enforced by
+/// projection, so `controls` satisfies them to within `MPCConfig::tolerance`
+/// (the solve fails rather than returning a control that does not). State
+/// constraints are only penalised in the cost — their residual is reported
+/// through `constraint_violation`, not eliminated.
 #[derive(Debug, Clone)]
 pub struct MPCSolution {
-    /// Optimal control sequence
+    /// Optimised control sequence (`control_horizon` entries)
     pub controls: Vec<Array1<f32>>,
-    /// Predicted state trajectory
+    /// Predicted state trajectory (`horizon + 1` entries)
     pub predicted_states: Vec<Array1<f32>>,
     /// Total cost
     pub total_cost: f32,
-    /// Horizon length
+    /// Prediction horizon length (number of simulated steps)
     pub horizon: usize,
+    /// Control horizon length (number of optimised control vectors)
+    pub control_horizon: usize,
     /// Raw sum of all constraint violations (without penalty scaling)
     pub constraint_violation: f32,
 }
 
 impl MPCSolution {
-    /// Get first control (to be applied)
-    pub fn first_control(&self) -> &Array1<f32> {
-        &self.controls[0]
+    /// Get first control (to be applied), or `None` for an empty sequence
+    pub fn first_control(&self) -> Option<&Array1<f32>> {
+        self.controls.first()
     }
 
     /// Get predicted state at time step
@@ -502,6 +707,12 @@ impl MPCSolution {
     }
 
     /// Check if all constraints are satisfied within numerical tolerance.
+    ///
+    /// `constraint_violation` is a **sum** over every predicted step, while the
+    /// threshold here is absolute. Control constraints are projected to (near)
+    /// exact feasibility so they contribute ~0; the residual this reports is
+    /// therefore dominated by the state constraints, which are only penalised
+    /// in the cost and never projected.
     pub fn is_feasible(&self) -> bool {
         self.total_cost.is_finite() && self.constraint_violation <= 1e-4
     }
@@ -510,6 +721,7 @@ impl MPCSolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constraint::ConstraintBuilder;
 
     #[test]
     fn test_mpc_config() {
@@ -639,10 +851,14 @@ mod tests {
             predicted_states: states,
             total_cost: 1.5,
             horizon: 3,
+            control_horizon: 3,
             constraint_violation: 0.0,
         };
 
-        assert_eq!(solution.first_control()[0], 1.0);
+        assert_eq!(
+            solution.first_control().expect("first control present")[0],
+            1.0
+        );
         assert_eq!(solution.predicted_state(0).unwrap()[0], 0.0);
         assert_eq!(solution.predicted_state(2).unwrap()[0], 0.15);
         assert!(solution.is_feasible());
@@ -661,6 +877,7 @@ mod tests {
             predicted_states: dummy_states.clone(),
             total_cost: 2.0,
             horizon: 1,
+            control_horizon: 1,
             constraint_violation: 0.0,
         };
 
@@ -669,6 +886,7 @@ mod tests {
             predicted_states: dummy_states,
             total_cost: 502.0, // finite but violating (penalty already baked in)
             horizon: 1,
+            control_horizon: 1,
             constraint_violation: 5.0,
         };
 
@@ -686,6 +904,7 @@ mod tests {
             predicted_states: dummy_states.clone(),
             total_cost: f32::INFINITY,
             horizon: 1,
+            control_horizon: 1,
             constraint_violation: 0.0,
         };
         assert!(!inf_solution.is_feasible());
@@ -695,8 +914,235 @@ mod tests {
             predicted_states: dummy_states,
             total_cost: f32::NAN,
             horizon: 1,
+            control_horizon: 1,
             constraint_violation: 0.0,
         };
         assert!(!nan_solution.is_feasible());
+    }
+
+    /// Build a scalar integrator (x_{t+1} = x_t + u_t) driven toward
+    /// `reference` with control weight `control_weight`. A large weight makes
+    /// the very first gradient step ask for a large control, which is what
+    /// exercises the projection.
+    fn integrator_controller(
+        config: MPCConfig,
+        reference: f32,
+        control_weight: f32,
+    ) -> MPCController<LinearDynamics, QuadraticCost> {
+        let a = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("1x1 A");
+        let b = Array2::from_shape_vec((1, 1), vec![1.0_f32]).expect("1x1 B");
+        let dynamics = LinearDynamics::new(a, b);
+
+        let cost = QuadraticCost::new(
+            vec![Array1::from_vec(vec![reference])],
+            Array1::from_vec(vec![reference]),
+            Array1::from_vec(vec![1.0_f32]),
+            Array1::from_vec(vec![control_weight]),
+            Array1::from_vec(vec![1.0_f32]),
+        );
+
+        MPCController::new(config, dynamics, cost)
+    }
+
+    /// Regression (finding 126/299): a control bound of |u| <= 1 must be
+    /// honoured even though the requested control is 5.0.
+    ///
+    /// The old `project_control` clamped to a hardcoded `[-10, 10]`, so a
+    /// control of 5.0 passed through untouched.
+    #[test]
+    fn test_mpc_honours_tight_control_bound() {
+        let config = MPCConfig {
+            prediction_horizon: 4,
+            control_horizon: 4,
+            state_dim: 1,
+            control_dim: 1,
+            warm_start: false,
+            ..Default::default()
+        };
+
+        // Reference far away => the unconstrained optimum wants |u| >> 1.
+        let mut mpc = integrator_controller(config, 50.0, 100.0);
+
+        let bound = ConstraintBuilder::new()
+            .name("u_bound")
+            .in_range(-1.0, 1.0)
+            .build()
+            .expect("bound builds");
+        mpc.add_control_constraint(Box::new(bound));
+
+        let solution = mpc
+            .solve(&Array1::from_vec(vec![0.0_f32]))
+            .expect("constrained solve");
+
+        for (t, control) in solution.controls.iter().enumerate() {
+            assert!(
+                control[0] <= 1.0 + 1e-4 && control[0] >= -1.0 - 1e-4,
+                "control at step {t} must stay inside [-1, 1], got {}",
+                control[0]
+            );
+        }
+        assert!(
+            solution.constraint_violation <= 1e-3,
+            "control constraints must be satisfied, residual {}",
+            solution.constraint_violation
+        );
+    }
+
+    /// Regression (finding 126/299): a control bound wider than the old
+    /// hardcoded `[-10, 10]` box must not be truncated to it.
+    #[test]
+    fn test_mpc_wide_control_bound_not_truncated() {
+        let config = MPCConfig {
+            prediction_horizon: 3,
+            control_horizon: 3,
+            state_dim: 1,
+            control_dim: 1,
+            warm_start: false,
+            max_iterations: 400,
+            ..Default::default()
+        };
+
+        // Reference at 100 => the optimiser drives u toward 100, well past 10.
+        let mut mpc = integrator_controller(config, 200.0, 100.0);
+
+        let bound = ConstraintBuilder::new()
+            .name("u_wide")
+            .in_range(-100.0, 100.0)
+            .build()
+            .expect("bound builds");
+        mpc.add_control_constraint(Box::new(bound));
+
+        let solution = mpc
+            .solve(&Array1::from_vec(vec![0.0_f32]))
+            .expect("constrained solve");
+
+        let u0 = solution.controls[0][0];
+        assert!(
+            u0 > 10.0,
+            "a [-100, 100] bound must not be truncated to the old [-10, 10] box, got {u0}"
+        );
+        assert!(u0 <= 100.0 + 1e-3, "u0 must respect the real bound: {u0}");
+    }
+
+    /// A control constraint whose type offers no projection operator must make
+    /// the solve fail loudly rather than silently returning an unprojected
+    /// control.
+    #[test]
+    fn test_mpc_reports_missing_projection_operator() {
+        struct NoProjection;
+        impl ViolationComputable for NoProjection {
+            fn violation(&self, x: &[f32]) -> f32 {
+                // Always violated by a fixed amount.
+                let _ = x;
+                1.0
+            }
+            fn check(&self, _x: &[f32]) -> bool {
+                false
+            }
+        }
+
+        let config = MPCConfig {
+            prediction_horizon: 2,
+            control_horizon: 2,
+            state_dim: 1,
+            control_dim: 1,
+            warm_start: false,
+            ..Default::default()
+        };
+        let mut mpc = integrator_controller(config, 1.0, 1.0);
+        mpc.add_control_constraint(Box::new(NoProjection));
+
+        let result = mpc.solve(&Array1::from_vec(vec![0.0_f32]));
+        assert!(
+            matches!(result, Err(LogicError::ProjectionFailed(_))),
+            "unprojectable control constraint must surface ProjectionFailed"
+        );
+    }
+
+    /// Regression (finding 257): `prediction_horizon` must drive the rollout
+    /// length while `control_horizon` drives the number of optimised controls.
+    #[test]
+    fn test_mpc_prediction_horizon_drives_rollout() {
+        let config = MPCConfig {
+            prediction_horizon: 12,
+            control_horizon: 3,
+            state_dim: 1,
+            control_dim: 1,
+            warm_start: false,
+            ..Default::default()
+        };
+        let mut mpc = integrator_controller(config, 0.0, 1.0);
+
+        let solution = mpc
+            .solve(&Array1::from_vec(vec![1.0_f32]))
+            .expect("solve succeeds");
+
+        assert_eq!(
+            solution.controls.len(),
+            3,
+            "controls must have control_horizon entries"
+        );
+        assert_eq!(
+            solution.predicted_states.len(),
+            13,
+            "trajectory must have prediction_horizon + 1 states"
+        );
+        assert_eq!(
+            solution.horizon, 12,
+            "reported horizon is the prediction horizon"
+        );
+        assert_eq!(solution.control_horizon, 3);
+    }
+
+    /// Regression (finding 257): warm starting after a horizon change must
+    /// resize the cached control sequence instead of reusing a stale length.
+    #[test]
+    fn test_mpc_warm_start_resizes_to_control_horizon() {
+        let config = MPCConfig {
+            prediction_horizon: 6,
+            control_horizon: 4,
+            state_dim: 1,
+            control_dim: 1,
+            warm_start: true,
+            ..Default::default()
+        };
+        let mut mpc = integrator_controller(config, 0.0, 1.0);
+
+        let first = mpc
+            .solve(&Array1::from_vec(vec![1.0_f32]))
+            .expect("first solve");
+        assert_eq!(first.controls.len(), 4);
+
+        // The warm-start cache is shifted by one; the next solve must still
+        // return exactly control_horizon controls.
+        let second = mpc
+            .solve(&Array1::from_vec(vec![0.8_f32]))
+            .expect("second solve");
+        assert_eq!(
+            second.controls.len(),
+            4,
+            "warm start must be resized back to control_horizon"
+        );
+    }
+
+    /// An invalid horizon configuration must be rejected instead of silently
+    /// producing a shorter prediction.
+    #[test]
+    fn test_mpc_rejects_control_horizon_longer_than_prediction() {
+        let config = MPCConfig {
+            prediction_horizon: 2,
+            control_horizon: 5,
+            state_dim: 1,
+            control_dim: 1,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let mut mpc = integrator_controller(config, 0.0, 1.0);
+        let result = mpc.solve(&Array1::from_vec(vec![1.0_f32]));
+        assert!(
+            matches!(result, Err(LogicError::InvalidInput(_))),
+            "control_horizon > prediction_horizon must be rejected"
+        );
     }
 }

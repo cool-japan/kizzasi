@@ -459,10 +459,26 @@ kizzasi-webgpu = { version = "0.2", features = ["webgpu"] }
 Available GPU kernels (implemented as WGSL shaders):
 
 - `ssm_scan_gpu` — parallel associative scan for SSM recurrence
-- `matvec_gpu` — batched matrix-vector multiply
-- `rms_norm_gpu` / `silu_gpu` — fused elementwise kernels
+- `matvec_gpu` — matrix-vector multiply (a single matrix against a single vector; there is no batch dimension)
+- `rms_norm_gpu` / `silu_gpu` — two independent elementwise kernels, each its own WGSL shader and its own dispatch — not fused into a single pass
 
-Without a physical GPU the backend returns `WebGpuError::BackendUnavailable`, allowing the same binary to fall back to CPU transparently.
+GPU unavailability is reported differently depending on *why* the GPU is unavailable:
+
+- **`webgpu` feature not compiled in**: every entry point returns `WebGpuError::BackendUnavailable` without touching `wgpu` at all.
+- **`webgpu` feature compiled in but no adapter found** (no physical GPU, or none matching the request): `WebGpuBackend::new` returns `WebGpuError::AdapterRequest`, *not* `BackendUnavailable`.
+- **Adapter found but logical device creation fails** (e.g. the requested limits exceed what the adapter supports): `WebGpuError::DeviceRequest`. This is a genuine failure, not a "no GPU" condition — the crate's own tests do not treat it as one (see `kizzasi-webgpu`'s `test_support::try_backend` skip helper).
+
+A binary that wants to fall back to CPU transparently on a GPU-less machine (or a build without the `webgpu` feature) must match both of the first two arms:
+
+```rust
+match WebGpuBackend::new().await {
+    Ok(backend) => { /* use the GPU path */ }
+    Err(WebGpuError::BackendUnavailable) | Err(WebGpuError::AdapterRequest(_)) => {
+        // No GPU available, or support wasn't compiled in -- fall back to CPU.
+    }
+    Err(e) => return Err(e.into()), // DeviceRequest and others are real failures.
+}
+```
 
 ### 7.5 Network Serving (REST, gRPC, WebSocket, MQTT)
 

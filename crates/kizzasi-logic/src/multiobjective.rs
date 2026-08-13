@@ -347,24 +347,40 @@ impl HypervolumeIndicator {
         hypervolume
     }
 
-    /// Compute hypervolume contribution of a solution
-    pub fn contribution(
-        &self,
-        solution: &MultiObjectiveSolution,
-        front: &[MultiObjectiveSolution],
-    ) -> f32 {
-        // Compute hypervolume with and without this solution
+    /// Compute the hypervolume contribution of the solution at `index`
+    /// within `front`: `hypervolume(front) - hypervolume(front without that
+    /// solution)`.
+    ///
+    /// Takes an index rather than a `&MultiObjectiveSolution` reference: the
+    /// previous signature excluded the solution by pointer identity
+    /// (`std::ptr::eq`), so any caller holding a clone — or a solution read
+    /// back from storage — silently matched nothing, made
+    /// `front_without == front`, and returned a contribution of exactly
+    /// `0.0` indistinguishable from a genuinely non-contributing solution.
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidInput`] when `index` is out of bounds for `front`.
+    pub fn contribution(&self, index: usize, front: &[MultiObjectiveSolution]) -> LogicResult<f32> {
+        if index >= front.len() {
+            return Err(LogicError::InvalidInput(format!(
+                "contribution: index {index} out of bounds for front of length {}",
+                front.len()
+            )));
+        }
+
         let hv_with = self.compute_2d(front);
 
         let front_without: Vec<MultiObjectiveSolution> = front
             .iter()
-            .filter(|s| !std::ptr::eq(*s, solution))
-            .cloned()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, s)| s.clone())
             .collect();
 
         let hv_without = self.compute_2d(&front_without);
 
-        hv_with - hv_without
+        Ok(hv_with - hv_without)
     }
 }
 
@@ -653,5 +669,57 @@ mod tests {
 
         let frontier = optimizer.get_pareto_frontier(&population);
         assert_eq!(frontier.len(), 3); // First 3 are non-dominated
+    }
+
+    /// Regression (finding 144): `contribution` used to exclude the target
+    /// solution by pointer identity, so a *cloned* solution (not literally
+    /// the same allocation as an element of `front`) silently matched
+    /// nothing and always returned `0.0`. It now takes an index instead.
+    #[test]
+    fn test_contribution_of_cloned_solution_is_nonzero() {
+        let indicator = HypervolumeIndicator::new(vec![10.0, 10.0]);
+        let front = [
+            MultiObjectiveSolution {
+                variables: Array1::from_vec(vec![0.0]),
+                objectives: vec![1.0, 8.0],
+                violations: vec![],
+                total_violation: 0.0,
+                rank: 0,
+                crowding_distance: 0.0,
+            },
+            MultiObjectiveSolution {
+                variables: Array1::from_vec(vec![1.0]),
+                objectives: vec![5.0, 5.0],
+                violations: vec![],
+                total_violation: 0.0,
+                rank: 0,
+                crowding_distance: 0.0,
+            },
+            MultiObjectiveSolution {
+                variables: Array1::from_vec(vec![2.0]),
+                objectives: vec![8.0, 1.0],
+                violations: vec![],
+                total_violation: 0.0,
+                rank: 0,
+                crowding_distance: 0.0,
+            },
+        ];
+
+        // Build a second, independently-allocated front out of clones — the
+        // old pointer-identity check would find no match for any element
+        // here since none of these allocations are literally `front[i]`.
+        let cloned_front: Vec<MultiObjectiveSolution> = front.to_vec();
+
+        let contribution = indicator
+            .contribution(1, &cloned_front)
+            .expect("index 1 is in bounds");
+        assert!(
+            contribution > 0.0,
+            "the middle solution contributes positive hypervolume, got {contribution}"
+        );
+
+        // Out-of-bounds index must error, not panic or silently return 0.0.
+        let err = indicator.contribution(cloned_front.len(), &cloned_front);
+        assert!(matches!(err, Err(LogicError::InvalidInput(_))));
     }
 }

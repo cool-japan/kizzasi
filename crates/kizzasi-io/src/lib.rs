@@ -184,10 +184,10 @@ mod osc;
 #[cfg(feature = "zeromq")]
 mod zeromq;
 
-#[cfg(all(feature = "ros2", not(target_os = "macos")))]
+#[cfg(feature = "ros2")]
 mod ros2;
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-pure"))]
 mod video;
 
 pub use adaptive::{
@@ -263,7 +263,13 @@ pub use websocket::{WebSocketConfig, WebSocketStream};
 pub use serial::{list_ports, DataBits, FlowControl, Parity, SerialConfig, SerialStream, StopBits};
 
 #[cfg(feature = "file")]
-pub use file::{CsvReader, CsvWriter, Hdf5Reader, Hdf5Writer, WavReader, WavSpec, WavWriter};
+pub use file::{CsvReader, CsvWriter, SampleFormat, WavReader, WavSpec, WavWriter};
+
+// HDF5 is pure Rust via OxiH5 (no libhdf5 install needed); it stays a
+// separate opt-in feature rather than part of `file` only because HDF5
+// support is optional (see Cargo.toml).
+#[cfg(feature = "hdf5")]
+pub use file::{Hdf5Reader, Hdf5Writer};
 
 #[cfg(feature = "network")]
 pub use socket::{SocketConfig, TcpClientStream, TcpServerStream, UdpSocketStream};
@@ -274,13 +280,16 @@ pub use osc::{OscArg, OscMessage, OscReceiver, OscSender, OscServer};
 #[cfg(feature = "zeromq")]
 pub use zeromq::{ZmqConfig, ZmqMessage, ZmqPattern, ZmqStream};
 
-#[cfg(all(feature = "ros2", not(target_os = "macos")))]
-pub use ros2::{QosProfile, Ros2Config, Ros2MessageType, Ros2Stream};
+#[cfg(feature = "ros2")]
+pub use ros2::{
+    imu_to_samples, msg as ros2_msg, QosProfile, Ros2Config, Ros2MessageType, Ros2Stream,
+};
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-pure"))]
 pub use video::{
     CameraDevice, FrameBuffer, OpticalFlow, OpticalFlowEstimator, OpticalFlowMethod, PixelFormat,
-    VideoConfig, VideoFilter, VideoFrame, VideoMetadata, VideoProcessor, VideoReader, VideoSource,
+    VideoBackend, VideoConfig, VideoFilter, VideoFrame, VideoMetadata, VideoProcessor, VideoReader,
+    VideoSource,
 };
 
 #[cfg(test)]

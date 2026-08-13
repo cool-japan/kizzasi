@@ -6,9 +6,6 @@
 //! 3. Instruction-level parallelism
 //! 4. Prefetching strategies
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
 use scirs2_core::ndarray::{Array1, Array2};
 use std::cell::RefCell;
 

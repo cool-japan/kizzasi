@@ -34,6 +34,25 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
+/// Convert a `usize` length/dimension to `u32` for the on-disk binary
+/// checkpoint format, failing loudly instead of silently wrapping.
+///
+/// The format's length fields are `u32`; casting with `as` instead of this
+/// helper truncates any value `> u32::MAX` (reachable for real model
+/// weights, e.g. tensors exceeding 4 GiB) to its low 32 bits and returns
+/// `Ok(())` — the save "succeeds" but writes a file whose stored length no
+/// longer matches the data that follows it, silently corrupting every
+/// subsequent tensor a reader parses from that point on.
+fn len_as_u32(len: usize, what: &str) -> TokenizerResult<u32> {
+    u32::try_from(len).map_err(|_| {
+        TokenizerError::InvalidConfig(format!(
+            "{what} ({len}) exceeds u32::MAX ({}) and cannot be represented in this checkpoint \
+             format; the save was rejected rather than silently truncated",
+            u32::MAX
+        ))
+    })
+}
+
 /// Model version for compatibility tracking
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelVersion {
@@ -213,6 +232,14 @@ impl ModelCheckpoint {
     }
 
     /// Save checkpoint to safetensors format
+    ///
+    /// File-I/O failures propagate as [`TokenizerError::IoError`] via `?`
+    /// and `std::io::Error`'s `#[from]` conversion (rather than a flattened
+    /// `InternalError(String)`), so callers can inspect
+    /// `std::io::Error::kind()` -- e.g. to distinguish a permissions failure
+    /// (`ErrorKind::PermissionDenied`) from a missing parent directory
+    /// (`ErrorKind::NotFound`) or a full disk (`ErrorKind::WriteZero`) --
+    /// instead of matching on a formatted message string.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> TokenizerResult<()> {
         let path = path.as_ref();
 
@@ -240,60 +267,54 @@ impl ModelCheckpoint {
         }
 
         // Write to file
-        let mut file = File::create(path)
-            .map_err(|e| TokenizerError::InternalError(format!("Failed to create file: {}", e)))?;
+        let mut file = File::create(path)?;
 
         // Write metadata length (u32) + metadata + tensors
         let metadata_bytes = metadata_json.as_bytes();
-        let metadata_len = metadata_bytes.len() as u32;
+        let metadata_len = len_as_u32(metadata_bytes.len(), "metadata length")?;
 
-        file.write_all(&metadata_len.to_le_bytes())
-            .map_err(|e| TokenizerError::InternalError(format!("Failed to write: {}", e)))?;
-        file.write_all(metadata_bytes)
-            .map_err(|e| TokenizerError::InternalError(format!("Failed to write: {}", e)))?;
+        file.write_all(&metadata_len.to_le_bytes())?;
+        file.write_all(metadata_bytes)?;
 
         // Write tensor data
         for (name, (shape, data)) in data_map {
             // Write: name_len (u32) + name + shape_len (u32) + shape + data_len (u32) + data
             let name_bytes = name.as_bytes();
-            file.write_all(&(name_bytes.len() as u32).to_le_bytes())
-                .map_err(|e| TokenizerError::InternalError(format!("Failed to write: {}", e)))?;
-            file.write_all(name_bytes)
-                .map_err(|e| TokenizerError::InternalError(format!("Failed to write: {}", e)))?;
+            let name_len = len_as_u32(name_bytes.len(), &format!("tensor '{name}' name length"))?;
+            file.write_all(&name_len.to_le_bytes())?;
+            file.write_all(name_bytes)?;
 
-            file.write_all(&(shape.len() as u32).to_le_bytes())
-                .map_err(|e| TokenizerError::InternalError(format!("Failed to write: {}", e)))?;
+            let shape_len = len_as_u32(shape.len(), &format!("tensor '{name}' shape length"))?;
+            file.write_all(&shape_len.to_le_bytes())?;
             for &dim in &shape {
-                file.write_all(&(dim as u32).to_le_bytes()).map_err(|e| {
-                    TokenizerError::InternalError(format!("Failed to write: {}", e))
-                })?;
+                let dim_u32 = len_as_u32(dim, &format!("tensor '{name}' dimension"))?;
+                file.write_all(&dim_u32.to_le_bytes())?;
             }
 
-            file.write_all(&(data.len() as u32).to_le_bytes())
-                .map_err(|e| TokenizerError::InternalError(format!("Failed to write: {}", e)))?;
-            file.write_all(&data)
-                .map_err(|e| TokenizerError::InternalError(format!("Failed to write: {}", e)))?;
+            let data_len = len_as_u32(data.len(), &format!("tensor '{name}' data length"))?;
+            file.write_all(&data_len.to_le_bytes())?;
+            file.write_all(&data)?;
         }
 
         Ok(())
     }
 
     /// Load checkpoint from safetensors format
+    ///
+    /// File-I/O failures propagate as [`TokenizerError::IoError`] -- see
+    /// [`Self::save`]'s doc comment.
     pub fn load<P: AsRef<Path>>(path: P) -> TokenizerResult<Self> {
         let path = path.as_ref();
-        let mut file = File::open(path)
-            .map_err(|e| TokenizerError::InternalError(format!("Failed to open file: {}", e)))?;
+        let mut file = File::open(path)?;
 
         // Read metadata length
         let mut len_buf = [0u8; 4];
-        file.read_exact(&mut len_buf)
-            .map_err(|e| TokenizerError::InternalError(format!("Failed to read: {}", e)))?;
+        file.read_exact(&mut len_buf)?;
         let metadata_len = u32::from_le_bytes(len_buf) as usize;
 
         // Read metadata
         let mut metadata_buf = vec![0u8; metadata_len];
-        file.read_exact(&mut metadata_buf)
-            .map_err(|e| TokenizerError::InternalError(format!("Failed to read: {}", e)))?;
+        file.read_exact(&mut metadata_buf)?;
         let metadata: ModelMetadata = serde_json::from_slice(&metadata_buf).map_err(|e| {
             TokenizerError::InternalError(format!("Failed to parse metadata: {}", e))
         })?;
@@ -307,45 +328,37 @@ impl ModelCheckpoint {
             match file.read_exact(&mut name_len_buf) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => {
-                    return Err(TokenizerError::InternalError(format!(
-                        "Failed to read: {}",
-                        e
-                    )))
-                }
+                // Preserve the real `std::io::Error` (and its `ErrorKind`)
+                // via `#[from]` instead of flattening it into a message string.
+                Err(e) => return Err(e.into()),
             }
             let name_len = u32::from_le_bytes(name_len_buf) as usize;
 
             // Read name
             let mut name_buf = vec![0u8; name_len];
-            file.read_exact(&mut name_buf)
-                .map_err(|e| TokenizerError::InternalError(format!("Failed to read: {}", e)))?;
+            file.read_exact(&mut name_buf)?;
             let name = String::from_utf8(name_buf)
                 .map_err(|e| TokenizerError::InternalError(format!("Invalid UTF-8: {}", e)))?;
 
             // Read shape
             let mut shape_len_buf = [0u8; 4];
-            file.read_exact(&mut shape_len_buf)
-                .map_err(|e| TokenizerError::InternalError(format!("Failed to read: {}", e)))?;
+            file.read_exact(&mut shape_len_buf)?;
             let shape_len = u32::from_le_bytes(shape_len_buf) as usize;
 
             let mut shape = Vec::with_capacity(shape_len);
             for _ in 0..shape_len {
                 let mut dim_buf = [0u8; 4];
-                file.read_exact(&mut dim_buf)
-                    .map_err(|e| TokenizerError::InternalError(format!("Failed to read: {}", e)))?;
+                file.read_exact(&mut dim_buf)?;
                 shape.push(u32::from_le_bytes(dim_buf) as usize);
             }
 
             // Read data
             let mut data_len_buf = [0u8; 4];
-            file.read_exact(&mut data_len_buf)
-                .map_err(|e| TokenizerError::InternalError(format!("Failed to read: {}", e)))?;
+            file.read_exact(&mut data_len_buf)?;
             let data_len = u32::from_le_bytes(data_len_buf) as usize;
 
             let mut data_bytes = vec![0u8; data_len];
-            file.read_exact(&mut data_bytes)
-                .map_err(|e| TokenizerError::InternalError(format!("Failed to read: {}", e)))?;
+            file.read_exact(&mut data_bytes)?;
 
             // Convert bytes to f32
             let data: Vec<f32> = data_bytes
@@ -361,20 +374,24 @@ impl ModelCheckpoint {
 }
 
 /// Save a training configuration to JSON
+///
+/// File-I/O failures propagate as [`TokenizerError::IoError`] -- see
+/// [`ModelCheckpoint::save`]'s doc comment.
 pub fn save_config<P: AsRef<Path>>(config: &TrainingConfig, path: P) -> TokenizerResult<()> {
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| TokenizerError::InternalError(e.to_string()))?;
 
-    std::fs::write(path, json)
-        .map_err(|e| TokenizerError::InternalError(format!("Failed to write config: {}", e)))?;
+    std::fs::write(path, json)?;
 
     Ok(())
 }
 
 /// Load a training configuration from JSON
+///
+/// File-I/O failures propagate as [`TokenizerError::IoError`] -- see
+/// [`ModelCheckpoint::save`]'s doc comment.
 pub fn load_config<P: AsRef<Path>>(path: P) -> TokenizerResult<TrainingConfig> {
-    let json = std::fs::read_to_string(path)
-        .map_err(|e| TokenizerError::InternalError(format!("Failed to read config: {}", e)))?;
+    let json = std::fs::read_to_string(path)?;
 
     let config = serde_json::from_str(&json)
         .map_err(|e| TokenizerError::InternalError(format!("Failed to parse config: {}", e)))?;
@@ -386,6 +403,28 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> TokenizerResult<TrainingConfig> {
 mod tests {
     use super::*;
     use std::env;
+
+    /// Regression: `len_as_u32` must reject lengths that don't fit in
+    /// `u32`, rather than silently truncating them (as the previous `as
+    /// u32` casts at every write site did) into a small number while the
+    /// full-size data still gets written after it — desynchronizing every
+    /// tensor a reader parses from that point on.
+    #[test]
+    fn test_len_as_u32_rejects_overflow() {
+        let too_big = u32::MAX as usize + 1;
+        assert!(len_as_u32(too_big, "test length").is_err());
+        assert!(len_as_u32(usize::MAX, "test length").is_err());
+    }
+
+    #[test]
+    fn test_len_as_u32_accepts_in_range_values() {
+        assert_eq!(len_as_u32(0, "test length").unwrap(), 0);
+        assert_eq!(len_as_u32(42, "test length").unwrap(), 42);
+        assert_eq!(
+            len_as_u32(u32::MAX as usize, "test length").unwrap(),
+            u32::MAX
+        );
+    }
 
     #[test]
     fn test_model_version() {
@@ -515,5 +554,70 @@ mod tests {
 
         // Cleanup
         std::fs::remove_file(&config_path).ok();
+    }
+
+    // Regression: `save`/`load`/`save_config`/`load_config` used to
+    // flatten every `std::io::Error` into `TokenizerError::InternalError`'s
+    // formatted string via `map_err`, discarding `ErrorKind` (a caller
+    // could no longer tell `NotFound` apart from `PermissionDenied` or any
+    // other I/O failure without parsing the message text). They now
+    // propagate the real `std::io::Error` via `TokenizerError::IoError`'s
+    // `#[from]` conversion (plain `?`), so `ErrorKind` survives end to end.
+    #[test]
+    fn test_load_missing_file_preserves_io_error_kind() {
+        let temp_dir = env::temp_dir();
+        let missing_path = temp_dir
+            .join("kizzasi_tokenizer_persistence_regression_missing_checkpoint.safetensors");
+        // Make sure it really doesn't exist before asserting on the error.
+        std::fs::remove_file(&missing_path).ok();
+
+        let err = ModelCheckpoint::load(&missing_path).expect_err("missing file must error");
+        match err {
+            TokenizerError::IoError(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected TokenizerError::IoError(NotFound), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_load_config_missing_file_preserves_io_error_kind() {
+        let temp_dir = env::temp_dir();
+        let missing_path =
+            temp_dir.join("kizzasi_tokenizer_persistence_regression_missing_config.json");
+        std::fs::remove_file(&missing_path).ok();
+
+        let err = load_config(&missing_path).expect_err("missing file must error");
+        match err {
+            TokenizerError::IoError(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected TokenizerError::IoError(NotFound), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_save_to_missing_directory_preserves_io_error_kind() {
+        // Writing under a parent directory that does not exist must
+        // surface the real `NotFound` `std::io::Error`, not an opaque
+        // `InternalError` string.
+        let temp_dir = env::temp_dir();
+        let bogus_path = temp_dir
+            .join("kizzasi_tokenizer_persistence_regression_nonexistent_dir")
+            .join("checkpoint.safetensors");
+
+        let version = ModelVersion::new(1, 0, 0);
+        let metadata = ModelMetadata::new(version, "TestModel".to_string(), 4, 8);
+        let checkpoint = ModelCheckpoint::new(metadata);
+
+        let err = checkpoint
+            .save(&bogus_path)
+            .expect_err("missing dir must error");
+        match err {
+            TokenizerError::IoError(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected TokenizerError::IoError(NotFound), got {other:?}"),
+        }
     }
 }

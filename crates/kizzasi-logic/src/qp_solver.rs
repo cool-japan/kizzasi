@@ -101,8 +101,18 @@ impl QPSolver {
         let mut row_idx = 0;
         for (a_mat, b_vec) in a_matrices.iter().zip(b_vectors.iter()) {
             let (m, n_cols) = a_mat.dim();
-            assert_eq!(n_cols, n, "Constraint matrix dimension mismatch");
-            assert_eq!(b_vec.len(), m, "Constraint vector dimension mismatch");
+            if n_cols != n {
+                return Err(LogicError::DimensionMismatch {
+                    expected: n,
+                    got: n_cols,
+                });
+            }
+            if b_vec.len() != m {
+                return Err(LogicError::DimensionMismatch {
+                    expected: m,
+                    got: b_vec.len(),
+                });
+            }
 
             for i in 0..m {
                 for j in 0..n {

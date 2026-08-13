@@ -546,7 +546,17 @@ fn regression_hierarchical_creation() {
         codebook_sizes: vec![256, 128, 64],
         use_residual: true,
     };
-    let tokenizer = HierarchicalTokenizer::new(32, config).expect("Creation failed");
+    let mut tokenizer = HierarchicalTokenizer::new(32, config).expect("Creation failed");
+
+    // `HierarchicalTokenizer::new` only seeds codebook shapes with random
+    // noise; `encode_with_levels`/`decode_hierarchical` require training
+    // first (level 0 needs a codebook of size 256, hence >= 256 points).
+    let training_data: Vec<Array1<f32>> = (0..300)
+        .map(|i| Array1::linspace(-1.0 + (i as f32 * 0.001), 1.0, 32))
+        .collect();
+    tokenizer
+        .fit(&training_data, 5, 1e-2)
+        .expect("Training failed");
 
     let signal = Array1::linspace(-1.0, 1.0, 32);
     let encoded_indices = tokenizer

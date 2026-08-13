@@ -27,13 +27,13 @@
 //! builder method, and stores the result back.  If `inner` is `None` (which
 //! should never happen in normal usage), a `RuntimeError` is raised.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyKeyboardInterrupt, PySystemExit, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use scirs2_core::ndarray::{Array1, Array2};
-use scirs2_numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use scirs2_numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2};
 
 use kizzasi_inference::{
     BeamSearch, ConstrainedBeamSearch, ConstraintFn, FallbackStrategy, RejectionSampler,
@@ -47,21 +47,74 @@ use crate::sampling::PySamplingConfig;
 // Helper — wrap a Python callable into a ConstraintFn Arc
 // ============================================================================
 
+/// Shared slot a [`python_constraint_fn`] closure writes its first captured
+/// `PyErr` into. `ConstraintFn = Arc<dyn Fn(&[f32]) -> bool + Send + Sync>`
+/// has no error channel — the constraint loops in `kizzasi_inference` call
+/// it many times per `expand`/`sample` and only ever look at the `bool` —
+/// so a raised exception cannot propagate through the closure's return
+/// value directly. Instead it is captured here and re-raised by
+/// [`take_constraint_error`] once control returns to the wrapping
+/// `#[pymethods]` call.
+type ConstraintErrorSlot = Arc<Mutex<Option<PyErr>>>;
+
 /// Wrap a Python callable object into a `ConstraintFn`.
 ///
-/// The callable receives a `Vec<f32>` exposed to Python as a plain Python list
-/// (converted from `&[f32]`).  Any Python-side exception or type error causes
-/// the constraint to return `false` so the beam is treated as violating.
-fn python_constraint_fn(callback: Py<PyAny>) -> ConstraintFn {
+/// The callable receives a `Vec<f32>` exposed to Python as a plain Python
+/// list (converted from `&[f32]`) and must return a `bool`.
+///
+/// Any Python-side exception (a typo raising `NameError`, a non-bool return
+/// raising `TypeError`, an `IndexError` from indexing an empty initial
+/// beam, `KeyboardInterrupt`, `SystemExit`, ...) is captured into
+/// `error_slot` — first one wins per call — and the constraint reports
+/// `false` (the same safe-conservative "treat as violated" default as
+/// before) so the underlying Rust loop keeps running instead of getting
+/// stuck mid-iteration. The captured error is re-raised by
+/// [`take_constraint_error`] after the enclosing `expand`/`sample` call
+/// returns, so a broken constraint is no longer silently indistinguishable
+/// from a correctly-restrictive one, and `KeyboardInterrupt`/`SystemExit`
+/// are no longer absorbed.
+fn python_constraint_fn(callback: Py<PyAny>, error_slot: ConstraintErrorSlot) -> ConstraintFn {
     Arc::new(move |sequence: &[f32]| -> bool {
         Python::attach(|py| -> bool {
             let py_seq: Vec<f32> = sequence.to_vec();
-            callback
+            match callback
                 .call1(py, (py_seq,))
                 .and_then(|val| val.extract::<bool>(py))
-                .unwrap_or(false)
+            {
+                Ok(satisfied) => satisfied,
+                Err(err) => {
+                    if let Ok(mut slot) = error_slot.lock() {
+                        if slot.is_none() {
+                            *slot = Some(err);
+                        }
+                    }
+                    false
+                }
+            }
         })
     })
+}
+
+/// Drain any exception captured by a [`python_constraint_fn`] closure since
+/// the last drain, converting it back into a `PyErr` for the caller.
+///
+/// `KeyboardInterrupt` / `SystemExit` are re-raised unchanged (their
+/// control-flow meaning must survive re-raising); every other exception is
+/// wrapped in a `RuntimeError` that chains the original as `__cause__`, so
+/// `str(err)` at the call site immediately identifies this as a constraint
+/// callback failure rather than a beam-search/rejection-sampling error.
+fn take_constraint_error(py: Python<'_>, slot: &Mutex<Option<PyErr>>) -> Option<PyErr> {
+    let captured = slot.lock().ok()?.take()?;
+    if captured.is_instance_of::<PyKeyboardInterrupt>(py)
+        || captured.is_instance_of::<PySystemExit>(py)
+    {
+        return Some(captured);
+    }
+    let wrapped = pyo3::exceptions::PyRuntimeError::new_err(
+        "constraint callback raised an exception (see __cause__)",
+    );
+    wrapped.set_cause(py, Some(captured));
+    Some(wrapped)
 }
 
 // ============================================================================
@@ -77,8 +130,12 @@ fn beams_to_py_list(py: Python<'_>, beams: &[kizzasi_inference::Beam]) -> PyResu
     let list = PyList::empty(py);
     for beam in beams {
         let d = PyDict::new(py);
-        let seq_array: Array1<f32> = Array1::from_vec(beam.sequence.clone());
-        d.set_item("sequence", seq_array.to_pyarray(py))?;
+        // `beam.sequence` is only borrowed (`&Beam`), so a copy is
+        // unavoidable, but it should happen exactly once: clone the `Vec`
+        // and move it directly into the PyArray with `into_pyarray`
+        // (zero-copy transfer) rather than wrapping it in an `Array1` and
+        // then `to_pyarray`-copying it a second time into the Python heap.
+        d.set_item("sequence", beam.sequence.clone().into_pyarray(py))?;
         d.set_item("log_prob", beam.log_prob)?;
         list.append(d)?;
     }
@@ -161,10 +218,9 @@ impl PyBeamSearch {
     /// -------
     /// numpy.ndarray of shape ``(n,)`` float32, or ``None``.
     pub fn best_sequence<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f32>>> {
-        self.inner.best().map(|beam| {
-            let arr: Array1<f32> = Array1::from_vec(beam.sequence.clone());
-            arr.to_pyarray(py)
-        })
+        self.inner
+            .best()
+            .map(|beam| beam.sequence.clone().into_pyarray(py))
     }
 
     /// Log probability of the best beam, or ``None`` if there are no beams.
@@ -232,6 +288,9 @@ pub struct PyConstrainedBeamSearch {
     beam_width: usize,
     /// Number of constraints that have been added so far.
     n_constraints: usize,
+    /// Shared with every constraint closure registered via
+    /// [`Self::add_constraint`]; see [`python_constraint_fn`].
+    constraint_error: ConstraintErrorSlot,
 }
 
 #[pymethods]
@@ -251,6 +310,7 @@ impl PyConstrainedBeamSearch {
             inner: Some(ConstrainedBeamSearch::new(beam_width)),
             beam_width,
             n_constraints: 0,
+            constraint_error: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -262,7 +322,7 @@ impl PyConstrainedBeamSearch {
     ///     Python callable ``(sequence: list[float]) -> bool``.
     ///     ``True`` means the constraint is satisfied.
     pub fn add_constraint(&mut self, constraint_fn: Py<PyAny>) -> PyResult<()> {
-        let rust_fn = python_constraint_fn(constraint_fn);
+        let rust_fn = python_constraint_fn(constraint_fn, Arc::clone(&self.constraint_error));
         let cbs = self.inner.take().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "ConstrainedBeamSearch is in an invalid state",
@@ -299,32 +359,41 @@ impl PyConstrainedBeamSearch {
     /// ----------
     /// logits:
     ///     Float32 array of shape ``(current_beams, vocab_size)``.
+    ///
+    /// Raises
+    /// ------
+    /// If any registered constraint callable raised an exception while this
+    /// call ran, that exception (wrapped in a `RuntimeError`, or re-raised
+    /// unchanged for `KeyboardInterrupt`/`SystemExit`) takes priority over a
+    /// successful return — see [`take_constraint_error`].
     pub fn expand<'py>(
         &mut self,
         py: Python<'py>,
         logits: PyReadonlyArray2<'py, f32>,
     ) -> PyResult<()> {
         let arr: Array2<f32> = logits.as_array().to_owned();
-        let _ = py;
-        self.inner
+        let outcome = self
+            .inner
             .as_mut()
             .ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err(
                     "ConstrainedBeamSearch is in an invalid state",
                 )
-            })?
-            .expand(&arr)
-            .map_err(to_py_err)
+            })
+            .and_then(|cbs| cbs.expand(&arr).map_err(to_py_err));
+        match (outcome, take_constraint_error(py, &self.constraint_error)) {
+            (Err(e), _) => Err(e),
+            (Ok(()), Some(e)) => Err(e),
+            (Ok(()), None) => Ok(()),
+        }
     }
 
     /// Best candidate sequence so far, or ``None`` if there are no beams.
     pub fn best_sequence<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f32>>> {
-        self.inner.as_ref().and_then(|cbs| {
-            cbs.best().map(|beam| {
-                let arr: Array1<f32> = Array1::from_vec(beam.sequence.clone());
-                arr.to_pyarray(py)
-            })
-        })
+        self.inner
+            .as_ref()
+            .and_then(|cbs| cbs.best())
+            .map(|beam| beam.sequence.clone().into_pyarray(py))
     }
 
     /// Number of active beams.
@@ -421,6 +490,9 @@ pub struct PyRejectionSampler {
     inner: Option<RejectionSampler>,
     /// Cached count of registered constraints.
     n_constraints: usize,
+    /// Shared with every constraint closure registered via
+    /// [`Self::add_constraint`]; see [`python_constraint_fn`].
+    constraint_error: ConstraintErrorSlot,
 }
 
 #[pymethods]
@@ -435,6 +507,7 @@ impl PyRejectionSampler {
         Self {
             inner: Some(RejectionSampler::new(inner_config)),
             n_constraints: 0,
+            constraint_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -446,7 +519,7 @@ impl PyRejectionSampler {
     ///     Python callable ``(sequence: list[float]) -> bool``.
     ///     Receives the *extended* context (context + current candidate).
     pub fn add_constraint(&mut self, constraint_fn: Py<PyAny>) -> PyResult<()> {
-        let rust_fn = python_constraint_fn(constraint_fn);
+        let rust_fn = python_constraint_fn(constraint_fn, Arc::clone(&self.constraint_error));
         let rs = self.inner.take().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("RejectionSampler is in an invalid state")
         })?;
@@ -496,6 +569,13 @@ impl PyRejectionSampler {
     /// -------
     /// float
     ///     Sampled value (index cast to f32 for most strategies).
+    ///
+    /// Raises
+    /// ------
+    /// If any registered constraint callable raised an exception while this
+    /// call ran, that exception (wrapped in a `RuntimeError`, or re-raised
+    /// unchanged for `KeyboardInterrupt`/`SystemExit`) takes priority over a
+    /// successful return — see [`take_constraint_error`].
     pub fn sample<'py>(
         &mut self,
         py: Python<'py>,
@@ -503,14 +583,18 @@ impl PyRejectionSampler {
         context: Vec<f32>,
     ) -> PyResult<f32> {
         let arr: Array1<f32> = logits.as_array().to_owned();
-        let _ = py;
-        self.inner
+        let outcome = self
+            .inner
             .as_mut()
             .ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("RejectionSampler is in an invalid state")
-            })?
-            .sample_with_rejection(&arr, &context)
-            .map_err(to_py_err)
+            })
+            .and_then(|rs| rs.sample_with_rejection(&arr, &context).map_err(to_py_err));
+        match (outcome, take_constraint_error(py, &self.constraint_error)) {
+            (Err(e), _) => Err(e),
+            (Ok(_), Some(e)) => Err(e),
+            (Ok(v), None) => Ok(v),
+        }
     }
 
     /// Number of constraint functions that have been registered.
@@ -692,5 +776,110 @@ mod tests {
         });
 
         assert_eq!(rs.num_constraints(), 2);
+    }
+
+    // ========================================================================
+    // Regression tests: constraint callbacks that raise are no longer
+    // silently swallowed into "constraint violated".
+    // ========================================================================
+
+    // 13. A constraint callback that raises (a plain typo -> NameError) must
+    // make `expand` return `Err`, not silently succeed while treating every
+    // beam as violating.
+    #[test]
+    fn test_constrained_beam_search_constraint_exception_propagates() {
+        use scirs2_numpy::PyArrayMethods;
+        Python::initialize();
+        Python::attach(|py| {
+            let mut cbs = PyConstrainedBeamSearch::new(2).expect("cbs");
+            let raises: Py<PyAny> = py
+                .eval(
+                    pyo3::ffi::c_str!("lambda seq: this_name_does_not_exist"),
+                    None,
+                    None,
+                )
+                .expect("lambda")
+                .unbind();
+            cbs.add_constraint(raises).expect("add_constraint");
+
+            let logits =
+                scirs2_numpy::PyArray2::from_vec2(py, &[vec![0.1_f32; 8]]).expect("logits");
+            let result = cbs.expand(py, logits.readonly());
+            assert!(
+                result.is_err(),
+                "a raising constraint callback must surface as an error, not silent success"
+            );
+            let err = result.expect_err("checked above");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
+                "expected the wrapped RuntimeError, got {:?}",
+                err
+            );
+            // The original NameError must be chained as __cause__.
+            let cause = err.value(py).getattr("__cause__").expect("__cause__");
+            assert!(
+                !cause.is_none(),
+                "original exception must be chained as __cause__"
+            );
+        });
+    }
+
+    // 14. `KeyboardInterrupt` raised from a constraint callback must be
+    // re-raised unchanged (not wrapped in RuntimeError, and not swallowed).
+    #[test]
+    fn test_rejection_sampler_constraint_keyboard_interrupt_propagates() {
+        use scirs2_numpy::PyArrayMethods;
+        Python::initialize();
+        Python::attach(|py| {
+            let cfg = PySamplingConfig::new();
+            let mut rs = PyRejectionSampler::new(&cfg);
+            let interrupts: Py<PyAny> = py
+                .eval(
+                    pyo3::ffi::c_str!("lambda seq: exec('raise KeyboardInterrupt')"),
+                    None,
+                    None,
+                )
+                .expect("lambda")
+                .unbind();
+            rs.add_constraint(interrupts).expect("add_constraint");
+
+            let logits = scirs2_numpy::PyArray1::from_vec(py, vec![1.0_f32, 2.0, 3.0]);
+            let result = rs.sample(py, logits.readonly(), vec![]);
+            assert!(result.is_err(), "KeyboardInterrupt must not be swallowed");
+            let err = result.expect_err("checked above");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py),
+                "expected KeyboardInterrupt to be re-raised unchanged, got {:?}",
+                err
+            );
+        });
+    }
+
+    // 15. The error slot must be drained (not left stale) after a failing
+    // call, so a later, successful call is not incorrectly failed by a
+    // leftover error from a previous call.
+    #[test]
+    fn test_constrained_beam_search_error_slot_cleared_after_drain() {
+        use scirs2_numpy::PyArrayMethods;
+        Python::initialize();
+        Python::attach(|py| {
+            let mut cbs = PyConstrainedBeamSearch::new(2).expect("cbs");
+            let raises: Py<PyAny> = py
+                .eval(pyo3::ffi::c_str!("lambda seq: 1 / 0"), None, None)
+                .expect("lambda")
+                .unbind();
+            cbs.add_constraint(raises).expect("add_constraint");
+
+            let logits1 =
+                scirs2_numpy::PyArray2::from_vec2(py, &[vec![0.1_f32; 8]]).expect("logits");
+            assert!(
+                cbs.expand(py, logits1.readonly()).is_err(),
+                "first call must error"
+            );
+            assert!(
+                cbs.constraint_error.lock().expect("lock").is_none(),
+                "error slot must be drained (None) after being taken once"
+            );
+        });
     }
 }

@@ -61,7 +61,11 @@ pub struct MoEConfig {
     pub routing_strategy: RoutingStrategy,
     /// Load balancing coefficient (typically 0.01)
     pub load_balance_coeff: f32,
-    /// Enable expert dropout during training
+    /// Per-expert dropout rate applied while training mode is enabled via
+    /// [`MixtureOfExperts::set_training`] (inverted dropout: a routed
+    /// expert's contribution is zeroed with this probability, and survivors
+    /// are rescaled by `1 / (1 - expert_dropout)`). Inert at inference, and
+    /// inert at any value outside `(0, 1)`.
     pub expert_dropout: f32,
     /// Noise standard deviation for noisy top-k
     pub noise_std: f32,
@@ -82,6 +86,16 @@ impl Default for MoEConfig {
     }
 }
 
+/// Draw one sample from the standard normal distribution `N(0, 1)` via the
+/// Box-Muller transform, using the uniform `[0, 1)` samples `RngExt::random`
+/// already provides elsewhere in this module.
+fn standard_normal<R: RngExt>(rng_state: &mut R) -> f32 {
+    // Box-Muller requires u1 in (0, 1] (not [0, 1)) to avoid ln(0) = -inf.
+    let u1: f32 = (1.0 - rng_state.random::<f32>()).max(f32::EPSILON);
+    let u2: f32 = rng_state.random::<f32>();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+}
+
 /// Router network for expert selection
 #[derive(Debug)]
 pub struct Router {
@@ -91,6 +105,9 @@ pub struct Router {
     noise_weights: Option<Array2<f32>>,
     /// Configuration
     config: MoEConfig,
+    /// Whether noise injection is active for [`RoutingStrategy::NoisyTopK`].
+    /// See [`Self::set_training`].
+    training: bool,
 }
 
 impl Router {
@@ -125,7 +142,22 @@ impl Router {
             weights,
             noise_weights,
             config,
+            training: false,
         })
+    }
+
+    /// Enable or disable noise injection for [`RoutingStrategy::NoisyTopK`].
+    ///
+    /// Noise is intentionally only injected while `training` — inference
+    /// should stay deterministic. Has no effect for other routing
+    /// strategies.
+    pub fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
+    /// Whether the router is currently in training mode.
+    pub fn is_training(&self) -> bool {
+        self.training
     }
 
     /// Compute routing probabilities for input
@@ -143,12 +175,23 @@ impl Router {
         // Compute logits: input · weights → (num_experts,)
         let logits = self.weights.t().dot(input);
 
-        // Add noise for noisy top-k
-        let logits = if let Some(ref noise_weights) = self.noise_weights {
-            let _noise_logits = noise_weights.t().dot(input);
-            // In training, add Gaussian noise scaled by noise_logits
-            // For now, just use logits (noise would be added during training)
-            logits
+        // Add noise for noisy top-k: `H(x) = (x·W_g) + N(0,1) * softplus(x·W_noise) * noise_std`,
+        // following the noisy top-k gating formulation (Shazeer et al.,
+        // "Outrageously Large Neural Networks"). Only active during
+        // training, so a NoisyTopK router is byte-identical to a TopK router
+        // at inference — a real (if simple) difference from `TopK` instead
+        // of computing and discarding `noise_weights.t().dot(input)`.
+        let logits = if let (true, Some(ref noise_weights)) = (self.training, &self.noise_weights) {
+            let noise_logits = noise_weights.t().dot(input);
+            let mut rng_state = rng();
+            let mut noisy = logits.clone();
+            for (l, &raw_noise_scale) in noisy.iter_mut().zip(noise_logits.iter()) {
+                // Softplus keeps the per-expert noise magnitude non-negative.
+                let softplus = (1.0 + raw_noise_scale.exp()).ln();
+                let z = standard_normal(&mut rng_state);
+                *l += z * softplus * self.config.noise_std;
+            }
+            noisy
         } else {
             logits
         };
@@ -345,7 +388,25 @@ impl MixtureOfExperts {
         })
     }
 
-    /// Forward pass with expert routing
+    /// Enable or disable training-mode behavior: noise injection for
+    /// [`RoutingStrategy::NoisyTopK`] (see [`Router::set_training`]) and
+    /// [`MoEConfig::expert_dropout`] (see [`Self::forward`]). Both are inert
+    /// at inference (`training == false`), so `step`/`forward` stay
+    /// deterministic outside of an explicit training loop.
+    pub fn set_training(&mut self, training: bool) {
+        self.router.set_training(training);
+    }
+
+    /// Forward pass with expert routing.
+    ///
+    /// While in training mode (see [`Self::set_training`]) and
+    /// `config.expert_dropout` is a finite value in `(0, 1)`, each routed
+    /// expert's contribution is independently dropped with that probability
+    /// — inverted dropout: a surviving expert's weight is rescaled by
+    /// `1 / (1 - expert_dropout)` so the expected combined output is
+    /// unchanged, mirroring [`crate::dropout::apply_dropout`]'s convention
+    /// elsewhere in this crate. Inert at inference, matching every other
+    /// `dropout`-style config field in this crate.
     pub fn forward(&mut self, input: &Array1<f32>) -> ModelResult<Array1<f32>> {
         trace!("MoE forward: input shape {:?}", input.shape());
 
@@ -355,11 +416,26 @@ impl MixtureOfExperts {
         // Store routing decision for load balancing
         self.routing_history.push(expert_indices.clone());
 
+        let expert_dropout = self.config.expert_dropout;
+        let drop_active = self.router.is_training()
+            && expert_dropout.is_finite()
+            && expert_dropout > 0.0
+            && expert_dropout < 1.0;
+        let survivor_scale = if drop_active {
+            1.0 / (1.0 - expert_dropout)
+        } else {
+            1.0
+        };
+        let mut rng_state = rng();
+
         // Compute expert outputs
         let mut output = Array1::zeros(self.config.output_dim);
         for (idx, &expert_idx) in expert_indices.iter().enumerate() {
+            if drop_active && rng_state.random::<f32>() < expert_dropout {
+                continue;
+            }
             let expert_output = self.experts[expert_idx].forward(input)?;
-            let weight = weights[idx];
+            let weight = weights[idx] * survivor_scale;
 
             // Weighted sum: output += weight * expert_output
             output = output + expert_output.mapv(|x| x * weight);
@@ -446,6 +522,107 @@ mod tests {
         // Weights should sum to ~1.0
         let sum: f32 = weights.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "Weights should sum to 1.0");
+    }
+
+    #[test]
+    fn test_noisy_topk_differs_from_topk_when_training() {
+        let config = MoEConfig {
+            num_experts: 8,
+            top_k: 3,
+            routing_strategy: RoutingStrategy::NoisyTopK,
+            noise_std: 5.0, // large enough that the noise is not lost to float noise
+            ..Default::default()
+        };
+        let mut router = Router::new(config).expect("Failed to create router");
+        let input = Array1::from_vec(vec![0.2; 256]);
+
+        // At inference (training == false, the default), NoisyTopK must be
+        // byte-identical to a plain TopK call with the same weights -- no
+        // noise should leak into deterministic inference.
+        let (indices_a, weights_a) = router.route(&input).expect("routing failed");
+        let (indices_b, weights_b) = router.route(&input).expect("routing failed");
+        assert_eq!(indices_a, indices_b);
+        for (a, b) in weights_a.iter().zip(weights_b.iter()) {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "inference routing must be deterministic"
+            );
+        }
+
+        // During training, repeated calls with the SAME input and SAME
+        // router (so only the injected noise differs) must actually vary --
+        // this is the regression check that noise is no longer computed and
+        // discarded.
+        router.set_training(true);
+        let mut saw_difference = false;
+        let (_, first_weights) = router.route(&input).expect("routing failed");
+        for _ in 0..20 {
+            let (_, weights) = router.route(&input).expect("routing failed");
+            if weights
+                .iter()
+                .zip(first_weights.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-4)
+            {
+                saw_difference = true;
+                break;
+            }
+        }
+        assert!(
+            saw_difference,
+            "NoisyTopK with training=true must produce varying routing \
+             weights across calls with the same input; noise is not being \
+             injected"
+        );
+    }
+
+    #[test]
+    fn test_expert_dropout_is_inert_at_inference_and_active_when_training() {
+        let config = MoEConfig {
+            num_experts: 8,
+            top_k: 4,
+            input_dim: 32,
+            output_dim: 32,
+            expert_dropout: 0.9, // high enough that >=1 drop is overwhelmingly likely
+            ..Default::default()
+        };
+        let mut moe = MixtureOfExperts::new(config).expect("Failed to create MoE");
+        let input = Array1::from_vec(vec![0.3; 32]);
+
+        // At inference (the default), config.expert_dropout must have no
+        // effect: repeated calls with the same input must be identical.
+        let ref_out = moe.forward(&input).expect("forward failed");
+        for _ in 0..10 {
+            let out = moe.forward(&input).expect("forward failed");
+            for (a, b) in ref_out.iter().zip(out.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-9,
+                    "expert_dropout must be inert at inference"
+                );
+            }
+        }
+
+        // While training, a 0.9 per-expert drop probability across top_k=4
+        // experts must vary the output across repeated calls with the same
+        // input -- this is the regression check that the field is no longer
+        // dead.
+        moe.set_training(true);
+        let mut saw_difference = false;
+        for _ in 0..20 {
+            let out = moe.forward(&input).expect("forward failed");
+            if out
+                .iter()
+                .zip(ref_out.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6)
+            {
+                saw_difference = true;
+                break;
+            }
+        }
+        assert!(
+            saw_difference,
+            "expert_dropout = 0.9 while training must eventually change the \
+             forward output; the field is not being read"
+        );
     }
 
     #[test]

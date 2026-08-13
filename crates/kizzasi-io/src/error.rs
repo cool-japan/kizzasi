@@ -47,8 +47,22 @@ pub enum IoError {
     #[error("Buffer is empty")]
     BufferEmpty,
 
+    /// The stream is permanently exhausted and will never produce another
+    /// sample. Distinct from [`IoError::BufferEmpty`], which means "nothing
+    /// available right now, try again".
+    #[error("End of stream")]
+    EndOfStream,
+
+    /// An operation was attempted on a transport that has not been connected
+    /// (or subscribed / started) yet.
+    #[error("Not connected: {0}")]
+    NotConnected(String),
+
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("Synchronization failed: {0}")]
+    SyncFailed(String),
 
     #[error("Core error: {0}")]
     CoreError(#[from] kizzasi_core::CoreError),

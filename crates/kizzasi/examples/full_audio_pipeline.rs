@@ -113,10 +113,7 @@ fn main() -> Result<()> {
     let continuation = predictor.predict_n(&last_sample, 100)?;
 
     println!("  ✓ Generated {} samples", continuation.len());
-    println!(
-        "  First 5 generated: {:?}",
-        &continuation.slice(s![0..5, 0])
-    );
+    println!("  First 5 generated: {:?}", continuation.slice(s![0..5, 0]));
     println!("  (This is speculative generation based on learned pattern)\n");
 
     // Demonstrate batch processing

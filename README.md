@@ -139,21 +139,24 @@ flowchart TD
 
 ### Crate Structure
 
-| Crate | Description | SLoC |
-|-------|-------------|------|
-| [`kizzasi`](crates/kizzasi) | Unified facade with prelude and ergonomic API | ~7,400 |
-| [`kizzasi-core`](crates/kizzasi-core) | SSM engine, embeddings, SIMD optimizations, parallel scan | ~18,500 |
-| [`kizzasi-model`](crates/kizzasi-model) | Mamba/Mamba2, RWKV v5/v6/v7, S4/S4D, Transformer + training | ~39,200 |
-| [`kizzasi-tokenizer`](crates/kizzasi-tokenizer) | VQ-VAE, μ-law, quantizers, multi-scale tokenization; multi-speaker, perceptual (Bark-scale), PEAQ quality evaluation | ~16,900 |
-| [`kizzasi-inference`](crates/kizzasi-inference) | Pipeline orchestration, sampling, batching, gRPC/REST | ~11,000 |
-| [`kizzasi-logic`](crates/kizzasi-logic) | Constraints, guardrails, projections, LTL/STL | ~20,400 |
-| [`kizzasi-io`](crates/kizzasi-io) | MQTT, Audio, WebSocket, Serial, File, DSP, Beamforming | ~18,500 |
-| [`kizzasi-embedded`](crates/kizzasi-embedded) | no_std SSM inference for edge devices | ~800 |
-| [`kizzasi-python`](crates/kizzasi-python) | Python bindings via PyO3/maturin | ~700 |
-| [`kizzasi-macros`](crates/kizzasi-macros) | Procedural macros for compile-time config | ~100 |
-| [`kizzasi-webgpu`](crates/kizzasi-webgpu) | WebGPU/WGSL GPU acceleration kernels (SSM scan, matvec, SiLU, RMS-norm) | ~400 |
+| Crate | Description | Status | SLoC |
+|-------|-------------|:------:|------|
+| [`kizzasi`](crates/kizzasi) | Unified facade with prelude and ergonomic API | Stable | ~8,200 |
+| [`kizzasi-core`](crates/kizzasi-core) | SSM engine, embeddings, SIMD optimizations, parallel scan | Stable | ~19,800 |
+| [`kizzasi-model`](crates/kizzasi-model) | Mamba/Mamba2, RWKV v5/v6/v7, S4/S4D, Transformer + training | Stable | ~35,800 |
+| [`kizzasi-tokenizer`](crates/kizzasi-tokenizer) | VQ-VAE, μ-law, quantizers, multi-scale tokenization; multi-speaker, perceptual (Bark-scale), PEAQ quality evaluation | Stable | ~17,500 |
+| [`kizzasi-inference`](crates/kizzasi-inference) | Pipeline orchestration, sampling, batching, gRPC/REST | Stable | ~12,600 |
+| [`kizzasi-logic`](crates/kizzasi-logic) | Constraints, guardrails, projections, LTL/STL | Stable | ~21,400 |
+| [`kizzasi-io`](crates/kizzasi-io) | MQTT, Audio, WebSocket, Serial, File, DSP, Beamforming, pure-Rust video (`video-pure`) | Stable | ~22,800 |
+| [`kizzasi-embedded`](crates/kizzasi-embedded) | no_std SSM inference for edge devices | Stable | ~2,400 |
+| [`kizzasi-python`](crates/kizzasi-python) | Python bindings via PyO3/maturin | Alpha | ~3,200 |
+| [`kizzasi-macros`](crates/kizzasi-macros) | Procedural macros for compile-time config | Stable | ~1,050 |
+| [`kizzasi-metal`](crates/kizzasi-metal) | Target-gated activation of candle's Apple Metal backend | Stable | ~60 |
+| [`kizzasi-webgpu`](crates/kizzasi-webgpu) | WebGPU/WGSL GPU acceleration kernels (SSM scan, matvec, SiLU, RMS-norm) | Alpha | ~2,500 |
 
-**Total: ~140,000+ lines of Rust code across 414 source files**
+**Total: ~147,000+ lines of Rust code across 438 source files**
+
+`Stable` crates are feature-complete and well-tested; `Alpha` crates (kizzasi-python, kizzasi-webgpu) are functional with test coverage but their APIs may still change.
 
 ---
 
@@ -171,13 +174,56 @@ kizzasi = "0.2"
 | Feature | Description | Default |
 |---------|-------------|:-------:|
 | `std` | Standard library support | ✓ |
-| `full` | Enable all features | ✓ |
+| `full` | Enable all features below | ✓ |
 | `io` | Physical world connectors | ✓ |
 | `logic` | TensorLogic constraints | ✓ |
-| `mqtt` | MQTT client (rumqttc) | ✓ |
-| `audio` | Audio I/O (cpal) | ✓ |
-| `async` | Async/streaming support | ○ |
-| `mamba` | Mamba/Mamba2 models | ○ |
+| `mqtt` | MQTT client over plain TCP (rumqttc) | ✓ |
+| `async` | Async/streaming support (tokio) | ✓ |
+| `config-files` | TOML/YAML config loading | ✓ |
+| `macros` | `#[derive(KizzasiConfig)]` and friends (kizzasi-macros) | ✓ |
+| `webgpu` | GPU SSM scan via `kizzasi-webgpu` (wgpu: Metal/Vulkan/DX12) | ○ |
+| `metal` | candle Metal backend, live on Apple targets only (propagates to kizzasi-core) | ○ |
+| `audio` | Live audio device I/O via cpal — **links a C library** (see below) | ○ |
+
+All of the above default-on features are pulled in transitively through `full`, which is itself part of `default`. The lower-level `kizzasi-model` crate has its own architecture features (`mamba`, `rwkv`, `s4`, `transformer`, all default-on there) for the standalone model implementations used via `kizzasi-inference`'s registry — they are not features of the `kizzasi` facade crate itself.
+
+### Pure Rust: what is and is not in the default build
+
+The default build compiles no C/C++/Fortran of kizzasi's own choosing. Everything that needs a native library is opt-in and named as such:
+
+| Feature | Crate | Native library it pulls in |
+|---------|-------|----------------------------|
+| `audio` | `kizzasi-io` | cpal → `alsa-sys`/libasound on Linux (CoreAudio via objc2 on Apple, WASAPI on Windows) |
+| `video` | `kizzasi-io` | `ffmpeg-next` → the FFmpeg libraries |
+| `qp-solver` | `kizzasi-logic` | `osqp` → the OSQP C solver |
+| `hf-hub` | `kizzasi-model` | reqwest → rustls → `aws-lc-sys` |
+
+`hdf5` is no longer in this table: it now depends on [`oxih5`](https://crates.io/crates/oxih5), a
+pure-Rust HDF5 reader/writer, so it compiles no C at all (the old `hdf5` crate → libhdf5 binding is
+gone).
+
+`kizzasi-io` also has a pure-Rust alternative to `video`: the opt-in `video-pure` feature (the
+OxiMedia stack) decodes Y4M files and captures from cameras with no C linked at all, so it is
+deliberately not a row in the table above. See `crates/kizzasi-io/README.md`'s Cargo Feature Flags
+table for exactly what it does and does not decode.
+
+The default build compiles no C at all -- for anyone depending on the published crates, not just inside this workspace. The last holdout was the tensor backend: upstream `candle-core`'s mandatory `tokenizers` dependency selects the `onig` feature, pulling in Oniguruma (`onig`/`onig_sys`, a C regex library), with no configuration lever inside kizzasi to drop it -- candle-core was already built with `default-features = false` here.
+
+kizzasi therefore depends on [`oxicandle-core`](https://crates.io/crates/oxicandle-core) and [`oxicandle-nn`](https://crates.io/crates/oxicandle-nn), the COOLJAPAN fork of candle 0.11.0, which selects `tokenizers`'s pure-Rust `fancy-regex` backend instead (upstream candle PR #3790). The fork keeps the upstream library names, so `use candle_core::…` is unchanged and no kizzasi source file differs because of it. `deny.toml` bans `onig`/`onig_sys` outright, so a regression fails the build rather than passing quietly.
+
+An earlier revision handled this with a `[patch.crates-io]` entry pointing at a sibling candle checkout. That was dropped because it only ever fixed the build *here*: `[patch]` does not propagate to crates.io, so consumers of a published kizzasi crate still compiled `onig`. If you want to check the property that actually matters, check it from outside this workspace, against the published crate:
+
+```bash
+cargo new /tmp/kz-consumer && cd /tmp/kz-consumer
+cargo add kizzasi-core
+cargo tree -i onig      # must report no matching packages
+```
+
+If upstream candle ever drops the `onig` default, the fork stops being necessary and these dependencies go back to plain `candle-core`/`candle-nn`.
+
+There is no `cuda` feature. candle's CUDA backend needs an NVIDIA toolkit at build time (its build scripts abort without one) and Cargo cannot make a feature conditional on the host toolchain, so a `cuda` flag would break `--all-features` on every machine without CUDA. Portable GPU acceleration is the `webgpu` feature; on Apple hardware `metal` forwards candle's own Metal backend.
+
+`metal` has the same shape of problem — candle's Metal backend pulls `objc2`, which `compile_error!`s off Apple — but the *target* is something Cargo does know, unlike the presence of a CUDA toolkit. So `metal` is routed through the [`kizzasi-metal`](crates/kizzasi-metal) crate, which declares candle under `cfg(target_vendor = "apple")` and `cfg(not(target_vendor = "apple"))` tables; `resolver = "2"` ignores the features of a platform-specific dependency for targets it is not building. The result is that `--all-features` builds and tests on Linux and Windows, while the backend itself stays Apple-only. Turning `metal` on off-Apple is inert but never silent: `is_metal_available()` returns `false` and `DeviceType::Metal` returns a device error naming the target rather than a CPU device in disguise.
 
 Minimal installation:
 ```toml
@@ -230,21 +276,25 @@ fn main() -> KizzasiResult<()> {
 
     let mut predictor = Kizzasi::new(config)?;
 
-    // Define safety constraints
-    let guardrails = GuardrailSet::new()
-        .add(Guardrail::new(
-            ConstraintBuilder::new()
-                .name("velocity_limit")
-                .bound(0, BoundType::Range(-1.0, 1.0))  // Clamp to [-1, 1]
-                .bound(1, BoundType::LessThan(100.0))   // Max value < 100
-                .build()?
-        ))
-        .add(Guardrail::new(
-            ConstraintBuilder::new()
-                .name("rate_limit")
-                .rate_limit(0.1)  // Max change per step
-                .build()?
-        ));
+    // Define safety constraints: each ConstraintBuilder produces exactly one
+    // bound on one dimension.
+    let velocity_limit = ConstraintBuilder::new()
+        .name("velocity_limit")
+        .dimension(0)
+        .in_range(-1.0, 1.0) // Clamp to [-1, 1]
+        .weight(1.0)
+        .build()?;
+
+    let max_value_limit = ConstraintBuilder::new()
+        .name("max_value_limit")
+        .dimension(1)
+        .less_than(100.0) // Max value < 100
+        .weight(1.0)
+        .build()?;
+
+    let mut guardrails = GuardrailSet::new();
+    guardrails.add_dimensional(0, Guardrail::new(velocity_limit, false));
+    guardrails.add_dimensional(1, Guardrail::new(max_value_limit, false));
 
     predictor.set_guardrails(guardrails);
 
@@ -252,21 +302,22 @@ fn main() -> KizzasiResult<()> {
     let input = array![0.5, 0.5, 0.5];
     let safe_output = predictor.step(&input)?;
 
+    println!("Safe output: {:?}", safe_output);
     Ok(())
 }
 ```
+
+Rate-of-change limits use a structurally different type, `TemporalConstraint` (see the Constraint System section below) — it is not accepted by `Guardrail::new`, which takes a single-bound `Constraint`.
 
 ### Real-Time Audio Processing
 
 ```rust
 use kizzasi::prelude::*;
+use kizzasi::{AudioConfig, AudioInput};
 
 fn main() -> KizzasiResult<()> {
-    // Use audio preset for optimized configuration
-    let config = KizzasiConfig::audio_preset()
-        .sample_rate(44100.0);
-
-    let mut predictor = Kizzasi::new(config)?;
+    // Use the audio preset for an optimized configuration (fixed 44.1kHz, mono)
+    let mut predictor = KizzasiBuilder::audio_preset().build()?;
 
     // Stream from microphone
     let audio_config = AudioConfig::new()
@@ -280,7 +331,7 @@ fn main() -> KizzasiResult<()> {
     loop {
         let buffer = audio.read()?;
         for sample in buffer.iter() {
-            let prediction = predictor.step(&array![*sample])?;
+            let _prediction = predictor.step(&array![*sample])?;
             // Use prediction for audio effect, anomaly detection, etc.
         }
     }
@@ -294,17 +345,17 @@ use kizzasi::prelude::*;
 
 fn main() -> KizzasiResult<()> {
     let config = KizzasiConfig::new()
-        .model_type(ModelType::S4D)
+        .model_type(ModelType::S4)
         .input_dim(6)
         .output_dim(6);
 
     let mut predictor = Kizzasi::new(config)?;
 
-    // Predict N steps into the future
+    // Predict N steps into the future — returns an Array2<f32> of shape (n_steps, output_dim)
     let initial = array![0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let trajectory = predictor.predict_n(&initial, 100)?;
 
-    println!("Predicted {} future states", trajectory.len());
+    println!("Predicted {} future states", trajectory.nrows());
     Ok(())
 }
 ```
@@ -324,19 +375,27 @@ Kizzasi supports multiple state-of-the-art sequence modeling architectures:
 
 ### Architecture Selection Guide
 
+`kizzasi_core::ModelType` (used by `KizzasiConfig`/`Kizzasi`) has four variants:
+
 ```rust
-// High-performance, long context
-ModelType::Mamba2  // Selective SSM with SSD
+use kizzasi::prelude::*;
 
-// Lightweight, embedded systems
-ModelType::Rwkv    // Linear attention, minimal state
+fn main() {
+    // High-performance, long context (default choice)
+    let _default_choice = ModelType::Mamba2; // Selective SSM with SSD
 
-// Smooth signal dynamics
-ModelType::S4D     // HiPPO initialization, diagonal SSM
+    // Lightweight, embedded systems
+    let _lightweight = ModelType::Rwkv; // Linear attention, minimal state
 
-// Comparison/research
-ModelType::Transformer  // Standard attention (O(N) per step)
+    // Smooth signal dynamics
+    let _smooth_dynamics = ModelType::S4; // HiPPO initialization, structured state space
+
+    // Original selective SSM
+    let _baseline = ModelType::Mamba; // First-generation selective SSM
+}
 ```
+
+S4D (diagonal-state S4) and Transformer are also implemented, but as standalone architectures in the lower-level `kizzasi-model` crate (`kizzasi_model::s4::S4D`, `kizzasi_model::transformer::Transformer`) used via `kizzasi-inference`'s model registry for research/comparison — they are not selectable through the top-level `Kizzasi` facade's `ModelType`.
 
 ---
 
@@ -359,17 +418,31 @@ ModelType::Transformer  // Standard attention (O(N) per step)
 Constraints can be enforced during training as differentiable losses:
 
 ```rust
-use kizzasi_logic::{ConstraintAwareLoss, LagrangianRelaxation};
+use kizzasi_logic::{
+    ConstraintAwareLoss, ConstraintBuilder, LagrangianRelaxation, LogicResult, PenaltyFunction,
+};
 
-// Combine task loss with constraint violation penalty
-let loss = ConstraintAwareLoss::new()
-    .task_loss(mse_loss)
-    .constraint_loss(guardrails.violation_loss(&prediction))
-    .weight(0.1);
+fn main() -> LogicResult<()> {
+    let velocity_limit = ConstraintBuilder::new()
+        .name("velocity_limit")
+        .dimension(0)
+        .in_range(-1.0, 1.0)
+        .weight(1.0)
+        .build()?;
 
-// Or use Lagrangian relaxation for adaptive weighting
-let relaxation = LagrangianRelaxation::new(guardrails)
-    .learning_rate(0.01);
+    // Combine task loss with constraint violation penalty
+    let loss_fn = ConstraintAwareLoss::new(vec![velocity_limit.clone()], PenaltyFunction::L2, 0.1);
+    let prediction = [1.5_f32, 0.2, 0.3];
+    let mse_loss = 0.05_f32;
+    let total_loss = loss_fn.compute_loss(&prediction, mse_loss);
+
+    // Or use Lagrangian relaxation for adaptive weighting
+    let mut relaxation = LagrangianRelaxation::new(1).with_multiplier_lr(0.01);
+    relaxation.update_multipliers(&prediction, &[velocity_limit]);
+
+    println!("total_loss = {total_loss}");
+    Ok(())
+}
 ```
 
 ---
@@ -387,19 +460,30 @@ Kizzasi provides multiple signal-to-token conversion strategies:
 | `MultiScaleTokenizer` | Hierarchical | Variable | Multi-resolution |
 | `PyramidTokenizer` | Residual | Variable | Progressive refinement |
 
+`kizzasi-tokenizer` is a separate crate dependency (not re-exported by the `kizzasi` facade), and `VQConfig`/`VQVAETokenizer` require the `vqvae` feature (`kizzasi-tokenizer = { version = "0.2", features = ["vqvae"] }`):
+
 ```rust
-use kizzasi_tokenizer::{VQVAETokenizer, VQConfig};
+use kizzasi_tokenizer::{Array1, SignalTokenizer, VQConfig, VQVAETokenizer};
 
-// Create VQ-VAE tokenizer with 1024 codebook entries
-let config = VQConfig::new()
-    .codebook_size(1024)
-    .embed_dim(256)
-    .ema_decay(0.99);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create VQ-VAE tokenizer with 1024 codebook entries
+    let config = VQConfig {
+        codebook_size: 1024,
+        embed_dim: 256,
+        ema_decay: 0.99,
+        ..Default::default()
+    };
 
-let tokenizer = VQVAETokenizer::new(config)?;
+    let input_dim = 64;
+    let tokenizer = VQVAETokenizer::new(input_dim, config);
 
-let tokens = tokenizer.encode(&signal)?;
-let reconstructed = tokenizer.decode(&tokens)?;
+    let signal = Array1::from_vec(vec![0.1_f32; input_dim]);
+    let tokens = tokenizer.encode(&signal)?;
+    let reconstructed = tokenizer.decode(&tokens)?;
+
+    println!("Reconstructed {} values", reconstructed.len());
+    Ok(())
+}
 ```
 
 ---
@@ -411,14 +495,58 @@ let reconstructed = tokenizer.decode(&tokens)?;
 Real-time motor control with safety bounds:
 
 ```rust
-let config = KizzasiConfig::robotics_preset()
-    .input_dim(12)   // 6 joint positions + 6 velocities
-    .output_dim(6);  // 6 torque commands
+use kizzasi::prelude::*;
 
-let guardrails = GuardrailSet::new()
-    .add(joint_limits())      // Physical joint ranges
-    .add(velocity_limits())   // Maximum angular velocities
-    .add(torque_limits());    // Actuator saturation
+fn joint_limits() -> LogicResult<Guardrail> {
+    let c = ConstraintBuilder::new()
+        .name("joint_limits")
+        .in_range(-3.14, 3.14)
+        .weight(1.0)
+        .build()?;
+    Ok(Guardrail::new(c, true))
+}
+
+fn velocity_limits() -> LogicResult<Guardrail> {
+    let c = ConstraintBuilder::new()
+        .name("velocity_limits")
+        .less_eq(5.0)
+        .weight(1.0)
+        .build()?;
+    Ok(Guardrail::new(c, true))
+}
+
+fn torque_limits() -> LogicResult<Guardrail> {
+    let c = ConstraintBuilder::new()
+        .name("torque_limits")
+        .in_range(-50.0, 50.0)
+        .weight(1.0)
+        .build()?;
+    Ok(Guardrail::new(c, false))
+}
+
+fn main() -> KizzasiResult<()> {
+    // Built directly rather than via KizzasiBuilder::robotics_preset(axes): that preset
+    // fixes input_dim == output_dim (and a lighter hidden_dim/state_dim/num_layers tuning),
+    // which doesn't fit this use case's asymmetric 12-in/6-out shape.
+    let config = KizzasiConfig::new()
+        .model_type(ModelType::Mamba2)
+        .input_dim(12)  // 6 joint positions + 6 velocities
+        .output_dim(6); // 6 torque commands
+
+    let mut predictor = Kizzasi::new(config)?;
+
+    let mut guardrails = GuardrailSet::new();
+    guardrails.add_global(joint_limits()?);    // Physical joint ranges
+    guardrails.add_global(velocity_limits()?); // Maximum angular velocities
+    guardrails.add_global(torque_limits()?);   // Actuator saturation
+
+    predictor.set_guardrails(guardrails);
+
+    let state = Array1::from_elem(12, 0.0_f32);
+    let torques = predictor.step(&state)?;
+    println!("Torque commands: {:?}", torques);
+    Ok(())
+}
 ```
 
 ### 2. Industrial Anomaly Detection
@@ -426,13 +554,22 @@ let guardrails = GuardrailSet::new()
 Predictive maintenance for IoT sensors:
 
 ```rust
-let config = KizzasiConfig::sensor_preset()
-    .input_dim(32);  // 32 sensor channels
+use kizzasi::prelude::*;
 
-// Train on "normal" operation data
-// At runtime, large prediction errors indicate anomalies
-let prediction = predictor.step(&sensor_reading)?;
-let anomaly_score = (prediction - actual).mapv(|x| x.abs()).sum();
+fn main() -> KizzasiResult<()> {
+    let mut predictor = KizzasiBuilder::sensor_preset(32).build()?; // 32 sensor channels
+
+    // Train on "normal" operation data (training loop not shown)
+    // At runtime, large prediction errors indicate anomalies
+    let sensor_reading = Array1::from_elem(32, 0.0_f32);
+    let actual = Array1::from_elem(32, 0.02_f32);
+
+    let prediction = predictor.step(&sensor_reading)?;
+    let anomaly_score = (prediction - actual).mapv(|x| x.abs()).sum();
+
+    println!("Anomaly score: {anomaly_score}");
+    Ok(())
+}
 ```
 
 ### 3. Audio Synthesis
@@ -440,14 +577,24 @@ let anomaly_score = (prediction - actual).mapv(|x| x.abs()).sum();
 Next-sample prediction for audio effects:
 
 ```rust
-let config = KizzasiConfig::audio_preset()
-    .model_type(ModelType::Rwkv);  // Fast, lightweight
+use kizzasi::prelude::*;
 
-// WaveNet-style sample-by-sample generation
-let mut predictor = Kizzasi::new(config)?;
-for sample in input_audio.iter() {
-    let next_sample = predictor.step(&array![*sample])?;
-    output_audio.push(next_sample[0]);
+fn main() -> KizzasiResult<()> {
+    let mut predictor = KizzasiBuilder::audio_preset()
+        .model_type(ModelType::Rwkv) // Fast, lightweight
+        .build()?;
+
+    let input_audio = vec![0.1_f32, 0.2, -0.1, 0.05, 0.0];
+    let mut output_audio = Vec::with_capacity(input_audio.len());
+
+    // WaveNet-style sample-by-sample generation
+    for sample in input_audio.iter() {
+        let next_sample = predictor.step(&array![*sample])?;
+        output_audio.push(next_sample[0]);
+    }
+
+    println!("Generated {} samples", output_audio.len());
+    Ok(())
 }
 ```
 
@@ -456,15 +603,45 @@ for sample in input_audio.iter() {
 Anime in-betweening and frame interpolation:
 
 ```rust
-let config = KizzasiConfig::new()
-    .model_type(ModelType::Mamba2)
-    .input_dim(1024)   // Frame embedding dimension
-    .output_dim(1024);
+use kizzasi::prelude::*;
 
-// Enforce skeleton/pose constraints
-let guardrails = GuardrailSet::new()
-    .add(bone_length_constraints())
-    .add(joint_angle_limits());
+fn bone_length_constraints() -> LogicResult<Guardrail> {
+    let c = ConstraintBuilder::new()
+        .name("bone_length")
+        .in_range(0.0, 2.0)
+        .weight(1.0)
+        .build()?;
+    Ok(Guardrail::new(c, false))
+}
+
+fn joint_angle_limits() -> LogicResult<Guardrail> {
+    let c = ConstraintBuilder::new()
+        .name("joint_angle")
+        .in_range(-3.14, 3.14)
+        .weight(1.0)
+        .build()?;
+    Ok(Guardrail::new(c, false))
+}
+
+fn main() -> KizzasiResult<()> {
+    let config = KizzasiConfig::new()
+        .model_type(ModelType::Mamba2)
+        .input_dim(1024)  // Frame embedding dimension
+        .output_dim(1024);
+
+    let mut predictor = Kizzasi::new(config)?;
+
+    // Enforce skeleton/pose constraints on the predicted frame embedding
+    let mut guardrails = GuardrailSet::new();
+    guardrails.add_global(bone_length_constraints()?);
+    guardrails.add_global(joint_angle_limits()?);
+    predictor.set_guardrails(guardrails);
+
+    let frame = Array1::from_elem(1024, 0.0_f32);
+    let next_frame = predictor.step(&frame)?;
+    println!("Predicted frame with {} features", next_frame.len());
+    Ok(())
+}
 ```
 
 ---
@@ -475,10 +652,12 @@ let guardrails = GuardrailSet::new()
 
 | Metric | Mamba2 | RWKV | S4D | Transformer |
 |--------|:------:|:----:|:---:|:-----------:|
-| Per-step latency | ~100μs | ~50μs | ~80μs | ~500μs |
+| Per-step complexity | O(1) | O(1) | O(1) | O(L) |
 | Memory (state) | O(d·N) | O(d) | O(d·N) | O(L·d) |
 | Context length | Unlimited | Unlimited | Unlimited | Fixed L |
 | Training parallel | ✓ | ✓ | ✓ | ✓ |
+
+Per-step complexity and memory scaling are analytic properties of each architecture class. Wall-clock latency is hardware- and configuration-dependent and has not been benchmarked on release hardware for this version; `cargo bench` runs the real Criterion suite (see `crates/kizzasi-model/benches/architecture_comparison.rs` for a single-step latency sweep across architectures and hidden dimensions) if you want numbers for your own machine.
 
 ### Optimization Features
 
@@ -521,9 +700,9 @@ See [KIZZASI_POLICY.md](KIZZASI_POLICY.md) for dependency guidelines.
  Dockerfile              1           53           26           14           13
  JavaScript              1          142          104           18           20
  Makefile                1          191          135           28           28
- Python                  7          503          347           45          111
- Shell                   3          313          232           37           44
- TOML                   15         1164          743          291          130
+ Python                  8          984          687           79          218
+ Shell                   4          384          276           51           57
+ TOML                   16         1619          810          676          133
  YAML                    1           41           38            0            3
 -------------------------------------------------------------------------------
  HTML                    2           96           88            0            8
@@ -533,33 +712,33 @@ See [KIZZASI_POLICY.md](KIZZASI_POLICY.md) for dependency guidelines.
 -------------------------------------------------------------------------------
  Jupyter Notebooks       3            0            0            0            0
  |- Markdown             3          169            1          127           41
- |- Python               3          690          537           57           96
- (Total)                            859          538          184          137
+ |- Python               3          688          538           54           96
+ (Total)                            857          539          181          137
 -------------------------------------------------------------------------------
- Markdown               40        11367            0         8752         2615
- |- BASH                15          214          126           57           31
+ Markdown               41        12362            0         9537         2825
+ |- BASH                16          219          131           57           31
  |- Dockerfile           1           19           19            0            0
- |- Python               3           97           67           12           18
- |- Rust                27         2673         1889          346          438
- |- TOML                17          113           88           18            7
+ |- Python               3          277          189           31           57
+ |- Rust                28         3007         2142          382          483
+ |- TOML                19          129          100           20            9
  |- YAML                 1           27           25            0            2
- (Total)                          14510         2214         9185         3111
+ (Total)                          16040         2606        10027         3407
 -------------------------------------------------------------------------------
- Rust                  414       179123       140465        10842        27816
- |- Markdown           408        23463          858        19105         3500
- (Total)                         202586       141323        29947        31316
+ Rust                  438       215697       170202        13758        31737
+ |- Markdown           436        32033          917        26463         4653
+ (Total)                         247730       171119        40221        36390
 ===============================================================================
- Total                 488       192993       142178        20027        30788
+ Total                 516       231569       172366        24161        35042
 ===============================================================================
 
-Tests: 2,567 passing (default features) / 2,744 passing (all-features) | Clippy: 0 warnings | Rustdoc: 0 warnings (strict)
+Tests: 3,688 passing, 24 skipped (workspace, all-features) | Clippy: 0 warnings | Rustdoc: 0 warnings (strict)
 ```
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please open an issue or pull request on [GitHub](https://github.com/cool-japan/kizzasi).
 
 ### Development Setup
 

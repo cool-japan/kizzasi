@@ -56,6 +56,10 @@ pub enum Opcode {
     CmpLe,
     /// Pop `b`, pop `a`; push `1.0` if `a >= b`, else `0.0`
     CmpGe,
+    /// Pop `b`, pop `a`; push `1.0` if `a < b` (strict), else `0.0`
+    CmpLt,
+    /// Pop `b`, pop `a`; push `1.0` if `a > b` (strict), else `0.0`
+    CmpGt,
     /// Pop `b`, pop `a`; push `1.0` if both non-zero, else `0.0`
     And,
     /// Pop `b`, pop `a`; push `1.0` if either non-zero, else `0.0`
@@ -182,6 +186,16 @@ impl CompiledConstraint {
                     let a = stack_pop(&mut stack, "CmpGe")?;
                     stack.push(if a >= b { 1.0 } else { 0.0 });
                 }
+                Opcode::CmpLt => {
+                    let b = stack_pop(&mut stack, "CmpLt")?;
+                    let a = stack_pop(&mut stack, "CmpLt")?;
+                    stack.push(if a < b { 1.0 } else { 0.0 });
+                }
+                Opcode::CmpGt => {
+                    let b = stack_pop(&mut stack, "CmpGt")?;
+                    let a = stack_pop(&mut stack, "CmpGt")?;
+                    stack.push(if a > b { 1.0 } else { 0.0 });
+                }
                 Opcode::And => {
                     let b = stack_pop(&mut stack, "And")?;
                     let a = stack_pop(&mut stack, "And")?;
@@ -275,6 +289,8 @@ fn constant_fold(ops: &[Opcode]) -> Vec<Opcode> {
                     Opcode::Max => Some(a.max(b)),
                     Opcode::CmpLe => Some(if a <= b { 1.0 } else { 0.0 }),
                     Opcode::CmpGe => Some(if a >= b { 1.0 } else { 0.0 }),
+                    Opcode::CmpLt => Some(if a < b { 1.0 } else { 0.0 }),
+                    Opcode::CmpGt => Some(if a > b { 1.0 } else { 0.0 }),
                     Opcode::And => Some(if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 }),
                     Opcode::Or => Some(if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 }),
                     _ => None,
@@ -378,6 +394,10 @@ pub enum ConstraintExpr {
     Le(Box<ConstraintExpr>, Box<ConstraintExpr>),
     /// `a >= b` (evaluates to 1.0 or 0.0)
     Ge(Box<ConstraintExpr>, Box<ConstraintExpr>),
+    /// `a < b`, strict (evaluates to 1.0 or 0.0)
+    Lt(Box<ConstraintExpr>, Box<ConstraintExpr>),
+    /// `a > b`, strict (evaluates to 1.0 or 0.0)
+    Gt(Box<ConstraintExpr>, Box<ConstraintExpr>),
     /// `a && b`
     And(Box<ConstraintExpr>, Box<ConstraintExpr>),
     /// `a || b`
@@ -427,15 +447,24 @@ impl ConstraintExpr {
     /// `||x[dims]||_2 <= radius`
     ///
     /// Compiles to: `sqrt(sum_i(x[dims[i]]^2)) <= radius`
-    pub fn l2_norm_le(dims: &[usize], radius: f32) -> Self {
-        assert!(!dims.is_empty(), "l2_norm_le: dims must not be empty");
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidConstraint`] when `dims` is empty — there is no
+    /// norm to bound.
+    pub fn l2_norm_le(dims: &[usize], radius: f32) -> LogicResult<Self> {
+        let Some((&first, rest)) = dims.split_first() else {
+            return Err(LogicError::InvalidConstraint(
+                "l2_norm_le requires at least one dimension".to_string(),
+            ));
+        };
 
         // Build sum of squares
         let mut sum_sq: ConstraintExpr = ConstraintExpr::Mul(
-            Box::new(ConstraintExpr::Dim(dims[0])),
-            Box::new(ConstraintExpr::Dim(dims[0])),
+            Box::new(ConstraintExpr::Dim(first)),
+            Box::new(ConstraintExpr::Dim(first)),
         );
-        for &d in &dims[1..] {
+        for &d in rest {
             let sq = ConstraintExpr::Mul(
                 Box::new(ConstraintExpr::Dim(d)),
                 Box::new(ConstraintExpr::Dim(d)),
@@ -444,13 +473,19 @@ impl ConstraintExpr {
         }
 
         let norm = ConstraintExpr::Sqrt(Box::new(sum_sq));
-        ConstraintExpr::Le(Box::new(norm), Box::new(ConstraintExpr::Const(radius)))
+        Ok(ConstraintExpr::Le(
+            Box::new(norm),
+            Box::new(ConstraintExpr::Const(radius)),
+        ))
     }
 
     /// `sum_i(coeffs[i].1 * x[coeffs[i].0]) <= rhs`
-    pub fn affine_le(coeffs: &[(usize, f32)], rhs: f32) -> Self {
-        assert!(!coeffs.is_empty(), "affine_le: coeffs must not be empty");
-
+    ///
+    /// # Errors
+    ///
+    /// [`LogicError::InvalidConstraint`] when `coeffs` is empty — there is no
+    /// affine form to bound.
+    pub fn affine_le(coeffs: &[(usize, f32)], rhs: f32) -> LogicResult<Self> {
         let term = |(dim, c): &(usize, f32)| -> ConstraintExpr {
             ConstraintExpr::Mul(
                 Box::new(ConstraintExpr::Const(*c)),
@@ -458,12 +493,21 @@ impl ConstraintExpr {
             )
         };
 
-        let mut sum = term(&coeffs[0]);
-        for coeff in &coeffs[1..] {
+        let Some((first, rest)) = coeffs.split_first() else {
+            return Err(LogicError::InvalidConstraint(
+                "affine_le requires at least one coefficient".to_string(),
+            ));
+        };
+
+        let mut sum = term(first);
+        for coeff in rest {
             sum = ConstraintExpr::Add(Box::new(sum), Box::new(term(coeff)));
         }
 
-        ConstraintExpr::Le(Box::new(sum), Box::new(ConstraintExpr::Const(rhs)))
+        Ok(ConstraintExpr::Le(
+            Box::new(sum),
+            Box::new(ConstraintExpr::Const(rhs)),
+        ))
     }
 }
 
@@ -520,6 +564,16 @@ fn emit(expr: &ConstraintExpr, ops: &mut Vec<Opcode>) {
             emit(a, ops);
             emit(b, ops);
             ops.push(Opcode::CmpGe);
+        }
+        ConstraintExpr::Lt(a, b) => {
+            emit(a, ops);
+            emit(b, ops);
+            ops.push(Opcode::CmpLt);
+        }
+        ConstraintExpr::Gt(a, b) => {
+            emit(a, ops);
+            emit(b, ops);
+            ops.push(Opcode::CmpGt);
         }
         ConstraintExpr::And(a, b) => {
             emit(a, ops);
@@ -658,10 +712,24 @@ mod tests {
         );
     }
 
+    /// Regression (finding 140): empty builders must report an error rather
+    /// than panicking.
+    #[test]
+    fn test_expression_builders_reject_empty_input() {
+        assert!(matches!(
+            ConstraintExpr::l2_norm_le(&[], 1.0),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+        assert!(matches!(
+            ConstraintExpr::affine_le(&[], 1.0),
+            Err(LogicError::InvalidConstraint(_))
+        ));
+    }
+
     #[test]
     fn test_compile_affine_le() {
         // 2*x[0] + 3*x[1] <= 10
-        let expr = ConstraintExpr::affine_le(&[(0, 2.0), (1, 3.0)], 10.0);
+        let expr = ConstraintExpr::affine_le(&[(0, 2.0), (1, 3.0)], 10.0).expect("affine_le");
         let compiled = expr.compile("affine", 2);
 
         // 2*1 + 3*1 = 5 <= 10 → feasible
@@ -682,7 +750,7 @@ mod tests {
     #[test]
     fn test_compile_l2_norm_le() {
         // ||(x[0], x[1])||_2 <= 1.0
-        let expr = ConstraintExpr::l2_norm_le(&[0, 1], 1.0);
+        let expr = ConstraintExpr::l2_norm_le(&[0, 1], 1.0).expect("l2_norm_le");
         let compiled = expr.compile("l2ball", 2);
 
         // (0.3, 0.4): norm = 0.5 <= 1.0
@@ -828,6 +896,10 @@ mod tests {
 pub struct TlExprCompiler {
     /// Maps symbolic variable names to dimension indices in the input vector.
     dim_map: HashMap<String, usize>,
+    /// Tolerance used when lowering `TLExpr::Eq(a, b)` to `|a - b| < tolerance`.
+    /// Defaults to `1e-6`, matching [`crate::TLExprEvaluator`]'s own `Eq`
+    /// tolerance (see [`Self::with_eq_tolerance`]).
+    eq_tolerance: f32,
 }
 
 impl Default for TlExprCompiler {
@@ -836,12 +908,28 @@ impl Default for TlExprCompiler {
     }
 }
 
+/// Default tolerance for `TLExpr::Eq` lowering, matching
+/// [`crate::TLExprEvaluator`]'s `diff < 1e-6` check exactly.
+const DEFAULT_EQ_TOLERANCE: f32 = 1e-6;
+
 impl TlExprCompiler {
     /// Create a new compiler with no variable-to-dimension mappings.
     pub fn new() -> Self {
         Self {
             dim_map: HashMap::new(),
+            eq_tolerance: DEFAULT_EQ_TOLERANCE,
         }
+    }
+
+    /// Override the tolerance `TLExpr::Eq(a, b)` is lowered with (default
+    /// `1e-6`). Non-finite or negative values are ignored (the previous
+    /// tolerance is kept) rather than producing a constraint that can never
+    /// be satisfied.
+    pub fn with_eq_tolerance(mut self, tolerance: f32) -> Self {
+        if tolerance.is_finite() && tolerance >= 0.0 {
+            self.eq_tolerance = tolerance;
+        }
+        self
     }
 
     /// Register a variable name → dimension index mapping.
@@ -956,7 +1044,7 @@ impl TlExprCompiler {
                     .into(),
             )),
 
-            // Comparisons → 1.0 / 0.0 via CmpLe / CmpGe
+            // Comparisons → 1.0 / 0.0 via CmpLe / CmpGe / CmpLt / CmpGt
             TLExpr::Lte(a, b) => Ok(ConstraintExpr::Le(
                 Box::new(self.lower(a)?),
                 Box::new(self.lower(b)?),
@@ -965,23 +1053,32 @@ impl TlExprCompiler {
                 Box::new(self.lower(a)?),
                 Box::new(self.lower(b)?),
             )),
-            TLExpr::Lt(a, b) => {
-                // a < b ≡ a <= b  AND  NOT(a == b) — simplify as Le (slightly wrong at boundary)
-                // For continuous signals this is equivalent; use Le
-                Ok(ConstraintExpr::Le(
-                    Box::new(self.lower(a)?),
-                    Box::new(self.lower(b)?),
-                ))
-            }
-            TLExpr::Gt(a, b) => Ok(ConstraintExpr::Ge(
+            // `Opcode::CmpLt`/`CmpGt` give a real strict comparison, so `Lt`
+            // and `Gt` no longer have to collapse to their non-strict
+            // siblings (which used to accept the boundary value itself,
+            // diverging from `TLExprEvaluator`'s true `<`/`>`).
+            TLExpr::Lt(a, b) => Ok(ConstraintExpr::Lt(
+                Box::new(self.lower(a)?),
+                Box::new(self.lower(b)?),
+            )),
+            TLExpr::Gt(a, b) => Ok(ConstraintExpr::Gt(
                 Box::new(self.lower(a)?),
                 Box::new(self.lower(b)?),
             )),
             TLExpr::Eq(a, b) => {
-                // a == b ≡ (a <= b) AND (a >= b)
-                let le = ConstraintExpr::Le(Box::new(self.lower(a)?), Box::new(self.lower(b)?));
-                let ge = ConstraintExpr::Ge(Box::new(self.lower(a)?), Box::new(self.lower(b)?));
-                Ok(ConstraintExpr::And(Box::new(le), Box::new(ge)))
+                // a == b, within a tolerance — matching
+                // `TLExprEvaluator::evaluate`'s `diff < 1e-6` exactly
+                // (strict `<`, not `<=`: lowering to `Abs(a-b) <= tol` would
+                // trade the old Lt/Gt boundary mismatch for a fresh one at
+                // `|a-b| == tol`).
+                let diff = ConstraintExpr::Abs(Box::new(ConstraintExpr::Sub(
+                    Box::new(self.lower(a)?),
+                    Box::new(self.lower(b)?),
+                )));
+                Ok(ConstraintExpr::Lt(
+                    Box::new(diff),
+                    Box::new(ConstraintExpr::Const(self.eq_tolerance)),
+                ))
             }
 
             // Logic
@@ -1083,8 +1180,9 @@ impl TlExprCompiler {
                 ))
             }),
             [Term::Typed { value, .. }] => {
-                // Recurse into the inner term
-                let inner = TlExprCompiler::new_with_map(self.dim_map.clone());
+                // Recurse into the inner term, preserving this compiler's
+                // configured Eq tolerance rather than silently resetting it.
+                let inner = TlExprCompiler::new_with_map(self.dim_map.clone(), self.eq_tolerance);
                 inner.lower_pred(name, std::slice::from_ref(value))
             }
             _ => Err(LogicError::InvalidConstraint(format!(
@@ -1094,8 +1192,11 @@ impl TlExprCompiler {
         }
     }
 
-    fn new_with_map(dim_map: HashMap<String, usize>) -> Self {
-        Self { dim_map }
+    fn new_with_map(dim_map: HashMap<String, usize>, eq_tolerance: f32) -> Self {
+        Self {
+            dim_map,
+            eq_tolerance,
+        }
     }
 }
 

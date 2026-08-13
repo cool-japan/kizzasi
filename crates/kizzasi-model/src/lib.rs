@@ -42,6 +42,7 @@ pub mod checkpoint;
 pub mod compression;
 pub mod curriculum;
 pub mod distributed;
+pub mod dropout;
 pub mod dynamic_quantization;
 pub mod early_exit;
 mod error;
@@ -51,6 +52,9 @@ pub mod gguf;
 pub(crate) mod gguf_dequant;
 pub mod gradient_checkpoint;
 pub mod huggingface;
+/// Download-and-convert pipeline built on [`huggingface::HuggingFaceHub`];
+/// needs the `hf-hub` feature for the same reason the hub client does.
+#[cfg(feature = "hf-hub")]
 pub mod huggingface_loader;
 pub mod incremental_loader;
 pub mod loader;
@@ -79,14 +83,19 @@ pub mod mamba2;
 
 pub mod interpretability;
 
+#[cfg(feature = "rwkv")]
 pub mod rwkv;
 
+#[cfg(feature = "rwkv")]
 pub mod rwkv5;
 
+#[cfg(feature = "rwkv")]
 pub mod rwkv7;
 
+#[cfg(feature = "s4")]
 pub mod s4;
 
+#[cfg(feature = "s4")]
 pub mod s5;
 
 pub mod h3;
@@ -101,12 +110,33 @@ pub mod spiking;
 
 pub mod temporal_multiscale;
 
+#[cfg(feature = "transformer")]
 pub mod transformer;
 
 pub mod tensorlogic_bridge;
 pub use tensorlogic_bridge::{compile_constraints, constraint_from_tl_expr};
 
 pub use error::{ModelError, ModelResult};
+
+/// Validate that a `step` input has the length the model was built for.
+///
+/// `ndarray`'s `Array1::dot(&Array2)` *panics* on a shape mismatch, and the
+/// input length of [`SignalPredictor::step`] is entirely user-controlled — so
+/// every model calls this before touching its input projection, turning what
+/// would be a process abort into a recoverable
+/// [`CoreError::DimensionMismatch`](kizzasi_core::CoreError::DimensionMismatch).
+pub fn check_input_dim(
+    input: &scirs2_core::ndarray::Array1<f32>,
+    expected: usize,
+) -> CoreResult<()> {
+    if input.len() != expected {
+        return Err(kizzasi_core::CoreError::DimensionMismatch {
+            expected,
+            got: input.len(),
+        });
+    }
+    Ok(())
+}
 
 // Re-export backward pass / autograd types
 pub use backprop::{
@@ -186,7 +216,9 @@ pub use compression::{CompressionReport, LowRankApprox, MagnitudePruner, Structu
 pub use state_io::{decode_f32_slice, encode_f32_slice, ModelSnapshot};
 
 pub use kizzasi_core::{CoreResult, HiddenState, SignalPredictor};
+#[cfg(feature = "rwkv")]
 pub use rwkv5::{Rwkv5Config, Rwkv5Model, Rwkv5State};
+#[cfg(feature = "rwkv")]
 pub use rwkv7::{Rwkv7Config, Rwkv7Model, Rwkv7State, Rwkv7TimeMixing};
 pub use scirs2_core::ndarray::{Array1, Array2};
 

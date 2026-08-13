@@ -215,9 +215,40 @@ impl ParallelBatchProjector {
         }
     }
 
+    /// Run `f` on a dedicated pool sized by `self.num_threads`. Built fresh
+    /// on every call rather than cached, because `num_threads` is a public,
+    /// freely mutable field — a cached pool could silently go stale after a
+    /// caller changes it. Falls back to running directly on the caller's
+    /// thread (the global rayon pool) when `num_threads == 0` or pool
+    /// construction fails.
+    fn run_with_configured_pool<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
+        if self.num_threads == 0 {
+            return f();
+        }
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(self.num_threads)
+            .build()
+        {
+            Ok(pool) => pool.install(f),
+            Err(err) => {
+                tracing::warn!(
+                    "ParallelBatchProjector: failed to build a {}-thread pool ({err}); \
+                     falling back to the global rayon pool",
+                    self.num_threads
+                );
+                f()
+            }
+        }
+    }
+
     /// Project multiple points onto the constraint set in parallel.
     ///
-    /// Each point is projected independently using projected gradient descent.
+    /// Each point is projected independently using projected gradient
+    /// descent, on the thread pool sized by `self.num_threads`. Stops early
+    /// once `constraint` reports feasibility, or once the gradient step's
+    /// magnitude falls below `self.tolerance` (previously stored and never
+    /// read: the loop only ever stopped on feasibility or on exhausting
+    /// `max_iterations`).
     /// `constraint` returns `true` if the point is feasible.
     /// `gradient` returns the constraint violation gradient at a point.
     pub fn project_batch(
@@ -228,26 +259,36 @@ impl ParallelBatchProjector {
     ) -> Vec<Vec<f64>> {
         let step_size = 0.01f64;
         let max_iter = self.max_iterations;
+        let tolerance = self.tolerance;
 
-        points
-            .par_iter()
-            .map(|point| {
-                let mut p = point.clone();
-                for _ in 0..max_iter {
-                    if constraint(&p) {
-                        break;
+        self.run_with_configured_pool(|| {
+            points
+                .par_iter()
+                .map(|point| {
+                    let mut p = point.clone();
+                    for _ in 0..max_iter {
+                        if constraint(&p) {
+                            break;
+                        }
+                        let grad = gradient(&p);
+                        let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+                        if grad_norm * step_size < tolerance {
+                            // The step is too small to make further
+                            // meaningful progress.
+                            break;
+                        }
+                        p.iter_mut()
+                            .zip(grad.iter())
+                            .for_each(|(x, g)| *x -= step_size * g);
                     }
-                    let grad = gradient(&p);
-                    p.iter_mut()
-                        .zip(grad.iter())
-                        .for_each(|(x, g)| *x -= step_size * g);
-                }
-                p
-            })
-            .collect()
+                    p
+                })
+                .collect()
+        })
     }
 
-    /// Compute violations for a batch of points in parallel.
+    /// Compute violations for a batch of points in parallel, on the thread
+    /// pool sized by `self.num_threads`.
     ///
     /// Returns `violations[point_idx][constraint_idx]` = violation amount.
     /// Points and constraints are evaluated in a parallel outer loop over points.
@@ -256,15 +297,17 @@ impl ParallelBatchProjector {
         points: &[Vec<f64>],
         constraints: &[ConstraintFn],
     ) -> Vec<Vec<f64>> {
-        points
-            .par_iter()
-            .map(|point| {
-                constraints
-                    .iter()
-                    .map(|c| c(point.as_slice()))
-                    .collect::<Vec<f64>>()
-            })
-            .collect()
+        self.run_with_configured_pool(|| {
+            points
+                .par_iter()
+                .map(|point| {
+                    constraints
+                        .iter()
+                        .map(|c| c(point.as_slice()))
+                        .collect::<Vec<f64>>()
+                })
+                .collect()
+        })
     }
 }
 
@@ -272,18 +315,38 @@ impl ParallelBatchProjector {
 // SIMD-optimized range constraint checking
 // ============================================================================
 
-/// Check whether all values in a slice are within `[min, max]`.
+/// Returns `true` iff every value in `values` lies within `[min, max]`.
 ///
-/// Written in an auto-vectorization-friendly pattern so LLVM can emit
-/// SSE/AVX/NEON SIMD instructions. Returns `(all_satisfied, violation_indices)`.
+/// A branch-free boolean fold with no early exit and no allocation, so
+/// LLVM's auto-vectorizer can lower it to packed SIMD compare+and
+/// instructions (SSE/AVX/NEON depending on target). This is the part of
+/// [`check_range_constraints_simd`] that can actually be vectorized —
+/// compacting the *indices* of out-of-range elements into a growable `Vec`
+/// is inherently data-dependent and something LLVM cannot auto-vectorize.
+pub fn all_in_range(values: &[f64], min: f64, max: f64) -> bool {
+    values
+        .iter()
+        .fold(true, |acc, &v| acc & (v >= min) & (v <= max))
+}
+
+/// Check whether all values in a slice are within `[min, max]`, returning
+/// which indices violate the range when they do not.
+///
+/// The `all_satisfied` reduction goes through [`all_in_range`] (auto-
+/// vectorization friendly); the index list is only built when that check
+/// fails, so the common all-satisfied case never pays for the
+/// non-vectorizable compaction below.
 pub fn check_range_constraints_simd(values: &[f64], min: f64, max: f64) -> (bool, Vec<usize>) {
+    if all_in_range(values, min, max) {
+        return (true, Vec::new());
+    }
     let violations: Vec<usize> = values
         .iter()
         .enumerate()
         .filter(|(_, &v)| v < min || v > max)
         .map(|(i, _)| i)
         .collect();
-    (violations.is_empty(), violations)
+    (false, violations)
 }
 
 // ============================================================================
@@ -507,6 +570,19 @@ mod tests {
         assert_eq!(violations, vec![0, 2]);
     }
 
+    /// Regression (finding 147): `all_in_range` is the genuinely
+    /// vectorizable reduction `check_range_constraints_simd` now delegates
+    /// to; test it directly rather than only through the wrapper.
+    #[test]
+    fn test_all_in_range() {
+        assert!(all_in_range(&[1.0, 2.0, 3.0], 0.0, 5.0));
+        assert!(all_in_range(&[], 0.0, 5.0)); // vacuously true
+        assert!(!all_in_range(&[1.0, -1.0, 3.0], 0.0, 5.0));
+        assert!(!all_in_range(&[1.0, 2.0, 6.0], 0.0, 5.0));
+        // Boundary values are inclusive.
+        assert!(all_in_range(&[0.0, 5.0], 0.0, 5.0));
+    }
+
     #[test]
     fn test_constraint_graph_empty_evaluate() {
         let mut graph = ConstraintGraph::new();
@@ -610,6 +686,30 @@ mod tests {
         assert!((projected[1][0] - 0.5).abs() < 1e-9);
         // First point should have been pushed down
         assert!(projected[0][0] <= 1.0 + 1e-6);
+    }
+
+    /// Regression (finding 137): `tolerance` used to be stored and never
+    /// read, so the descent loop only ever stopped on feasibility or on
+    /// exhausting `max_iterations`. With an unreachable feasibility
+    /// condition (`constraint` always returns `false`) but a small,
+    /// nonzero gradient, the loop must now still terminate early via the
+    /// step-size check instead of running the full iteration budget.
+    #[test]
+    fn test_project_batch_stops_early_once_step_is_below_tolerance() {
+        let mut projector = ParallelBatchProjector::new(0);
+        projector.tolerance = 1.0; // any step smaller than this stops immediately
+        projector.max_iterations = 1_000_000; // would hang/spin without the tolerance check
+
+        let points = vec![vec![10.0f64]];
+        let constraint = |_: &[f64]| false; // never "done" by feasibility alone
+        let gradient = |_: &[f64]| vec![0.001]; // step_size(0.01) * 0.001 << tolerance(1.0)
+
+        // Must return promptly (the point is untouched, since the very
+        // first step is already below tolerance) rather than looping
+        // 1,000,000 times.
+        let projected = projector.project_batch(&points, &constraint, &gradient);
+        assert_eq!(projected.len(), 1);
+        assert!((projected[0][0] - 10.0).abs() < 1e-9);
     }
 
     type ConstraintFn = Arc<dyn Fn(&[f64]) -> f64 + Send + Sync>;

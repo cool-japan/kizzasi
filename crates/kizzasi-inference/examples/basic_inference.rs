@@ -17,9 +17,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Create a model registry
     let mut registry = ModelRegistry::new();
 
-    // 2. Register an S4D model configuration
+    // 2. Register an S4D model configuration.
+    //    S4D has no output-projection layer, so output_dim must equal
+    //    input_dim (see ModelRegistry's architecture docs).
     let model_config = ModelBuilder::s4d()
-        .dims(1, 128, 10) // input_dim, hidden_dim, output_dim
+        .dims(1, 128, 1) // input_dim, hidden_dim, output_dim
         .layers(4)
         .state_dim(16)
         .build();
@@ -31,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = registry.create_model("signal_predictor")?;
 
     // 4. Create engine configuration
-    let engine_config = EngineConfig::new(1, 10);
+    let engine_config = EngineConfig::new(1, 1);
 
     // 5. Create inference engine with model
     let mut engine = InferenceEngine::with_model(engine_config, model);

@@ -148,14 +148,14 @@ impl StreamSynchronizer {
         let mut min_max_time: Option<Timestamp> = None;
 
         for buffer in self.buffers.values() {
-            if buffer.is_empty() {
+            // Read `back()` directly rather than a separate `is_empty()`
+            // check followed by an `expect()` on `back()` -- avoids relying
+            // on an invariant across two statements to justify a panic-free
+            // unwrap.
+            let Some(latest) = buffer.back() else {
                 return Err(IoError::BufferEmpty);
-            }
-
-            let max_time = buffer
-                .back()
-                .expect("Buffer must be non-empty (checked above)")
-                .timestamp;
+            };
+            let max_time = latest.timestamp;
             min_max_time = Some(match min_max_time {
                 None => max_time,
                 Some(current) => current.min(max_time),
@@ -163,6 +163,23 @@ impl StreamSynchronizer {
         }
 
         min_max_time.ok_or_else(|| IoError::BufferEmpty)
+    }
+
+    /// Reject a sample whose distance from `target_time` exceeds
+    /// `config.max_time_diff`. Used wherever a stream can only offer an
+    /// extrapolated/held value rather than a genuine bracket straddling
+    /// `target_time` -- e.g. a stream that stalled and has nothing recent
+    /// enough to align with the other streams.
+    fn check_max_time_diff(&self, sample_time: Timestamp, target_time: Timestamp) -> IoResult<()> {
+        let distance = sample_time.abs_diff(target_time);
+        if distance > self.config.max_time_diff {
+            return Err(IoError::SyncFailed(format!(
+                "sample is {distance} microseconds from the sync target, exceeding max_time_diff \
+                 of {} microseconds",
+                self.config.max_time_diff
+            )));
+        }
+        Ok(())
     }
 
     /// Interpolate sample at specific timestamp
@@ -191,7 +208,11 @@ impl StreamSynchronizer {
 
         match self.config.interpolation {
             InterpolationMethod::Nearest => {
-                // Use nearest sample
+                // Use nearest sample. Even when both a `before` and an
+                // `after` sample straddle `target_time`, "nearest" can
+                // still be arbitrarily far away if the stream's samples
+                // are sparse, so the tolerance check applies unconditionally
+                // here (unlike Linear's true-bracket case below).
                 let nearest = match (before, after) {
                     (Some(b), Some(a)) => {
                         let diff_before = target_time - b.timestamp;
@@ -206,29 +227,82 @@ impl StreamSynchronizer {
                     (None, Some(a)) => a,
                     (None, None) => return Err(IoError::BufferEmpty),
                 };
+                self.check_max_time_diff(nearest.timestamp, target_time)?;
                 Ok(nearest.data.clone())
             }
             InterpolationMethod::Linear => {
                 match (before, after) {
                     (Some(b), Some(a)) if b.timestamp != a.timestamp => {
-                        // Linear interpolation
+                        // Genuine interpolation: target_time falls strictly
+                        // between two real samples, so there is nothing
+                        // stale being extrapolated here regardless of how
+                        // far apart b and a are.
                         let t =
                             (target_time - b.timestamp) as f32 / (a.timestamp - b.timestamp) as f32;
                         Ok(&b.data * (1.0 - t) + &a.data * t)
                     }
-                    (Some(b), _) => Ok(b.data.clone()),
-                    (None, Some(a)) => Ok(a.data.clone()),
-                    _ => Err(IoError::BufferEmpty),
+                    (Some(b), Some(_)) => {
+                        // b.timestamp == a.timestamp == target_time: exact
+                        // match, not extrapolation.
+                        Ok(b.data.clone())
+                    }
+                    (Some(b), None) => {
+                        // No sample at or after target_time for this
+                        // stream: it stopped producing data and we would
+                        // be holding a stale value indefinitely.
+                        self.check_max_time_diff(b.timestamp, target_time)?;
+                        Ok(b.data.clone())
+                    }
+                    (None, Some(a)) => {
+                        // No sample at or before target_time: this stream
+                        // has not caught up yet.
+                        self.check_max_time_diff(a.timestamp, target_time)?;
+                        Ok(a.data.clone())
+                    }
+                    (None, None) => Err(IoError::BufferEmpty),
                 }
             }
             InterpolationMethod::Hold => {
-                // Use previous value
+                // Use previous value. Hold always extrapolates by
+                // definition, so the tolerance check is unconditional --
+                // this is exactly the case that used to hold an
+                // arbitrarily old value forever.
                 match before {
-                    Some(b) => Ok(b.data.clone()),
+                    Some(b) => {
+                        self.check_max_time_diff(b.timestamp, target_time)?;
+                        Ok(b.data.clone())
+                    }
                     None => match after {
-                        Some(a) => Ok(a.data.clone()),
+                        Some(a) => {
+                            self.check_max_time_diff(a.timestamp, target_time)?;
+                            Ok(a.data.clone())
+                        }
                         None => Err(IoError::BufferEmpty),
                     },
+                }
+            }
+        }
+    }
+
+    /// Repeatedly attempt to synchronize, waiting up to `config.timeout`
+    /// for a successful `try_sync()` (e.g. while streams are still
+    /// catching up, or a formerly stale stream that was tripping
+    /// `max_time_diff` has caught back up). `try_sync` itself never waits;
+    /// `config.timeout` was previously accepted by `SyncConfig` but never
+    /// consulted anywhere in the synchronizer.
+    pub async fn sync_with_timeout(&mut self) -> IoResult<HashMap<String, Array1<f32>>> {
+        let deadline = tokio::time::Instant::now() + self.config.timeout;
+        // Poll frequently relative to the configured timeout, but never
+        // sleep longer than the timeout itself.
+        let poll_interval = self.config.timeout.min(Duration::from_millis(1));
+        loop {
+            match self.try_sync() {
+                Ok(synced) => return Ok(synced),
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(poll_interval).await;
                 }
             }
         }
@@ -470,6 +544,202 @@ mod tests {
         // Should have non-zero offset (server is ahead)
         assert!(sync.offset().abs() > 0);
         assert!(sync.rtt() > 0);
+    }
+
+    // === Regression tests: max_time_diff/timeout enforcement (medium, id=41) ===
+
+    fn synced_config(interpolation: InterpolationMethod, max_time_diff: u64) -> SyncConfig {
+        SyncConfig {
+            max_time_diff,
+            buffer_size: 100,
+            timeout: Duration::from_millis(50),
+            interpolation,
+        }
+    }
+
+    #[test]
+    fn test_stale_stream_rejected_with_hold() {
+        let mut sync = StreamSynchronizer::new(synced_config(InterpolationMethod::Hold, 10_000));
+        sync.add_stream("fresh".to_string());
+        sync.add_stream("stale".to_string());
+
+        // "stale" stopped producing data an hour (in microseconds) before
+        // "fresh"'s latest sample -- try_sync used to happily hold that
+        // ancient value forever with InterpolationMethod::Hold.
+        let base_time = 1_000_000_000u64;
+        sync.push(TimestampedSample::new(
+            base_time,
+            Array1::from_vec(vec![1.0]),
+            "stale".to_string(),
+        ))
+        .unwrap();
+        sync.push(TimestampedSample::new(
+            base_time + 3_600_000_000, // +1 hour, in microseconds
+            Array1::from_vec(vec![2.0]),
+            "fresh".to_string(),
+        ))
+        .unwrap();
+
+        let result = sync.try_sync();
+        assert!(
+            matches!(result, Err(IoError::SyncFailed(_))),
+            "expected a SyncFailed error for the stale stream, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_stale_stream_rejected_with_nearest() {
+        let mut sync = StreamSynchronizer::new(synced_config(InterpolationMethod::Nearest, 10_000));
+        sync.add_stream("fresh".to_string());
+        sync.add_stream("stale".to_string());
+
+        let base_time = 1_000_000_000u64;
+        sync.push(TimestampedSample::new(
+            base_time,
+            Array1::from_vec(vec![1.0]),
+            "stale".to_string(),
+        ))
+        .unwrap();
+        sync.push(TimestampedSample::new(
+            base_time + 3_600_000_000,
+            Array1::from_vec(vec![2.0]),
+            "fresh".to_string(),
+        ))
+        .unwrap();
+
+        let result = sync.try_sync();
+        assert!(matches!(result, Err(IoError::SyncFailed(_))));
+    }
+
+    #[test]
+    fn test_stale_stream_rejected_with_linear() {
+        let mut sync = StreamSynchronizer::new(synced_config(InterpolationMethod::Linear, 10_000));
+        sync.add_stream("fresh".to_string());
+        sync.add_stream("stale".to_string());
+
+        let base_time = 1_000_000_000u64;
+        sync.push(TimestampedSample::new(
+            base_time,
+            Array1::from_vec(vec![1.0]),
+            "stale".to_string(),
+        ))
+        .unwrap();
+        sync.push(TimestampedSample::new(
+            base_time + 3_600_000_000,
+            Array1::from_vec(vec![2.0]),
+            "fresh".to_string(),
+        ))
+        .unwrap();
+
+        let result = sync.try_sync();
+        assert!(matches!(result, Err(IoError::SyncFailed(_))));
+    }
+
+    #[test]
+    fn test_streams_within_tolerance_still_sync() {
+        // Sanity check that the new staleness check does not reject
+        // legitimately close streams (regression guard against an
+        // overly-strict check).
+        let mut sync = StreamSynchronizer::new(synced_config(InterpolationMethod::Hold, 10_000));
+        sync.add_stream("a".to_string());
+        sync.add_stream("b".to_string());
+
+        let base_time = 1_000_000u64;
+        sync.push(TimestampedSample::new(
+            base_time,
+            Array1::from_vec(vec![1.0]),
+            "a".to_string(),
+        ))
+        .unwrap();
+        // Only 1ms apart -- well within the 10ms (10_000 microsecond) tolerance.
+        sync.push(TimestampedSample::new(
+            base_time + 1_000,
+            Array1::from_vec(vec![2.0]),
+            "b".to_string(),
+        ))
+        .unwrap();
+
+        let result = sync.try_sync();
+        assert!(result.is_ok(), "expected sync to succeed, got {result:?}");
+    }
+
+    #[test]
+    fn test_linear_true_bracket_ignores_tolerance() {
+        // When target_time falls strictly between two real samples of the
+        // SAME stream, that is genuine interpolation, not extrapolation of
+        // stale data, so it must succeed even if the bracket itself is
+        // wider than max_time_diff.
+        let mut sync = StreamSynchronizer::new(synced_config(InterpolationMethod::Linear, 500));
+        sync.add_stream("wide".to_string());
+        sync.add_stream("pace".to_string());
+
+        sync.push(TimestampedSample::new(
+            0,
+            Array1::from_vec(vec![0.0]),
+            "wide".to_string(),
+        ))
+        .unwrap();
+        sync.push(TimestampedSample::new(
+            10_000,
+            Array1::from_vec(vec![10.0]),
+            "wide".to_string(),
+        ))
+        .unwrap();
+        // "pace" defines target_time = 5_000 (its only/latest sample),
+        // which falls strictly inside "wide"'s [0, 10_000] bracket.
+        sync.push(TimestampedSample::new(
+            5_000,
+            Array1::from_vec(vec![1.0]),
+            "pace".to_string(),
+        ))
+        .unwrap();
+
+        let result = sync.try_sync().expect("true bracket must not be rejected");
+        let wide_value = result.get("wide").unwrap();
+        assert!((wide_value[0] - 5.0).abs() < 1e-3);
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_timeout_returns_error_after_deadline() {
+        let config = SyncConfig {
+            max_time_diff: 10_000,
+            buffer_size: 100,
+            timeout: Duration::from_millis(20),
+            interpolation: InterpolationMethod::Hold,
+        };
+        let mut sync = StreamSynchronizer::new(config);
+        sync.add_stream("only".to_string());
+        // Never push any data: try_sync() will keep returning
+        // IoError::BufferEmpty until the deadline elapses.
+
+        let start = std::time::Instant::now();
+        let result = sync.sync_with_timeout().await;
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() >= Duration::from_millis(20),
+            "sync_with_timeout should wait roughly the configured timeout before giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_timeout_succeeds_once_data_is_ready() {
+        let config = SyncConfig {
+            max_time_diff: 10_000,
+            buffer_size: 100,
+            timeout: Duration::from_millis(200),
+            interpolation: InterpolationMethod::Hold,
+        };
+        let mut sync = StreamSynchronizer::new(config);
+        sync.add_stream("a".to_string());
+        sync.push(TimestampedSample::new(
+            1000,
+            Array1::from_vec(vec![9.0]),
+            "a".to_string(),
+        ))
+        .unwrap();
+
+        let result = sync.sync_with_timeout().await;
+        assert!(result.is_ok());
     }
 
     #[test]

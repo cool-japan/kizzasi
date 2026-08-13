@@ -10,9 +10,22 @@
 //! Decoder constructors mirror their encoder counterparts so a round-trip
 //! `encode → decode` always uses matching parameters.
 
+use super::model::{
+    build_scaled_table, BitReader, FreqModel, ARITHMETIC_HEADER_LEN, DEFAULT_MIN_COUNT,
+    FLAG_ADAPTIVE, HALF, KNOWN_FLAGS, MAX_TOTAL_COUNT, PRECISION_BITS, QUARTER, RANGE_SCALE,
+    THREE_QUARTER, WHOLE,
+};
 use super::HuffmanNode;
 use crate::error::{TokenizerError, TokenizerResult};
 use std::collections::HashMap;
+
+/// Upper bound on the symbol capacity pre-allocated from an untrusted header.
+///
+/// The symbol count in a compressed stream is metadata: a corrupt or hostile
+/// header could claim billions of symbols. Decoding still honours the declared
+/// count, but the initial allocation is capped so a bad header cannot force a
+/// multi-gigabyte reservation before a single bit has been read.
+const MAX_PREALLOC_SYMBOLS: usize = 1 << 16;
 
 /// Huffman decoder for decompression
 pub struct HuffmanDecoder {
@@ -132,118 +145,172 @@ impl HuffmanDecoder {
 }
 
 /// Arithmetic decoder for decompression
+///
+/// Exact inverse of [`super::ArithmeticEncoder`]: 32-bit `low`/`high`
+/// registers, the same E1/E2/E3 renormalisation schedule, and the same
+/// frequency model. Bits past the end of the payload read as zero, which is
+/// what makes the encoder's two-bit termination sequence sufficient.
+///
+/// # Matching the encoder
+///
+/// The decoder must be constructed from the *initial* frequency table the
+/// encoder started with — for an adaptive stream that means the table before
+/// any updates, not the table left behind afterwards. The stream itself
+/// records whether it was produced adaptively, and the decoder replays the
+/// identical update rule, so no extra flag has to be passed in.
 pub struct ArithmeticDecoder {
-    /// Symbol frequency counts (must match encoder)
+    /// Symbol frequency counts (must match the encoder's initial table)
     frequencies: HashMap<u32, u64>,
-    /// Total count
-    total_count: u64,
-    /// Alphabet (sorted symbols)
-    alphabet: Vec<u32>,
 }
 
 impl ArithmeticDecoder {
     /// Create a decoder with matching frequencies
     pub fn new(frequencies: HashMap<u32, u64>) -> Self {
-        let total_count = frequencies.values().sum();
-        let mut alphabet: Vec<u32> = frequencies.keys().copied().collect();
-        alphabet.sort_unstable();
-
-        Self {
-            frequencies,
-            total_count,
-            alphabet,
-        }
+        Self { frequencies }
     }
 
     /// Decode compressed data
+    ///
+    /// # Errors
+    ///
+    /// * [`TokenizerError::DecodingError`] if the header is truncated, sets
+    ///   flag bits this version does not understand, or if the payload does
+    ///   not resolve to a symbol in the alphabet (a corrupt stream).
+    /// * [`TokenizerError::InvalidConfig`] if the frequency table is empty or
+    ///   its total exceeds the coder's 2^30 limit.
     pub fn decode(&self, encoded: &[u8]) -> TokenizerResult<Vec<u32>> {
-        if encoded.len() < 12 {
+        let count_bytes: [u8; 4] = encoded
+            .get(..4)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| {
+                TokenizerError::decoding(
+                    "decoding",
+                    "Encoded data too short (missing arithmetic-coder header)",
+                )
+            })?;
+        let num_symbols = u32::from_le_bytes(count_bytes) as usize;
+
+        let flags = encoded.get(4).copied().ok_or_else(|| {
+            TokenizerError::decoding(
+                "decoding",
+                "Encoded data too short (missing arithmetic-coder flag byte)",
+            )
+        })?;
+        if flags & !KNOWN_FLAGS != 0 {
             return Err(TokenizerError::decoding(
                 "decoding",
-                "Encoded data too short",
+                format!(
+                    "Unsupported arithmetic-coder flags 0x{:02x}; stream was written by a newer format",
+                    flags
+                ),
             ));
         }
+        let adaptive = flags & FLAG_ADAPTIVE != 0;
+        let payload = encoded.get(ARITHMETIC_HEADER_LEN..).unwrap_or(&[]);
 
-        let num_symbols =
-            u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
-        let value = u64::from_le_bytes([
-            encoded[4],
-            encoded[5],
-            encoded[6],
-            encoded[7],
-            encoded[8],
-            encoded[9],
-            encoded[10],
-            encoded[11],
-        ]);
+        let mut model = FreqModel::from_frequencies(&self.frequencies, DEFAULT_MIN_COUNT)?;
+        if model.total() > MAX_TOTAL_COUNT {
+            return Err(TokenizerError::InvalidConfig(format!(
+                "Arithmetic coder total frequency {} exceeds the maximum {}",
+                model.total(),
+                MAX_TOTAL_COUNT
+            )));
+        }
 
-        const PRECISION: u64 = 1u64 << 32;
-        let mut symbols = Vec::with_capacity(num_symbols);
-        let mut low = 0u64;
-        let mut high = PRECISION - 1;
-        let code_value = value;
+        let mut reader = BitReader::new(payload);
+        let mut low: u64 = 0;
+        let mut high: u64 = WHOLE - 1;
+        let mut value: u64 = 0;
+        for _ in 0..PRECISION_BITS {
+            value = (value << 1) | u64::from(reader.read_bit());
+        }
+
+        let mut symbols = Vec::with_capacity(num_symbols.min(MAX_PREALLOC_SYMBOLS));
 
         for _ in 0..num_symbols {
             let range = high - low + 1;
+            let total = model.total();
 
-            // Find symbol whose cumulative range contains code_value
-            let scaled = ((code_value - low + 1) * self.total_count - 1) / range;
+            let offset = value.checked_sub(low).ok_or_else(|| {
+                TokenizerError::decoding(
+                    "decoding",
+                    format!(
+                        "Corrupt arithmetic stream: code fell below the interval at symbol {}",
+                        symbols.len()
+                    ),
+                )
+            })?;
+            let scaled = ((offset + 1) * total - 1) / range;
 
-            let mut cumulative = 0u64;
-            let mut found_symbol = None;
-
-            for &symbol in &self.alphabet {
-                let freq = self.frequencies.get(&symbol).unwrap_or(&0);
-                if scaled >= cumulative && scaled < cumulative + freq {
-                    found_symbol = Some(symbol);
-                    break;
-                }
-                cumulative += freq;
-            }
-
-            let symbol = found_symbol.ok_or_else(|| {
+            let idx = model.find_by_cumulative(scaled).ok_or_else(|| {
                 TokenizerError::decoding(
                     "decoding",
                     format!("Cannot decode symbol at position {}", symbols.len()),
                 )
             })?;
-
+            let (cum_low, cum_high) = model.cumulative(idx).ok_or_else(|| {
+                TokenizerError::InternalError(
+                    "Arithmetic model index outside its own cumulative table".into(),
+                )
+            })?;
+            let symbol = model.symbol_at(idx).ok_or_else(|| {
+                TokenizerError::InternalError(
+                    "Arithmetic model index outside its own alphabet".into(),
+                )
+            })?;
             symbols.push(symbol);
 
-            // Update range
-            let (cum_low, cum_high) = self.cumulative_frequency(symbol);
-            high = low + (range * cum_high / self.total_count) - 1;
-            low += range * cum_low / self.total_count;
+            // Narrow the interval exactly as the encoder did.
+            high = low + range * cum_high / total - 1;
+            low += range * cum_low / total;
+
+            // Mirror the encoder's E1/E2/E3 renormalisation.
+            loop {
+                if high < HALF {
+                    // E1: nothing to strip from `value`.
+                } else if low >= HALF {
+                    value -= HALF;
+                    low -= HALF;
+                    high -= HALF;
+                } else if low >= QUARTER && high < THREE_QUARTER {
+                    value -= QUARTER;
+                    low -= QUARTER;
+                    high -= QUARTER;
+                } else {
+                    break;
+                }
+                low <<= 1;
+                high = (high << 1) | 1;
+                value = (value << 1) | u64::from(reader.read_bit());
+            }
+
+            if adaptive {
+                model.update(idx)?;
+            }
         }
 
         Ok(symbols)
-    }
-
-    fn cumulative_frequency(&self, symbol: u32) -> (u64, u64) {
-        let mut cumulative = 0u64;
-
-        for s in &self.alphabet {
-            if *s >= symbol {
-                break;
-            }
-            cumulative += self.frequencies.get(s).unwrap_or(&0);
-        }
-
-        let freq = self.frequencies.get(&symbol).unwrap_or(&0);
-        (cumulative, cumulative + freq)
     }
 }
 
 /// Range decoder for decompression
 pub struct RangeDecoder {
-    /// Cumulative frequency table
-    cumulative: Vec<(u32, u64, u64)>,
-    /// Total count
-    total_count: u64,
+    /// Cumulative frequency table quantised onto the shared `[0, 2^16]` grid
+    scaled_cum: Vec<(u32, u32, u32)>,
 }
 
 impl RangeDecoder {
     /// Create a decoder from frequencies
+    ///
+    /// Quantises the frequency table through the same routine
+    /// [`super::RangeEncoder::from_frequencies`] uses, so both sides agree on
+    /// every symbol interval.
+    ///
+    /// # Errors
+    ///
+    /// * [`TokenizerError::DecodingError`] if `frequencies` is empty.
+    /// * [`TokenizerError::InvalidConfig`] if every count is zero, or if the
+    ///   alphabet has more than 65,536 distinct symbols.
     pub fn from_frequencies(frequencies: HashMap<u32, u64>) -> TokenizerResult<Self> {
         if frequencies.is_empty() {
             return Err(TokenizerError::decoding(
@@ -252,27 +319,9 @@ impl RangeDecoder {
             ));
         }
 
-        let total_count: u64 = frequencies.values().sum();
+        let scaled_cum = build_scaled_table(&frequencies)?;
 
-        // Build cumulative frequency table
-        let mut symbols: Vec<u32> = frequencies.keys().copied().collect();
-        symbols.sort_unstable();
-
-        let mut cumulative = Vec::new();
-        let mut cum_freq = 0u64;
-
-        for symbol in symbols {
-            let freq = frequencies.get(&symbol).unwrap_or(&0);
-            if *freq > 0 {
-                cumulative.push((symbol, cum_freq, cum_freq + freq));
-                cum_freq += freq;
-            }
-        }
-
-        Ok(Self {
-            cumulative,
-            total_count,
-        })
+        Ok(Self { scaled_cum })
     }
 
     /// Decode compressed data
@@ -281,30 +330,13 @@ impl RangeDecoder {
     /// byte, reads the next four bytes as the initial code, then tracks only
     /// `code: u32` and `range: u32` (no `low`).
     pub fn decode(&self, encoded: &[u8]) -> TokenizerResult<Vec<u32>> {
-        if encoded.len() < 4 {
-            return Err(TokenizerError::decoding(
-                "decoding",
-                "Encoded data too short",
-            ));
-        }
+        let count_bytes: [u8; 4] = encoded
+            .get(..4)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| TokenizerError::decoding("decoding", "Encoded data too short"))?;
+        let num_symbols = u32::from_le_bytes(count_bytes) as usize;
 
-        let num_symbols =
-            u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
-
-        // Same parameters as encoder.
-        let scale: u64 = 1u64 << 14;
-        let total = self.total_count;
-
-        // Pre-compute scaled cumulative frequencies (same as encoder).
-        let mut scaled_cum: Vec<(u32, u32, u32)> = Vec::with_capacity(self.cumulative.len());
-        for (sym, cum_low, cum_high) in &self.cumulative {
-            let scaled_low = ((*cum_low as u128 * scale as u128) / total as u128) as u64;
-            let scaled_high = ((*cum_high as u128 * scale as u128) / total as u128) as u64;
-            let scaled_high = scaled_high.max(scaled_low + 1);
-            scaled_cum.push((*sym, scaled_low as u32, scaled_high as u32));
-        }
-
-        let data = &encoded[4..];
+        let data = encoded.get(4..).unwrap_or(&[]);
         let mut data_idx = 0usize;
 
         // Discard the encoder's initial cache placeholder byte.
@@ -321,8 +353,8 @@ impl RangeDecoder {
         }
 
         let mut range: u32 = 0xFFFFFFFF;
-        let mut symbols = Vec::with_capacity(num_symbols);
-        let scale_u32 = scale as u32;
+        let mut symbols = Vec::with_capacity(num_symbols.min(MAX_PREALLOC_SYMBOLS));
+        let scale_u32 = RANGE_SCALE as u32;
 
         for _ in 0..num_symbols {
             // Find symbol whose [cum_low, cum_high) contains v = code / step.
@@ -339,9 +371,16 @@ impl RangeDecoder {
             // makes v == scale exactly at the top of the alphabet.
             let v_clamped = v.min(scale_u32 - 1);
 
-            let (symbol, cum_low, cum_high) = scaled_cum
-                .iter()
-                .find(|(_, cl, ch)| v_clamped >= *cl && v_clamped < *ch)
+            // The table is contiguous and strictly increasing, so the owning
+            // interval is the last one whose lower bound is <= v.
+            let pos = self
+                .scaled_cum
+                .partition_point(|&(_, cum_low, _)| cum_low <= v_clamped);
+            let (symbol, cum_low, cum_high) = pos
+                .checked_sub(1)
+                .and_then(|idx| self.scaled_cum.get(idx))
+                .copied()
+                .filter(|&(_, _, cum_high)| v_clamped < cum_high)
                 .ok_or_else(|| {
                     TokenizerError::decoding(
                         "decoding",
@@ -349,11 +388,11 @@ impl RangeDecoder {
                     )
                 })?;
 
-            symbols.push(*symbol);
+            symbols.push(symbol);
 
             // Update decoder state (mirror encoder).
-            code = code.wrapping_sub(step.wrapping_mul(*cum_low));
-            range = step.wrapping_mul(cum_high.wrapping_sub(*cum_low));
+            code = code.wrapping_sub(step.wrapping_mul(cum_low));
+            range = step.wrapping_mul(cum_high.wrapping_sub(cum_low));
 
             // Renormalization: must mirror encoder exactly. Pull in bytes
             // until `range` is back above 2^24.

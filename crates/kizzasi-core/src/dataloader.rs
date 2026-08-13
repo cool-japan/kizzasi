@@ -147,13 +147,82 @@ impl TimeSeriesDataLoader {
         })
     }
 
+    /// Split the series chronologically into `(train, validation)` loaders.
+    ///
+    /// The **tail** `val_ratio` fraction of the raw time series becomes the
+    /// validation half. The split is positional, never random: a shuffled
+    /// split of sliding windows would let the model validate on windows that
+    /// overlap — and therefore leak — its own training data.
+    ///
+    /// Windows never cross the cut point, so the `window_size + horizon`
+    /// timesteps straddling the boundary are dropped rather than shared.
+    ///
+    /// # Arguments
+    /// * `val_ratio` - fraction of timesteps reserved for validation, in `(0, 1)`
+    /// * `val_batch_size` - batch size for the validation loader; shuffling is
+    ///   always disabled on the validation half
+    ///
+    /// # Errors
+    /// Returns [`CoreError::InvalidConfig`] when `val_ratio` is outside
+    /// `(0, 1)`, when `val_batch_size` is zero, or when the series is too short
+    /// for both halves to yield at least one window.
+    pub fn split_chronological(
+        &self,
+        val_ratio: f32,
+        val_batch_size: usize,
+    ) -> CoreResult<(Self, Self)> {
+        if !val_ratio.is_finite() || val_ratio <= 0.0 || val_ratio >= 1.0 {
+            return Err(CoreError::InvalidConfig(format!(
+                "validation split must lie in the open interval (0, 1), got {}",
+                val_ratio
+            )));
+        }
+        if val_batch_size == 0 {
+            return Err(CoreError::InvalidConfig(
+                "validation batch size must be greater than zero".to_string(),
+            ));
+        }
+
+        let total_rows = self.data.nrows();
+        let min_rows = self.config.window_size + self.config.horizon;
+        if total_rows < 2 * min_rows {
+            return Err(CoreError::InvalidConfig(format!(
+                "series of {} timesteps cannot be split: each half needs at least {} \
+                 (window_size {} + horizon {})",
+                total_rows, min_rows, self.config.window_size, self.config.horizon
+            )));
+        }
+
+        // Clamp so both halves keep at least one full window; the bounds are
+        // valid because `total_rows >= 2 * min_rows` was checked above.
+        let requested = ((total_rows as f32) * val_ratio).round() as usize;
+        let val_rows = requested.clamp(min_rows, total_rows - min_rows);
+        let cut = total_rows - val_rows;
+
+        let train_data = self.data.slice(s![..cut, ..]).to_owned();
+        let val_data = self.data.slice(s![cut.., ..]).to_owned();
+
+        let train = Self::new(train_data, self.config.clone())?;
+        let val_config = DataLoaderConfig {
+            batch_size: val_batch_size,
+            shuffle: false,
+            ..self.config.clone()
+        };
+        let val = Self::new(val_data, val_config)?;
+
+        Ok((train, val))
+    }
+
     /// Get number of batches per epoch
     pub fn num_batches(&self) -> usize {
         let num_samples = self.indices.len();
+        // A zero batch size would divide by zero; treat it as "one sample per
+        // batch" so a misconfigured loader degrades instead of panicking.
+        let batch_size = self.config.batch_size.max(1);
         if self.config.drop_last {
-            num_samples / self.config.batch_size
+            num_samples / batch_size
         } else {
-            num_samples.div_ceil(self.config.batch_size)
+            num_samples.div_ceil(batch_size)
         }
     }
 
@@ -295,11 +364,14 @@ impl<'a> Iterator for BatchIterator<'a> {
             return None;
         }
 
-        let start_idx = self.current_batch * self.loader.config.batch_size;
-        let end_idx = (start_idx + self.loader.config.batch_size).min(self.loader.indices.len());
+        // Mirror `num_batches`: a zero batch size degrades to one sample per
+        // batch instead of yielding empty batches forever.
+        let batch_size = self.loader.config.batch_size.max(1);
+        let start_idx = self.current_batch * batch_size;
+        let end_idx = (start_idx + batch_size).min(self.loader.indices.len());
 
         // Check if we should drop last incomplete batch
-        if self.loader.config.drop_last && end_idx - start_idx < self.loader.config.batch_size {
+        if self.loader.config.drop_last && end_idx.saturating_sub(start_idx) < batch_size {
             return None;
         }
 
@@ -503,5 +575,92 @@ mod tests {
 
         // Without drop_last, we might have more batches
         assert!(loader_no_drop.num_batches() >= loader_drop.num_batches());
+    }
+
+    #[test]
+    fn test_split_chronological_takes_the_tail_for_validation() {
+        // Row `t` is filled with the value `t` so the split point is visible in
+        // the data itself: the validation half must contain only later
+        // timesteps than the training half.
+        let n = 200usize;
+        let data = Array2::from_shape_fn((n, 1), |(t, _)| t as f32);
+
+        let config = DataLoaderConfig::default()
+            .with_window_size(8)
+            .with_horizon(4)
+            .with_batch_size(4)
+            .with_shuffle(true);
+        let loader = TimeSeriesDataLoader::new(data, config).unwrap();
+
+        let (train, val) = loader.split_chronological(0.25, 2).unwrap();
+
+        assert_eq!(
+            val.config().batch_size,
+            2,
+            "validation batch size must come from the argument"
+        );
+        assert!(!val.config().shuffle, "validation must not be shuffled");
+        assert_eq!(
+            train.config().batch_size,
+            4,
+            "train keeps its own batch size"
+        );
+        assert!(train.num_batches() > 0 && val.num_batches() > 0);
+
+        let train_max = train.data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let val_min = val.data.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(
+            val_min > train_max,
+            "validation window must start strictly after the training window \
+             (train_max={train_max}, val_min={val_min})"
+        );
+        assert_eq!(
+            train.data.nrows() + val.data.nrows(),
+            n,
+            "the split must partition the series"
+        );
+    }
+
+    #[test]
+    fn test_split_chronological_rejects_invalid_input() {
+        let data = Array2::<f32>::zeros((200, 1));
+        let config = DataLoaderConfig::default()
+            .with_window_size(8)
+            .with_horizon(4)
+            .with_batch_size(4);
+        let loader = TimeSeriesDataLoader::new(data, config).unwrap();
+
+        assert!(loader.split_chronological(0.0, 4).is_err());
+        assert!(loader.split_chronological(1.0, 4).is_err());
+        assert!(loader.split_chronological(-0.5, 4).is_err());
+        assert!(loader.split_chronological(f32::NAN, 4).is_err());
+        assert!(loader.split_chronological(0.2, 0).is_err());
+
+        // A series too short for two windows must report an error, not a
+        // silently degenerate loader.
+        let short = Array2::<f32>::zeros((20, 1));
+        let short_config = DataLoaderConfig::default()
+            .with_window_size(8)
+            .with_horizon(4)
+            .with_batch_size(4);
+        let short_loader = TimeSeriesDataLoader::new(short, short_config).unwrap();
+        assert!(short_loader.split_chronological(0.2, 4).is_err());
+    }
+
+    #[test]
+    fn test_split_chronological_clamps_extreme_ratios() {
+        // A ratio that would leave one half without a full window is clamped so
+        // both halves stay usable.
+        let data = Array2::<f32>::zeros((60, 1));
+        let config = DataLoaderConfig::default()
+            .with_window_size(8)
+            .with_horizon(4)
+            .with_batch_size(2);
+        let loader = TimeSeriesDataLoader::new(data, config).unwrap();
+
+        let (train, val) = loader.split_chronological(0.99, 2).unwrap();
+        assert!(train.data.nrows() >= 12);
+        assert!(val.data.nrows() >= 12);
+        assert!(train.num_samples() > 0 && val.num_samples() > 0);
     }
 }

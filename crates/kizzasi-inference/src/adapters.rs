@@ -104,6 +104,11 @@ pub struct InferenceResponse {
 }
 
 /// Configuration overrides in message
+///
+/// These are honoured by the adapters through
+/// [`StreamingEngine::step_async_with`](crate::streaming::StreamingEngine::step_async_with):
+/// an override the engine cannot apply is reported back to the client as an
+/// error rather than silently discarded.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageConfig {
     /// Temperature for sampling
@@ -117,6 +122,28 @@ pub struct MessageConfig {
 
     /// Maximum number of tokens to generate
     pub max_tokens: Option<usize>,
+}
+
+#[cfg(feature = "streaming")]
+impl From<&MessageConfig> for crate::streaming::SamplingOverrides {
+    fn from(config: &MessageConfig) -> Self {
+        Self {
+            temperature: config.temperature,
+            top_k: config.top_k,
+            top_p: config.top_p,
+            max_tokens: config.max_tokens,
+        }
+    }
+}
+
+/// Flatten a multi-step rollout into a single response payload
+///
+/// Returns the concatenated samples and the number of generated steps, which is
+/// what [`InferenceResponse::num_tokens`] reports.
+#[cfg(feature = "streaming")]
+pub fn flatten_outputs(outputs: &[Array1<f32>]) -> (Vec<f32>, usize) {
+    let flat = outputs.iter().flat_map(|o| o.iter().copied()).collect();
+    (flat, outputs.len())
 }
 
 impl InferenceMessage {
@@ -160,14 +187,30 @@ impl InferenceResponse {
 }
 
 /// Trait for network adapters
+///
+/// `start`/`stop` take `&self` (not `&mut self`) so `stop` can be called
+/// through a shared `Arc<Adapter>` handle while `start` is in flight on
+/// another task — e.g. `let adapter = Arc::new(adapter); let a2 =
+/// adapter.clone(); tokio::spawn(async move { a2.start().await });
+/// adapter.stop().await;`.
 #[cfg(feature = "async")]
 pub trait NetworkAdapter {
-    /// Start the adapter
-    fn start(&mut self) -> impl std::future::Future<Output = InferenceResult<()>>;
+    /// Start the adapter and serve until [`NetworkAdapter::stop`] is called
+    /// (or the underlying transport ends on its own).
+    fn start(&self) -> impl std::future::Future<Output = InferenceResult<()>>;
 
-    /// Stop the adapter
-    fn stop(&mut self) -> impl std::future::Future<Output = InferenceResult<()>>;
+    /// Signal a running [`NetworkAdapter::start`] call to shut down.
+    ///
+    /// Implementations must actually interrupt the running serve loop (e.g.
+    /// via a `tokio::sync::watch` flag observed with `select!`/
+    /// `wait_for`), not merely flip a flag nothing reads.
+    fn stop(&self) -> impl std::future::Future<Output = InferenceResult<()>>;
 
-    /// Check if adapter is running
+    /// Check if the adapter is currently serving.
+    ///
+    /// Must be a plain, synchronous, panic-free read (e.g. backed by
+    /// `watch::Sender::borrow` or an `AtomicBool`) — never one that blocks on
+    /// the async runtime, which panics outside a multi-threaded Tokio
+    /// context.
     fn is_running(&self) -> bool;
 }

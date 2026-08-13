@@ -54,11 +54,20 @@ pub struct TransformerConfig {
     pub num_layers: usize,
     /// Maximum context window
     pub max_seq_len: usize,
-    /// Dropout rate
+    /// Dropout rate applied to each layer output while training mode is
+    /// enabled via `set_training(true)` (inverted dropout; inert at inference)
     pub dropout: f32,
     /// Use RMSNorm instead of LayerNorm
     pub use_rms_norm: bool,
-    /// Use causal masking (autoregressive)
+    /// Reserved: currently has no runtime effect.
+    ///
+    /// `Transformer::step` (and the `MultiHeadAttention` it drives) is a
+    /// single-token-at-a-time streaming path: each step appends exactly one
+    /// new position to the KV cache and never removes from the front except
+    /// to enforce `max_seq_len`. Every cached position is therefore already
+    /// `<= ` the current token by construction, so there is no future
+    /// position an explicit causal mask would ever need to hide — the
+    /// architecture is unconditionally causal regardless of this flag.
     pub causal: bool,
 }
 
@@ -142,6 +151,31 @@ impl TransformerConfig {
     }
 }
 
+/// Apply rotary position embeddings (RoPE) to one attention head's slice of
+/// `vec`, in place, at absolute position `pos`.
+///
+/// Uses the "rotate half" convention (splitting the head into two halves and
+/// rotating them as a complex pair per dimension), matching most
+/// open-weight implementations (LLaMA, GPT-NeoX, ...), with the standard
+/// base of 10000. An odd `head_dim` leaves its final, unpaired element
+/// untouched.
+fn apply_rope(vec: &mut Array1<f32>, head_start: usize, head_dim: usize, pos: usize) {
+    let half = head_dim / 2;
+    for i in 0..half {
+        let inv_freq = 1.0 / 10000f32.powf(2.0 * i as f32 / head_dim as f32);
+        let theta = pos as f32 * inv_freq;
+        let (sin_t, cos_t) = theta.sin_cos();
+        let idx0 = head_start + i;
+        let idx1 = head_start + half + i;
+        if idx1 < vec.len() {
+            let x0 = vec[idx0];
+            let x1 = vec[idx1];
+            vec[idx0] = x0 * cos_t - x1 * sin_t;
+            vec[idx1] = x0 * sin_t + x1 * cos_t;
+        }
+    }
+}
+
 /// Multi-Head Self-Attention
 struct MultiHeadAttention {
     num_heads: usize,
@@ -160,6 +194,14 @@ struct MultiHeadAttention {
     key_cache: VecDeque<Array1<f32>>,
     value_cache: VecDeque<Array1<f32>>,
     max_cache_len: usize,
+
+    /// Absolute position of the next token to be processed by `forward`.
+    /// Drives the RoPE rotation applied to `q`/`k`; reset to 0 in
+    /// [`Self::reset`]. Keys are rotated once, at insertion time, before
+    /// being cached — not re-rotated on every subsequent step — so eviction
+    /// from the cache (once `max_cache_len` is exceeded) does not disturb
+    /// the positional encoding of the entries that remain.
+    position: usize,
 }
 
 impl MultiHeadAttention {
@@ -191,16 +233,30 @@ impl MultiHeadAttention {
             key_cache: VecDeque::new(),
             value_cache: VecDeque::new(),
             max_cache_len: config.max_seq_len,
+            position: 0,
         })
     }
 
-    fn forward(&mut self, x: &Array1<f32>, causal: bool) -> CoreResult<Array1<f32>> {
+    fn forward(&mut self, x: &Array1<f32>) -> CoreResult<Array1<f32>> {
         let batch_size = x.len().min(self.hidden_dim);
+        let current_pos = self.position;
 
         // Project to Q, K, V
-        let q = self.project(x, &self.q_proj);
-        let k = self.project(x, &self.k_proj);
+        let mut q = self.project(x, &self.q_proj);
+        let mut k = self.project(x, &self.k_proj);
         let v = self.project(x, &self.v_proj);
+
+        // Rotary position embeddings: rotate q (this token) and k (before
+        // caching, so every cached key stays permanently tagged with its
+        // own absolute position) per head. This is what makes attention
+        // depend on token order at all: previously there was no positional
+        // signal anywhere in this module, so permuting the order of
+        // previously-seen inputs left the output completely unchanged.
+        for h in 0..self.num_heads {
+            let head_start = h * self.head_dim;
+            apply_rope(&mut q, head_start, self.head_dim, current_pos);
+            apply_rope(&mut k, head_start, self.head_dim, current_pos);
+        }
 
         // Add to cache
         self.key_cache.push_back(k.clone());
@@ -221,7 +277,6 @@ impl MultiHeadAttention {
         // For each head
         for h in 0..self.num_heads {
             let head_start = h * self.head_dim;
-            let _head_end = (head_start + self.head_dim).min(batch_size);
 
             // Compute attention scores with all cached positions
             let mut scores = Vec::with_capacity(seq_len);
@@ -229,7 +284,7 @@ impl MultiHeadAttention {
                 let k_cached = &self.key_cache[pos];
                 let mut score = 0.0;
 
-                // Q · K^T for this head
+                // Q · K^T for this head (both already RoPE-rotated)
                 for i in 0..self.head_dim {
                     let q_idx = head_start + i;
                     let k_idx = head_start + i;
@@ -239,12 +294,15 @@ impl MultiHeadAttention {
                 }
                 score /= scale;
 
-                // Causal masking: only attend to current and past positions
-                if !causal || pos < seq_len {
-                    scores.push(score);
-                } else {
-                    scores.push(f32::NEG_INFINITY);
-                }
+                // No causal mask is applied here (and none is needed):
+                // `key_cache`/`value_cache` hold exactly the positions
+                // `forward` has already appended, oldest-evicted-first, so
+                // every cached position is by construction <= the current
+                // token — there is no future position for a mask to ever
+                // need to hide in this single-token-at-a-time streaming
+                // design. `TransformerConfig::causal` therefore has no
+                // effect on this step-wise path.
+                scores.push(score);
             }
 
             // Softmax over positions
@@ -269,6 +327,8 @@ impl MultiHeadAttention {
             }
         }
 
+        self.position += 1;
+
         // Output projection
         let output = self.project(&attention_output, &self.o_proj);
         Ok(output)
@@ -290,6 +350,7 @@ impl MultiHeadAttention {
     fn reset(&mut self) {
         self.key_cache.clear();
         self.value_cache.clear();
+        self.position = 0;
     }
 }
 
@@ -349,7 +410,6 @@ struct TransformerLayer {
     ln2: LayerNorm,
     attention: MultiHeadAttention,
     feed_forward: FeedForward,
-    causal: bool,
 }
 
 impl TransformerLayer {
@@ -370,14 +430,17 @@ impl TransformerLayer {
             ln2,
             attention,
             feed_forward,
-            causal: config.causal,
         })
     }
 
     fn forward(&mut self, x: &Array1<f32>) -> CoreResult<Array1<f32>> {
         // Pre-norm: LayerNorm → Attention → Residual
         let x_norm = self.ln1.forward(x);
-        let attn_out = self.attention.forward(&x_norm, self.causal)?;
+        // `TransformerConfig::causal` is not threaded through: see
+        // `MultiHeadAttention::forward`'s doc on why a causal mask is
+        // structurally unnecessary (and was previously dead code) for this
+        // single-token-at-a-time streaming path.
+        let attn_out = self.attention.forward(&x_norm)?;
         let mut x_attn = x.clone();
         for i in 0..x_attn.len().min(attn_out.len()) {
             x_attn[i] += attn_out[i];
@@ -406,6 +469,8 @@ pub struct Transformer {
     ln_out: LayerNorm,
     input_proj: Array2<f32>,
     output_proj: Array2<f32>,
+    /// Whether `TransformerConfig::dropout` is active (see [`Transformer::set_training`]).
+    training: bool,
 }
 
 impl Transformer {
@@ -445,6 +510,7 @@ impl Transformer {
             ln_out,
             input_proj,
             output_proj,
+            training: false,
         })
     }
 
@@ -626,6 +692,22 @@ impl Transformer {
         Ok(())
     }
 
+    /// Enable or disable training mode.
+    ///
+    /// Models are created in inference mode, where `TransformerConfig::dropout` is inert
+    /// and [`step`](crate::SignalPredictor::step) is deterministic. Set this to
+    /// `true` during training so the configured dropout rate is applied to each
+    /// layer output (inverted dropout — no rescale is needed when switching
+    /// back to inference).
+    pub fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
+    /// Whether the model is currently in training mode (dropout active).
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
     /// Load weights from a JSON file previously written by `save_weights_json`.
     pub fn load_weights_json<P: AsRef<std::path::Path>>(&mut self, path: P) -> ModelResult<()> {
         let file = std::fs::File::open(path.as_ref()).map_err(|e| {
@@ -641,7 +723,23 @@ impl Transformer {
                     format!("JSON deserialization failed: {e}"),
                 )
             })?;
+        self.load_weights_map(&weights).map(|_| ())
+    }
 
+    /// Load weights from an in-memory `name → flat f32 values` map.
+    ///
+    /// This is the in-process counterpart of [`Self::load_weights_json`]: it
+    /// applies exactly the same shape checks and partial-loading semantics
+    /// without routing the parameters through a serialized file.
+    pub fn load_weights_map(
+        &mut self,
+        weights: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> ModelResult<usize> {
+        // Number of tensors actually applied. The caller needs this to tell a
+        // genuine partial load from a weight map whose names match nothing at
+        // all — the latter would otherwise leave the model randomly
+        // initialised while reporting success.
+        let applied = std::cell::Cell::new(0usize);
         let load_array2 = |map: &std::collections::HashMap<String, Vec<f32>>,
                            key: &str,
                            rows: usize,
@@ -667,6 +765,7 @@ impl Transformer {
                         format!("failed to reshape '{}': {e}", key),
                     )
                 })?;
+                applied.set(applied.get() + 1);
                 Ok(Some(arr))
             } else {
                 Ok(None)
@@ -676,10 +775,10 @@ impl Transformer {
         let hidden = self.config.hidden_dim;
         let ff_dim = self.config.ff_dim;
 
-        if let Some(arr) = load_array2(&weights, "input_proj", self.config.input_dim, hidden)? {
+        if let Some(arr) = load_array2(weights, "input_proj", self.config.input_dim, hidden)? {
             self.input_proj = arr;
         }
-        if let Some(arr) = load_array2(&weights, "output_proj", hidden, self.config.input_dim)? {
+        if let Some(arr) = load_array2(weights, "output_proj", hidden, self.config.input_dim)? {
             self.output_proj = arr;
         }
 
@@ -688,27 +787,27 @@ impl Transformer {
             let attn = format!("{}.attention", prefix);
             let ff = format!("{}.feed_forward", prefix);
 
-            if let Some(arr) = load_array2(&weights, &format!("{}.q_proj", attn), hidden, hidden)? {
+            if let Some(arr) = load_array2(weights, &format!("{}.q_proj", attn), hidden, hidden)? {
                 layer.attention.q_proj = arr;
             }
-            if let Some(arr) = load_array2(&weights, &format!("{}.k_proj", attn), hidden, hidden)? {
+            if let Some(arr) = load_array2(weights, &format!("{}.k_proj", attn), hidden, hidden)? {
                 layer.attention.k_proj = arr;
             }
-            if let Some(arr) = load_array2(&weights, &format!("{}.v_proj", attn), hidden, hidden)? {
+            if let Some(arr) = load_array2(weights, &format!("{}.v_proj", attn), hidden, hidden)? {
                 layer.attention.v_proj = arr;
             }
-            if let Some(arr) = load_array2(&weights, &format!("{}.o_proj", attn), hidden, hidden)? {
+            if let Some(arr) = load_array2(weights, &format!("{}.o_proj", attn), hidden, hidden)? {
                 layer.attention.o_proj = arr;
             }
-            if let Some(arr) = load_array2(&weights, &format!("{}.fc1", ff), hidden, ff_dim)? {
+            if let Some(arr) = load_array2(weights, &format!("{}.fc1", ff), hidden, ff_dim)? {
                 layer.feed_forward.fc1 = arr;
             }
-            if let Some(arr) = load_array2(&weights, &format!("{}.fc2", ff), ff_dim, hidden)? {
+            if let Some(arr) = load_array2(weights, &format!("{}.fc2", ff), ff_dim, hidden)? {
                 layer.feed_forward.fc2 = arr;
             }
         }
 
-        Ok(())
+        Ok(applied.get())
     }
 
     /// Save all model weights to a SafeTensors file at `path`.
@@ -796,12 +895,17 @@ impl Transformer {
 impl SignalPredictor for Transformer {
     #[instrument(skip(self, input))]
     fn step(&mut self, input: &Array1<f32>) -> CoreResult<Array1<f32>> {
+        crate::check_input_dim(input, self.input_proj.shape()[0])?;
+
         // Project input to hidden dimension
         let mut hidden = input.dot(&self.input_proj);
 
         // Pass through each layer
+        let dropout_rate = self.config.dropout;
+        let training = self.training;
         for layer in &mut self.layers {
             hidden = layer.forward(&hidden)?;
+            crate::dropout::apply_dropout(&mut hidden, dropout_rate, training);
         }
 
         // Final layer normalization
@@ -842,12 +946,22 @@ impl AutoregressiveModel for Transformer {
     }
 
     fn get_states(&self) -> Vec<HiddenState> {
-        // Pack both K and V caches into a single Array2 per layer.
-        // Layout: rows [0, cache_len) hold K entries;
-        //         rows [cache_len, 2*cache_len) hold V entries.
+        // Pack K, V, and the RoPE position counter into a single Array2 per
+        // layer. Layout: rows [0, cache_len) hold K entries;
+        // [cache_len, 2*cache_len) hold V entries; the final row (index
+        // 2*cache_len) is a position row whose column 0 holds
+        // `attention.position` (as f32) — that counter is part of the
+        // layer's real recurrent state now that q/k are RoPE-rotated by it,
+        // and must round-trip through get/set_states just like the cache
+        // does, or a restored model would rotate its next token by the
+        // wrong absolute position and silently diverge from the
+        // continuation it is supposed to reproduce.
+        //
         // An empty cache (cache_len == 0) is encoded as a 1-row sentinel with
         // step_count == 0 (update() is NOT called), so set_states can distinguish
-        // "fresh model" from "one step of history".
+        // "fresh model" from "one step of history". `position` is always 0
+        // when the cache is empty (nothing has been pushed yet), so the
+        // sentinel does not need to carry it separately.
         self.layers
             .iter()
             .map(|layer| {
@@ -857,7 +971,7 @@ impl AutoregressiveModel for Transformer {
                     // minimum that HiddenState::new accepts without needing .max(1).
                     HiddenState::new(1, self.config.hidden_dim)
                 } else {
-                    let total_rows = cache_len * 2;
+                    let total_rows = cache_len * 2 + 1;
                     let mut combined = Array2::zeros((total_rows, self.config.hidden_dim));
                     for (i, k) in layer.attention.key_cache.iter().enumerate() {
                         for j in 0..k.len().min(self.config.hidden_dim) {
@@ -869,6 +983,7 @@ impl AutoregressiveModel for Transformer {
                             combined[[cache_len + i, j]] = v[j];
                         }
                     }
+                    combined[[2 * cache_len, 0]] = layer.attention.position as f32;
                     let mut hs = HiddenState::new(total_rows, self.config.hidden_dim);
                     hs.update(combined);
                     hs
@@ -892,23 +1007,25 @@ impl AutoregressiveModel for Transformer {
 
             // step_count == 0 means the sentinel for an empty cache; nothing to restore.
             if states[layer_idx].step_count() == 0 {
+                layer.attention.position = 0;
                 continue;
             }
 
             let combined = states[layer_idx].state();
             let nrows = combined.nrows();
 
-            if !nrows.is_multiple_of(2) {
+            if nrows == 0 || nrows.is_multiple_of(2) {
                 return Err(ModelError::load_error(
                     "Transformer set_states",
                     format!(
-                        "layer {layer_idx}: KV cache state has odd row count {nrows}; \
-                         expected an even number (K rows concatenated with V rows)"
+                        "layer {layer_idx}: KV cache state has row count {nrows}; \
+                         expected an odd number >= 1 (K rows concatenated with V \
+                         rows, plus one trailing position row)"
                     ),
                 ));
             }
 
-            let cache_len = nrows / 2;
+            let cache_len = (nrows - 1) / 2;
             for i in 0..cache_len {
                 let mut k = Array1::zeros(self.config.hidden_dim);
                 for j in 0..self.config.hidden_dim.min(combined.ncols()) {
@@ -923,6 +1040,11 @@ impl AutoregressiveModel for Transformer {
                 }
                 layer.attention.value_cache.push_back(v);
             }
+            layer.attention.position = if combined.ncols() > 0 {
+                combined[[2 * cache_len, 0]].max(0.0) as usize
+            } else {
+                0
+            };
         }
 
         Ok(())
@@ -973,6 +1095,47 @@ mod tests {
         let input = Array1::from_vec(vec![0.5]);
         let output = model.step(&input);
         assert!(output.is_ok());
+    }
+
+    #[test]
+    fn test_transformer_output_depends_on_token_order() {
+        // Regression test for the missing-positional-encoding bug: before
+        // RoPE, attention had no positional signal at all, so permuting the
+        // order of previously-seen inputs left the output for a fixed final
+        // token completely unchanged. That must no longer hold.
+        let config = TransformerConfig::new()
+            .hidden_dim(64)
+            .num_heads(4)
+            .num_layers(2)
+            .max_seq_len(128);
+        let mut model = Transformer::new(config).expect("Failed to create Transformer");
+
+        let a = Array1::from_vec(vec![0.3]);
+        let b = Array1::from_vec(vec![0.7]);
+        let c = Array1::from_vec(vec![-0.4]);
+
+        // Sequence 1: a, b, then c.
+        model.step(&a).expect("step a");
+        model.step(&b).expect("step b");
+        let out1 = model.step(&c).expect("step c");
+
+        model.reset();
+
+        // Sequence 2: b, a, then the SAME final token c -- same multiset of
+        // prior tokens, different order.
+        model.step(&b).expect("step b");
+        model.step(&a).expect("step a");
+        let out2 = model.step(&c).expect("step c");
+
+        let differs = out1
+            .iter()
+            .zip(out2.iter())
+            .any(|(x, y)| (x - y).abs() > 1e-5);
+        assert!(
+            differs,
+            "reordering previously-seen tokens must change the output now \
+             that RoPE provides a positional signal"
+        );
     }
 
     #[test]

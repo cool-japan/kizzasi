@@ -18,7 +18,7 @@ use scirs2_core::ndarray::{Array1, Array2};
 /// `!Send`.
 ///
 /// Uses `scirs2_core::random::StdRng` (= `Random<rand::rngs::StdRng>`) which is `Send`.
-fn make_sampler_rng(seed: Option<u64>) -> scirs2_core::random::StdRng {
+pub(crate) fn make_sampler_rng(seed: Option<u64>) -> scirs2_core::random::StdRng {
     // `Random::<rand::rngs::ThreadRng>::seed(s)` returns `Random<rand::rngs::StdRng>`
     let s = match seed {
         Some(s) => s,
@@ -247,34 +247,84 @@ impl Sampler {
     }
 
     /// Top-k sampling: sample from k most likely candidates
+    ///
+    /// Temperature is applied before filtering (see
+    /// [`Sampler::filtered_sample`]); when `SamplingConfig::top_p` is also
+    /// set (e.g. after `.top_k(50).top_p(0.9)`), the nucleus filter is
+    /// applied on top of the top-k filter rather than being silently
+    /// dropped.
     fn top_k_sample(&mut self, logits: &Array1<f32>) -> InferenceResult<f32> {
-        let k = self.config.top_k.unwrap_or(10);
+        self.filtered_sample(logits)
+    }
 
-        // Get top-k indices
+    /// Top-p (nucleus) sampling: sample from cumulative probability threshold
+    ///
+    /// See [`Sampler::top_k_sample`]: the two filters compose.
+    fn top_p_sample(&mut self, logits: &Array1<f32>) -> InferenceResult<f32> {
+        self.filtered_sample(logits)
+    }
+
+    /// Shared implementation behind [`SamplingStrategy::TopK`] and
+    /// [`SamplingStrategy::TopP`].
+    ///
+    /// `top_k` and `top_p` are independent knobs on [`SamplingConfig`] (both
+    /// can be `Some` at once), so dispatch here is keyed on which fields are
+    /// populated rather than solely on `strategy` — otherwise
+    /// `.top_k(50).top_p(0.9)` would silently run only the last-set
+    /// strategy, with the other field stored and ignored.
+    ///
+    /// Temperature scaling is applied first (short-circuiting to greedy at a
+    /// near-zero temperature, matching [`Sampler::temperature_sample`]),
+    /// then the top-k mask, then the top-p mask, then the result is
+    /// softmax-normalised and sampled.
+    fn filtered_sample(&mut self, logits: &Array1<f32>) -> InferenceResult<f32> {
+        if self.config.temperature <= 1e-6_f32 {
+            return Ok(self.greedy_sample(logits));
+        }
+
+        let mut working = if (self.config.temperature - 1.0).abs() > 1e-6 {
+            logits.mapv(|x| x / self.config.temperature)
+        } else {
+            logits.clone()
+        };
+
+        if let Some(k) = self.config.top_k {
+            working = Self::top_k_filter(&working, k);
+        }
+        if let Some(p) = self.config.top_p {
+            working = Self::top_p_filter(&working, p);
+        }
+
+        let probs = softmax(&working);
+        self.sample_categorical(&probs)
+    }
+
+    /// Mask every element outside the `k` highest values to `-inf`.
+    fn top_k_filter(logits: &Array1<f32>, k: usize) -> Array1<f32> {
+        let k = k.max(1);
         let mut indexed: Vec<_> = logits.iter().enumerate().collect();
         indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         let top_k_indices: Vec<usize> = indexed.iter().take(k).map(|(idx, _)| *idx).collect();
 
-        // Create filtered logits
         let mut filtered = Array1::from_elem(logits.len(), f32::NEG_INFINITY);
         for &idx in &top_k_indices {
             filtered[idx] = logits[idx];
         }
-
-        let probs = softmax(&filtered);
-        self.sample_categorical(&probs)
+        filtered
     }
 
-    /// Top-p (nucleus) sampling: sample from cumulative probability threshold
-    fn top_p_sample(&mut self, logits: &Array1<f32>) -> InferenceResult<f32> {
-        let p = self.config.top_p.unwrap_or(0.9);
-
-        // Sort by probability (descending)
+    /// Mask every element outside the smallest-cumulative-probability
+    /// nucleus (`>= p`) to `-inf`.
+    ///
+    /// `logits` may already contain `-inf` entries from a preceding
+    /// [`Sampler::top_k_filter`] pass: `softmax` assigns those exactly `0.0`
+    /// probability, so they sort to the bottom and the nucleus is built
+    /// exclusively from the surviving top-k candidates.
+    fn top_p_filter(logits: &Array1<f32>, p: f32) -> Array1<f32> {
         let probs = softmax(logits);
         let mut indexed: Vec<_> = probs.iter().enumerate().collect();
         indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Find nucleus (smallest set with cumulative prob >= p)
         let mut cumsum = 0.0;
         let mut nucleus_size = 0;
         for (_, &prob) in &indexed {
@@ -284,8 +334,8 @@ impl Sampler {
                 break;
             }
         }
+        let nucleus_size = nucleus_size.max(1);
 
-        // Create filtered logits
         let nucleus_indices: Vec<usize> = indexed
             .iter()
             .take(nucleus_size)
@@ -295,9 +345,7 @@ impl Sampler {
         for &idx in &nucleus_indices {
             filtered[idx] = logits[idx];
         }
-
-        let filtered_probs = softmax(&filtered);
-        self.sample_categorical(&filtered_probs)
+        filtered
     }
 
     /// Sample from a categorical distribution using the stored RNG.
@@ -326,7 +374,7 @@ impl Sampler {
 }
 
 /// Apply softmax to convert logits to probabilities
-fn softmax(logits: &Array1<f32>) -> Array1<f32> {
+pub(crate) fn softmax(logits: &Array1<f32>) -> Array1<f32> {
     // Subtract max for numerical stability
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exp_logits = logits.mapv(|x| (x - max_logit).exp());
@@ -628,13 +676,30 @@ impl RejectionSampler {
         logits: &Array1<f32>,
         context: &[f32],
     ) -> InferenceResult<f32> {
+        self.sample_with_rejection_tracked(logits, context)
+            .map(|(value, _rejected)| value)
+    }
+
+    /// Same as [`RejectionSampler::sample_with_rejection`], but also returns
+    /// every candidate value that was rejected (violated at least one
+    /// constraint) during the search, in draw order.
+    ///
+    /// Used by [`AdaptiveRejectionSampler`] to learn which indices are being
+    /// rejected; exposed publicly since any caller may want the same
+    /// visibility into rejection behaviour.
+    pub fn sample_with_rejection_tracked(
+        &mut self,
+        logits: &Array1<f32>,
+        context: &[f32],
+    ) -> InferenceResult<(f32, Vec<f32>)> {
         if self.constraints.is_empty() {
             // No constraints, just sample normally
-            return self.base_sampler.sample(logits);
+            return self.base_sampler.sample(logits).map(|v| (v, Vec::new()));
         }
 
         let mut best_candidate = None;
         let mut min_violations = usize::MAX;
+        let mut rejected = Vec::new();
 
         for attempt in 0..self.max_attempts {
             let candidate = self.base_sampler.sample(logits)?;
@@ -648,8 +713,10 @@ impl RejectionSampler {
 
             if violations == 0 {
                 // Found a valid sample!
-                return Ok(candidate);
+                return Ok((candidate, rejected));
             }
+
+            rejected.push(candidate);
 
             // Track best candidate
             if violations < min_violations {
@@ -665,15 +732,17 @@ impl RejectionSampler {
 
         // All attempts failed, use fallback
         match self.fallback_strategy {
-            FallbackStrategy::BestCandidate => best_candidate.ok_or_else(|| {
-                InferenceError::ForwardError(
-                    "Rejection sampling failed: no candidates generated".to_string(),
-                )
-            }),
+            FallbackStrategy::BestCandidate => {
+                best_candidate.map(|c| (c, rejected)).ok_or_else(|| {
+                    InferenceError::ForwardError(
+                        "Rejection sampling failed: no candidates generated".to_string(),
+                    )
+                })
+            }
             FallbackStrategy::Greedy => {
                 let greedy_config = SamplingConfig::new().strategy(SamplingStrategy::Greedy);
                 let mut greedy_sampler = Sampler::new(greedy_config);
-                greedy_sampler.sample(logits)
+                greedy_sampler.sample(logits).map(|v| (v, rejected))
             }
             FallbackStrategy::Error => Err(InferenceError::ForwardError(format!(
                 "Rejection sampling failed after {} attempts",
@@ -732,7 +801,21 @@ impl AdaptiveRejectionSampler {
         self
     }
 
+    /// Set the fallback strategy used when every attempt within a single
+    /// [`AdaptiveRejectionSampler::sample_adaptive`] call violates a
+    /// constraint.
+    pub fn fallback_strategy(mut self, strategy: FallbackStrategy) -> Self {
+        self.rejection_sampler = self.rejection_sampler.fallback_strategy(strategy);
+        self
+    }
+
     /// Sample with adaptive biasing away from frequently rejected values
+    ///
+    /// Every candidate rejected during the search (not just the ones
+    /// recorded on outright failure) increments `rejection_counts` for its
+    /// index, so the bias applied above actually reflects what has been
+    /// rejected, and `rejection_rate()` is non-zero once rejections have
+    /// occurred.
     pub fn sample_adaptive(
         &mut self,
         logits: &Array1<f32>,
@@ -753,27 +836,35 @@ impl AdaptiveRejectionSampler {
             }
         }
 
-        // Try to sample with rejection
+        // Try to sample with rejection, tracking every rejected candidate.
         let result = self
             .rejection_sampler
-            .sample_with_rejection(&adjusted_logits, context);
+            .sample_with_rejection_tracked(&adjusted_logits, context);
 
-        // Record statistics even on success (for learning)
-        if let Ok(value) = result {
-            Ok(value)
-        } else {
-            // On failure, try greedy as fallback and record
-            let greedy_config = SamplingConfig::new().strategy(SamplingStrategy::Greedy);
-            let mut greedy_sampler = Sampler::new(greedy_config);
-            if let Ok(fallback) = greedy_sampler.sample(&adjusted_logits) {
-                let idx = fallback as usize;
-                if idx < self.rejection_counts.len() {
-                    self.rejection_counts[idx] += 1;
+        match result {
+            Ok((value, rejected)) => {
+                for candidate in rejected {
+                    let idx = candidate as usize;
+                    if idx < self.rejection_counts.len() {
+                        self.rejection_counts[idx] += 1;
+                    }
                 }
+                Ok(value)
             }
-            Err(InferenceError::ForwardError(
-                "Adaptive rejection sampling failed".to_string(),
-            ))
+            Err(_) => {
+                // On failure, try greedy as fallback and record
+                let greedy_config = SamplingConfig::new().strategy(SamplingStrategy::Greedy);
+                let mut greedy_sampler = Sampler::new(greedy_config);
+                if let Ok(fallback) = greedy_sampler.sample(&adjusted_logits) {
+                    let idx = fallback as usize;
+                    if idx < self.rejection_counts.len() {
+                        self.rejection_counts[idx] += 1;
+                    }
+                }
+                Err(InferenceError::ForwardError(
+                    "Adaptive rejection sampling failed".to_string(),
+                ))
+            }
         }
     }
 
@@ -838,6 +929,72 @@ mod tests {
         let logits = Array1::from_vec(vec![0.1, 0.5, 0.3, 0.8, 0.2]);
         let result = sampler.sample(&logits);
         assert!(result.is_ok());
+    }
+
+    /// Regression: `top_k_sample`/`top_p_sample` never referenced
+    /// `self.config.temperature`, so a low temperature (which should sharpen
+    /// the distribution towards the top candidate) had no observable effect.
+    /// A very low temperature over a top-2 restriction must pick the higher
+    /// candidate in (almost) every draw; a high temperature must visit both.
+    #[test]
+    fn test_top_k_respects_temperature() {
+        let logits = Array1::from_vec(vec![0.0_f32, 5.0, 0.0, 0.0]); // index 1 dominates
+
+        let mut sharp = Sampler::new(SamplingConfig::new().top_k(2).temperature(0.05).seed(7));
+        let sharp_counts = (0..200)
+            .map(|_| sharp.sample(&logits).expect("sample must succeed") as usize)
+            .filter(|&idx| idx == 1)
+            .count();
+        assert!(
+            sharp_counts >= 195,
+            "low temperature must pick the dominant top-k candidate almost always, got {sharp_counts}/200"
+        );
+
+        let mut smooth = Sampler::new(SamplingConfig::new().top_k(2).temperature(5.0).seed(7));
+        let smooth_counts = (0..200)
+            .map(|_| smooth.sample(&logits).expect("sample must succeed") as usize)
+            .filter(|&idx| idx == 1)
+            .count();
+        assert!(
+            smooth_counts < 195,
+            "high temperature must spread draws across both top-k candidates, got {smooth_counts}/200 on index 1"
+        );
+    }
+
+    /// Regression: `.top_k(k)` and `.top_p(p)` each overwrote
+    /// `SamplingConfig::strategy`, so `.top_k(50).top_p(0.9)` silently ran
+    /// top-p only, with `top_k` stored and ignored. Both must now compose.
+    ///
+    /// Logits `[2.0, 1.9, 1.8, -10.0]` are close enough that `top_p(0.95)`
+    /// *alone* needs all three of indices 0, 1, 2 to reach the 0.95
+    /// cumulative threshold. With `top_k(2)` composed on top, index 2 is
+    /// masked out before top-p ever sees it, so a composed sampler must draw
+    /// only from `{0, 1}` — proving the top-k restriction is actually being
+    /// applied, not silently overwritten by top-p.
+    #[test]
+    fn test_top_k_and_top_p_compose() {
+        let logits = Array1::from_vec(vec![2.0_f32, 1.9, 1.8, -10.0]);
+        let config = SamplingConfig::new().top_k(2).top_p(0.95).seed(11);
+        assert_eq!(config.top_k, Some(2));
+        assert_eq!(config.top_p, Some(0.95));
+
+        let mut sampler = Sampler::new(config);
+        let mut saw_0 = false;
+        let mut saw_1 = false;
+        for _ in 0..100 {
+            let idx = sampler.sample(&logits).expect("sample must succeed") as usize;
+            assert!(
+                idx == 0 || idx == 1,
+                "composed top-k(2)+top-p(0.95) must never draw index 2 or 3 \
+                 (top-p alone would allow index 2), got index {idx}"
+            );
+            saw_0 |= idx == 0;
+            saw_1 |= idx == 1;
+        }
+        assert!(
+            saw_0 && saw_1,
+            "the surviving top-2 candidates must both be reachable, got saw_0={saw_0} saw_1={saw_1}"
+        );
     }
 
     #[test]
@@ -952,6 +1109,76 @@ mod tests {
         assert!(
             results1 != results2,
             "Different seeds produced identical sequences"
+        );
+    }
+
+    /// Regression: `AdaptiveRejectionSampler` claimed to learn from
+    /// rejections, but `rejection_counts` was only ever incremented on the
+    /// (rare) outright-failure path — every *successful* call (which is
+    /// where `BestCandidate`'s fallback almost always lands) recorded
+    /// nothing, so the bias loop always computed a zero penalty and
+    /// `rejection_rate()` stayed `0.0` forever.
+    ///
+    /// With a Greedy base sampler and a constraint that always rejects the
+    /// argmax index, every attempt in the first several calls draws (and
+    /// rejects) that same index; once `total_samples > 10`, the accumulated
+    /// penalty must be large enough that Greedy stops picking it.
+    #[test]
+    fn test_adaptive_rejection_sampler_learns_from_rejections() {
+        use std::sync::Arc;
+
+        let logits = Array1::from_vec(vec![0.1_f32, 0.9, 0.5, 0.2]); // argmax = index 1
+        let config = SamplingConfig::new().strategy(SamplingStrategy::Greedy);
+        let reject_index_one: ConstraintFn =
+            Arc::new(|seq: &[f32]| seq.last().map(|&v| v as usize != 1).unwrap_or(true));
+
+        let mut sampler =
+            AdaptiveRejectionSampler::new(config, logits.len()).add_constraint(reject_index_one);
+
+        assert_eq!(sampler.rejection_rate(), 0.0);
+
+        // Drive past the `total_samples > 10` threshold where biasing
+        // activates.
+        let mut last_value = None;
+        for _ in 0..11 {
+            last_value = Some(
+                sampler
+                    .sample_adaptive(&logits, &[])
+                    .expect("sample_adaptive must succeed via BestCandidate fallback"),
+            );
+        }
+
+        // Index 1 has been drawn-and-rejected on every prior attempt: the
+        // bias loop must have penalised it enough that Greedy no longer
+        // picks it.
+        assert_ne!(
+            last_value.unwrap() as usize,
+            1,
+            "adaptive sampler should have learned to avoid the always-rejected index"
+        );
+        assert!(
+            sampler.rejection_rate() > 0.0,
+            "rejection_rate() must reflect the tracked rejections, not stay at 0.0"
+        );
+    }
+
+    /// `AdaptiveRejectionSampler::fallback_strategy` must actually change
+    /// which `FallbackStrategy` the inner `RejectionSampler` uses.
+    #[test]
+    fn test_adaptive_rejection_sampler_fallback_strategy_is_configurable() {
+        use std::sync::Arc;
+
+        let logits = Array1::from_vec(vec![0.1_f32, 0.9, 0.5, 0.2]);
+        let config = SamplingConfig::new().strategy(SamplingStrategy::Greedy);
+        let reject_everything: ConstraintFn = Arc::new(|_seq: &[f32]| false);
+
+        let mut sampler = AdaptiveRejectionSampler::new(config, logits.len())
+            .add_constraint(reject_everything)
+            .fallback_strategy(FallbackStrategy::Error);
+
+        assert!(
+            sampler.sample_adaptive(&logits, &[]).is_err(),
+            "FallbackStrategy::Error must propagate as an error, not silently substitute BestCandidate"
         );
     }
 
