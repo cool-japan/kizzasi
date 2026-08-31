@@ -46,7 +46,7 @@ scirs2-linalg = { version = "0.6.5", features = ["simd", "parallel"] }
 scirs2-signal = { version = "0.6.5" }
 scirs2-fft = { version = "0.6.5" }
 scirs2-series = { version = "0.6.5" }
-tensorlogic-ir = { version = "0.1.1" }
+tensorlogic-ir = { version = "0.1.2" }
 
 # Core dependencies
 thiserror = "2"
